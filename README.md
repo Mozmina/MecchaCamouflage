@@ -10,6 +10,14 @@
 
 Mod for [MECCHA CHAMELEON](https://store.steampowered.com/app/4704690/).
 
+<p align="center">
+  <img
+    src="assets/demo.png"
+    alt="Meccha Camouflage demo"
+    width="100%"
+  />
+</p>
+
 [Download](https://github.com/acentrist/MecchaCamouflage/releases/latest).
 
 Extract the release zip into:
