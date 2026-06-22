@@ -259,6 +259,30 @@ int main()
         assert(!latest_log_like.reaches_coarse_bottom);
         assert(latest_log_like.failure == "front_coverage_bottom_not_reached");
 
+        const auto latest_right_edge_gap = Core::evaluate_front_coverage(Core::FrontCoverageInput{
+            0.4537,
+            0.35,
+            0.5463,
+            0.6167,
+            0.4419,
+            0.3326,
+            0.5458,
+            0.6282,
+            256,
+            256,
+            21688,
+            2048,
+            5853,
+            58461,
+            65536,
+            226,
+            256,
+            true});
+        assert(!latest_right_edge_gap.ok);
+        assert(latest_right_edge_gap.failed);
+        assert(!latest_right_edge_gap.refined_grid_complete);
+        assert(latest_right_edge_gap.failure == "front_coverage_grid_incomplete");
+
         const auto covered_front = Core::evaluate_front_coverage(Core::FrontCoverageInput{
             0.45,
             0.35,
@@ -281,6 +305,7 @@ int main()
         assert(covered_front.ok);
         assert(!covered_front.failed);
         assert(covered_front.reaches_coarse_bottom);
+        assert(covered_front.refined_grid_complete);
         assert(covered_front.failure == "ok");
     }
 

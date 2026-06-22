@@ -94,6 +94,7 @@ Assert-True ($SourceText.Contains("front_coverage_ok=")) "front coverage success
 Assert-True ($SourceText.Contains("front_coverage_failed=")) "front coverage failure marker is missing"
 Assert-True ($SourceText.Contains("vertical_band_hits=")) "front vertical band coverage marker is missing"
 Assert-True ($SourceText.Contains("refined_reaches_coarse_bottom=")) "front coarse-bottom coverage marker is missing"
+Assert-True ($SourceText.Contains("refined_grid_complete=")) "front refined-grid completion marker is missing"
 Assert-True ($SourceText.Contains("hidden_background_capture_empty_no_apply")) "hidden capture refusal marker is missing"
 Assert-True ($SourceText.Contains("texture_import_used=0")) "texture import disabled marker is missing"
 Assert-True ($SourceText.Contains("import_backend=0")) "import backend disabled marker is missing"

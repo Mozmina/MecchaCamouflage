@@ -437,6 +437,9 @@ namespace MecchaCamouflage::Core
         report.reaches_coarse_bottom = input.refined_max_ny >= input.coarse_max_ny - tolerance_y;
         report.reaches_coarse_left = input.refined_min_nx <= input.coarse_min_nx + tolerance_x;
         report.reaches_coarse_right = input.refined_max_nx >= input.coarse_max_nx - tolerance_x;
+        report.refined_grid_complete =
+            input.refined_total_cells <= 0 ||
+            input.refined_grid_cursor >= input.refined_total_cells;
 
         if (input.sample_count < input.min_samples)
         {
@@ -456,6 +459,11 @@ namespace MecchaCamouflage::Core
         if (!report.reaches_coarse_left || !report.reaches_coarse_right)
         {
             report.failure = "front_coverage_horizontal_span_incomplete";
+            return report;
+        }
+        if (!report.refined_grid_complete)
+        {
+            report.failure = "front_coverage_grid_incomplete";
             return report;
         }
 

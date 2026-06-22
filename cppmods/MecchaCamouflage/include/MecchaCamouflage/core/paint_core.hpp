@@ -335,6 +335,7 @@ namespace MecchaCamouflage::Core
         bool reaches_coarse_top{false};
         bool reaches_coarse_left{false};
         bool reaches_coarse_right{false};
+        bool refined_grid_complete{false};
         double refined_cell_width{0.0};
         double refined_cell_height{0.0};
         int vertical_band_hits{0};

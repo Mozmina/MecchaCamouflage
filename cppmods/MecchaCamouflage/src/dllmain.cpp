@@ -10742,10 +10742,11 @@ namespace
                     (m_pipeline_job.hard_max_attempts > 0 &&
                      m_pipeline_job.refined_stats.attempts >= m_pipeline_job.hard_max_attempts);
                 RC::Output::send<RC::LogLevel::Verbose>(
-                    STR("{} refined_hit_tick cursor={}/{} attempts={} samples={} target_samples={} min_samples={} batch={} front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} vertical_band_hits={}/{} coarse_bbox=({}, {})-({}, {}) refined_bbox=({}, {})-({}, {}) frame_budget_overrun={} hit_budget_exhausted={} job_stage=refined_hit\n"),
+                    STR("{} refined_hit_tick cursor={}/{} refined_grid_complete={} attempts={} samples={} target_samples={} min_samples={} batch={} front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} vertical_band_hits={}/{} coarse_bbox=({}, {})-({}, {}) refined_bbox=({}, {})-({}, {}) frame_budget_overrun={} hit_budget_exhausted={} job_stage=refined_hit\n"),
                     ModTag,
                     m_pipeline_job.refine_cursor,
                     m_pipeline_job.refine_total_cells,
+                    m_pipeline_job.front_coverage.refined_grid_complete ? 1 : 0,
                     m_pipeline_job.refined_stats.attempts,
                     m_pipeline_job.samples.size(),
                     m_pipeline_job.target_paint_hits,
@@ -10776,7 +10777,7 @@ namespace
                                      m_pipeline_job.use_normalized_coords ? STR("normalized_0_1") : STR("viewport_pixels"),
                                      m_pipeline_job.refined_stats);
                 RC::Output::send<RC::LogLevel::Warning>(
-                    STR("{} front_coverage_report front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} refined_reaches_coarse_top={} refined_reaches_coarse_left={} refined_reaches_coarse_right={} vertical_band_hits={}/{} coarse_bbox=({}, {})-({}, {}) refined_bbox=({}, {})-({}, {}) refined_grid_cursor={} refined_total_cells={} samples={} target_samples={} min_samples={} hit_budget_exhausted={} job_stage=refined_hit\n"),
+                    STR("{} front_coverage_report front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} refined_reaches_coarse_top={} refined_reaches_coarse_left={} refined_reaches_coarse_right={} refined_grid_complete={} vertical_band_hits={}/{} coarse_bbox=({}, {})-({}, {}) refined_bbox=({}, {})-({}, {}) refined_grid_cursor={} refined_total_cells={} samples={} target_samples={} min_samples={} hit_budget_exhausted={} job_stage=refined_hit\n"),
                     ModTag,
                     m_pipeline_job.front_coverage_ok ? 1 : 0,
                     m_pipeline_job.front_coverage_failed ? 1 : 0,
@@ -10785,6 +10786,7 @@ namespace
                     m_pipeline_job.front_coverage.reaches_coarse_top ? 1 : 0,
                     m_pipeline_job.front_coverage.reaches_coarse_left ? 1 : 0,
                     m_pipeline_job.front_coverage.reaches_coarse_right ? 1 : 0,
+                    m_pipeline_job.front_coverage.refined_grid_complete ? 1 : 0,
                     m_pipeline_job.vertical_band_hits,
                     m_pipeline_job.vertical_band_count,
                     active_coarse_stats.min_nx,
@@ -10810,7 +10812,7 @@ namespace
                                                ? RC::ensure_str(m_pipeline_job.front_coverage.failure.c_str())
                                                : STR("play_screen_body_quality_insufficient");
                     RC::Output::send<RC::LogLevel::Warning>(
-                        STR("{} play screen_body refused reason={} failure={} samples={} min_samples={} target_samples={} hard_max_attempts={} bbox_norm=({}, {})-({}, {}) bbox_px={}x{} refine_grid={}x{} front_coverage_ok={} front_coverage_failed={} refined_reaches_coarse_bottom={} vertical_band_hits={}/{} refined_grid_cursor={} refined_total_cells={} hit_ms={} no_import=1 no_apply=1 no_clear=1 no_commit=1 no_mesh_hide=1 fallback_used=0 side_enabled=0 side_backend=front_first_deferred job_stage=refined_hit frame_budget_overrun=0 hit_budget_exhausted={}\n"),
+                        STR("{} play screen_body refused reason={} failure={} samples={} min_samples={} target_samples={} hard_max_attempts={} bbox_norm=({}, {})-({}, {}) bbox_px={}x{} refine_grid={}x{} front_coverage_ok={} front_coverage_failed={} refined_reaches_coarse_bottom={} refined_grid_complete={} vertical_band_hits={}/{} refined_grid_cursor={} refined_total_cells={} hit_ms={} no_import=1 no_apply=1 no_clear=1 no_commit=1 no_mesh_hide=1 fallback_used=0 side_enabled=0 side_backend=front_first_deferred job_stage=refined_hit frame_budget_overrun=0 hit_budget_exhausted={}\n"),
                         ModTag,
                         m_pipeline_job.reason,
                         m_state.last_failure,
@@ -10829,6 +10831,7 @@ namespace
                         m_pipeline_job.front_coverage_ok ? 1 : 0,
                         m_pipeline_job.front_coverage_failed ? 1 : 0,
                         m_pipeline_job.front_coverage.reaches_coarse_bottom ? 1 : 0,
+                        m_pipeline_job.front_coverage.refined_grid_complete ? 1 : 0,
                         m_pipeline_job.vertical_band_hits,
                         m_pipeline_job.vertical_band_count,
                         m_pipeline_job.refine_cursor,
@@ -10842,7 +10845,7 @@ namespace
                     static_cast<int>(m_pipeline_job.samples.size()) < m_pipeline_job.min_paint_hits)
                 {
                     RC::Output::send<RC::LogLevel::Warning>(
-                        STR("{} play screen_body quality_partial_dev samples={} min_samples={} target_samples={} front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} vertical_band_hits={}/{} replicated_partial=1 quality_success=0 no_apply=0 fallback_used=0 side_enabled=0 side_backend=front_first_deferred job_stage=refined_hit\n"),
+                        STR("{} play screen_body quality_partial_dev samples={} min_samples={} target_samples={} front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} refined_grid_complete={} vertical_band_hits={}/{} replicated_partial=1 quality_success=0 no_apply=0 fallback_used=0 side_enabled=0 side_backend=front_first_deferred job_stage=refined_hit\n"),
                         ModTag,
                         m_pipeline_job.samples.size(),
                         m_pipeline_job.min_paint_hits,
@@ -10851,6 +10854,7 @@ namespace
                         m_pipeline_job.front_coverage_failed ? 1 : 0,
                         RC::ensure_str(m_pipeline_job.front_coverage.failure.c_str()),
                         m_pipeline_job.front_coverage.reaches_coarse_bottom ? 1 : 0,
+                        m_pipeline_job.front_coverage.refined_grid_complete ? 1 : 0,
                         m_pipeline_job.vertical_band_hits,
                         m_pipeline_job.vertical_band_count);
                 }
@@ -11185,12 +11189,13 @@ namespace
                         DiagnosticsEnabled,
                         m_pipeline_job.apply_backend.ok});
                 RC::Output::send<RC::LogLevel::Warning>(
-                    STR("{} front_coverage_apply_gate front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} vertical_band_hits={}/{} refined_grid_cursor={} refined_total_cells={} replicated_quality_min={} apply_samples={} replicated_partial={} quality_success={} no_apply={} side_enabled=0 side_backend=front_first_deferred job_stage=surface_trace_sampling\n"),
+                    STR("{} front_coverage_apply_gate front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} refined_grid_complete={} vertical_band_hits={}/{} refined_grid_cursor={} refined_total_cells={} replicated_quality_min={} apply_samples={} replicated_partial={} quality_success={} no_apply={} side_enabled=0 side_backend=front_first_deferred job_stage=surface_trace_sampling\n"),
                     ModTag,
                     m_pipeline_job.front_coverage_ok ? 1 : 0,
                     m_pipeline_job.front_coverage_failed ? 1 : 0,
                     RC::ensure_str(m_pipeline_job.front_coverage.failure.c_str()),
                     m_pipeline_job.front_coverage.reaches_coarse_bottom ? 1 : 0,
+                    m_pipeline_job.front_coverage.refined_grid_complete ? 1 : 0,
                     m_pipeline_job.vertical_band_hits,
                     m_pipeline_job.vertical_band_count,
                     m_pipeline_job.refine_cursor,
@@ -11201,7 +11206,7 @@ namespace
                     m_pipeline_job.stroke_plan.quality_success ? 1 : 0,
                     m_pipeline_job.stroke_plan.ok ? 0 : 1);
                 RC::Output::send<RC::LogLevel::Warning>(
-                    STR("{} surface_sampling route=f10_v2_runtime_atlas accepted_samples={} rejected_samples={} material_resolved_samples={} scene_capture_samples={} exact_material_source=unavailable material_confidence={} material_source=hidden_character_capture_rgb_estimated color_source=hidden_character_capture atlas_source={} atlas_probe_ok={} coverage_ok={} coverage_failure={} valid_coverage={} direct_coverage={} inferred_coverage={} per_chart_coverage={} lower_body_undercovered={} side_undercovered={} back_undercovered={} front_coverage_ok={} front_coverage_failed={} refined_reaches_coarse_bottom={} vertical_band_hits={}/{} refined_grid_cursor={} refined_total_cells={} apply_backend={} apply_backend_ok={} apply_rpc=ServerSendPaint_or_ServerPaint local_echo_rpc=PaintAtUVWithBrush replicated_apply={} replicated_partial={} quality_success={} max_replicated_strokes_per_tick={} apply_mode=AlphaBlend brush_radius={} brush_seed_radius_px={} effective_brush_world_radius={} brush_texture_min_radius={} brush_texture_max_radius={} brush_hardness={} brush_opacity={} brush_spacing={} brush_falloff={} brush_blend_mode={} brush_template_resolution={} brush_subdivision_level={} brush_subdivision_pixel_size={} brush_max_generated_triangles={} brush_gutter_expand_pixels={} brush_source={} no_apply={} texture_import_used=0 fallback_used=0 legacy_splat_success=0 side_enabled=0 side_backend=front_first_deferred frame_budget_overrun=0 job_stage=surface_trace_sampling phase_ms={} camera_state_restored={}\n"),
+                    STR("{} surface_sampling route=f10_v2_runtime_atlas accepted_samples={} rejected_samples={} material_resolved_samples={} scene_capture_samples={} exact_material_source=unavailable material_confidence={} material_source=hidden_character_capture_rgb_estimated color_source=hidden_character_capture atlas_source={} atlas_probe_ok={} coverage_ok={} coverage_failure={} valid_coverage={} direct_coverage={} inferred_coverage={} per_chart_coverage={} lower_body_undercovered={} side_undercovered={} back_undercovered={} front_coverage_ok={} front_coverage_failed={} refined_reaches_coarse_bottom={} refined_grid_complete={} vertical_band_hits={}/{} refined_grid_cursor={} refined_total_cells={} apply_backend={} apply_backend_ok={} apply_rpc=ServerSendPaint_or_ServerPaint local_echo_rpc=PaintAtUVWithBrush replicated_apply={} replicated_partial={} quality_success={} max_replicated_strokes_per_tick={} apply_mode=AlphaBlend brush_radius={} brush_seed_radius_px={} effective_brush_world_radius={} brush_texture_min_radius={} brush_texture_max_radius={} brush_hardness={} brush_opacity={} brush_spacing={} brush_falloff={} brush_blend_mode={} brush_template_resolution={} brush_subdivision_level={} brush_subdivision_pixel_size={} brush_max_generated_triangles={} brush_gutter_expand_pixels={} brush_source={} no_apply={} texture_import_used=0 fallback_used=0 legacy_splat_success=0 side_enabled=0 side_backend=front_first_deferred frame_budget_overrun=0 job_stage=surface_trace_sampling phase_ms={} camera_state_restored={}\n"),
                     ModTag,
                     m_pipeline_job.apply_samples.size(),
                     m_pipeline_job.surface_evidence.rejected_samples,
@@ -11222,6 +11227,7 @@ namespace
                     m_pipeline_job.front_coverage_ok ? 1 : 0,
                     m_pipeline_job.front_coverage_failed ? 1 : 0,
                     m_pipeline_job.front_coverage.reaches_coarse_bottom ? 1 : 0,
+                    m_pipeline_job.front_coverage.refined_grid_complete ? 1 : 0,
                     m_pipeline_job.vertical_band_hits,
                     m_pipeline_job.vertical_band_count,
                     m_pipeline_job.refine_cursor,
@@ -11427,7 +11433,7 @@ namespace
                 m_pipeline_job.frame_budget_overrun = m_pipeline_job.frame_budget_overrun || budget.overrun;
                 m_pipeline_job.timing.import_ms += elapsed_ms_since(apply_tick_start);
                 RC::Output::send<RC::LogLevel::Warning>(
-                    STR("{} replicated_apply_tick cursor={}/{} attempted={} replicated_strokes_sent={} local_echo_strokes={} failed={} apply_rpc={} local_echo_rpc={} max_replicated_strokes_per_tick={} frame_budget_overrun={} hard_budget_overrun={} budget_ms={} job_stage=apply texture_import_used=0 import_backend=0 replicated_apply=1 replicated_partial={} quality_success={} front_coverage_ok={} front_coverage_failed={} refined_reaches_coarse_bottom={} vertical_band_hits={}/{} color_source=hidden_character_capture brush_payload=1 apply_mode=AlphaBlend brush_radius={} effective_brush_world_radius={} brush_seed_radius_px={} brush_subdivision_level={} brush_subdivision_pixel_size={} no_trace_color_fallback=1 first_failure={}\n"),
+                    STR("{} replicated_apply_tick cursor={}/{} attempted={} replicated_strokes_sent={} local_echo_strokes={} failed={} apply_rpc={} local_echo_rpc={} max_replicated_strokes_per_tick={} frame_budget_overrun={} hard_budget_overrun={} budget_ms={} job_stage=apply texture_import_used=0 import_backend=0 replicated_apply=1 replicated_partial={} quality_success={} front_coverage_ok={} front_coverage_failed={} refined_reaches_coarse_bottom={} refined_grid_complete={} vertical_band_hits={}/{} color_source=hidden_character_capture brush_payload=1 apply_mode=AlphaBlend brush_radius={} effective_brush_world_radius={} brush_seed_radius_px={} brush_subdivision_level={} brush_subdivision_pixel_size={} no_trace_color_fallback=1 first_failure={}\n"),
                     ModTag,
                     m_pipeline_job.apply_cursor,
                     m_pipeline_job.apply_samples.size(),
@@ -11446,6 +11452,7 @@ namespace
                     m_pipeline_job.front_coverage_ok ? 1 : 0,
                     m_pipeline_job.front_coverage_failed ? 1 : 0,
                     m_pipeline_job.front_coverage.reaches_coarse_bottom ? 1 : 0,
+                    m_pipeline_job.front_coverage.refined_grid_complete ? 1 : 0,
                     m_pipeline_job.vertical_band_hits,
                     m_pipeline_job.vertical_band_count,
                     m_pipeline_job.brush.radius,
@@ -11480,7 +11487,7 @@ namespace
                                                : STR("<none>");
                 }
                 RC::Output::send<RC::LogLevel::Warning>(
-                    STR("{} play replicated_paint result reason={} success={} visible_backend={} queued_strokes={} replicated_apply=1 replicated_strokes_sent={} local_echo_strokes={} replicated_strokes_failed={} apply_rpc={} local_echo_rpc={} import_backend=0 texture_import_used=0 no_apply=0 albedo_only=1 material_channels_sent=0 replicated_partial={} quality_success={} front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} vertical_band_hits={}/{} refined_grid_cursor={} refined_total_cells={} side_enabled=0 side_backend=front_first_deferred atlas_source={} atlas_probe_ok={} exact_material_source=unavailable material_confidence=preserved_original material_source=hidden_character_capture_rgb_estimated color_source=hidden_character_capture brush_payload=1 apply_mode=AlphaBlend brush_radius={} effective_brush_world_radius={} brush_seed_radius_px={} brush_subdivision_level={} brush_subdivision_pixel_size={} frame_budget_overrun={} apply_frame_overruns={} phase_ms=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) fallback_used=0 legacy_splat_success=0 job_stage=complete\n"),
+                    STR("{} play replicated_paint result reason={} success={} visible_backend={} queued_strokes={} replicated_apply=1 replicated_strokes_sent={} local_echo_strokes={} replicated_strokes_failed={} apply_rpc={} local_echo_rpc={} import_backend=0 texture_import_used=0 no_apply=0 albedo_only=1 material_channels_sent=0 replicated_partial={} quality_success={} front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} refined_grid_complete={} vertical_band_hits={}/{} refined_grid_cursor={} refined_total_cells={} side_enabled=0 side_backend=front_first_deferred atlas_source={} atlas_probe_ok={} exact_material_source=unavailable material_confidence=preserved_original material_source=hidden_character_capture_rgb_estimated color_source=hidden_character_capture brush_payload=1 apply_mode=AlphaBlend brush_radius={} effective_brush_world_radius={} brush_seed_radius_px={} brush_subdivision_level={} brush_subdivision_pixel_size={} frame_budget_overrun={} apply_frame_overruns={} phase_ms=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) fallback_used=0 legacy_splat_success=0 job_stage=complete\n"),
                     ModTag,
                     m_pipeline_job.reason.empty() ? STR("<none>") : m_pipeline_job.reason,
                     m_state.success,
@@ -11497,6 +11504,7 @@ namespace
                     m_pipeline_job.front_coverage_failed ? 1 : 0,
                     RC::ensure_str(m_pipeline_job.front_coverage.failure.c_str()),
                     m_pipeline_job.front_coverage.reaches_coarse_bottom ? 1 : 0,
+                    m_pipeline_job.front_coverage.refined_grid_complete ? 1 : 0,
                     m_pipeline_job.vertical_band_hits,
                     m_pipeline_job.vertical_band_count,
                     m_pipeline_job.refine_cursor,
