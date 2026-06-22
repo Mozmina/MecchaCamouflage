@@ -42,6 +42,10 @@ Assert-True ($SourceText.Contains('stroke_server_rpcs{STR("ServerSendPaint"), ST
 Assert-True ($SourceText.Contains('local_rpcs{STR("PaintAtUVWithBrush")}')) "PaintAtUVWithBrush local echo is missing"
 Assert-True ($SourceText.Contains("color_source=hidden_character_capture")) "front hidden capture color source is missing"
 Assert-True ($SourceText.Contains("readback_backend=sampled_pixel_tick")) "front sampled readback marker is missing"
+Assert-True ($SourceText.Contains("FrontQualityPriorityMode = true")) "front quality-priority mode is not enabled"
+Assert-True ($SourceText.Contains("quality_priority=")) "quality-priority log marker is missing"
+Assert-True ($SourceText.Contains("target_stop_disabled=")) "target-stop-disabled marker is missing"
+Assert-True ($SourceText.Contains("duplicate_merge_disabled=")) "duplicate-merge-disabled marker is missing"
 
 Assert-True (-not $SourceText.Contains("auto run_play() -> void")) "synchronous run_play route remains"
 Assert-True (-not $SourceText.Contains("run_play();")) "F10 path still calls synchronous run_play"

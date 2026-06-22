@@ -247,6 +247,36 @@ int main()
     }
 
     {
+        const auto standard = Core::choose_adaptive_sampling_policy(Core::AdaptiveSamplingInput{
+            1920,
+            1080,
+            0,
+            0,
+            520.0,
+            780.0,
+            512,
+            0,
+            512,
+            false});
+        const auto quality = Core::choose_adaptive_sampling_policy(Core::AdaptiveSamplingInput{
+            1920,
+            1080,
+            0,
+            0,
+            520.0,
+            780.0,
+            512,
+            0,
+            512,
+            true});
+        assert(quality.target_front_hits > standard.target_front_hits);
+        assert(quality.min_front_hits > standard.min_front_hits);
+        assert(quality.hard_max_attempts > standard.hard_max_attempts);
+        assert(quality.refine_grid_x >= standard.refine_grid_x);
+        assert(quality.refine_grid_y >= standard.refine_grid_y);
+    }
+
+    {
         const auto latest_log_like = Core::evaluate_front_coverage(Core::FrontCoverageInput{
             0.4537,
             0.35,

@@ -69,6 +69,7 @@ namespace
     constexpr int SceneCaptureSourceFinalColorLdr = 2;
     constexpr double FrontMetallicAfterMetallicBase = 0.0;
     constexpr double FrontRoughnessAfterMetallicBase = 0.65;
+    constexpr bool FrontQualityPriorityMode = true;
     constexpr bool DiagnosticsEnabled = MECCHA_CAMOUFLAGE_DIAGNOSTICS != 0;
 
     struct Color
@@ -12362,7 +12363,8 @@ namespace
                     m_pipeline_job.bbox_h_px,
                     active_coarse_stats.hit_uv_count,
                     0,
-                    active_coarse_stats.attempts});
+                    active_coarse_stats.attempts,
+                    FrontQualityPriorityMode});
                 m_pipeline_job.target_paint_hits = sampling_policy.target_front_hits;
                 m_pipeline_job.min_paint_hits = sampling_policy.min_front_hits;
                 m_pipeline_job.preferred_paint_hits = sampling_policy.preferred_front_hits;
@@ -12370,10 +12372,17 @@ namespace
                 m_pipeline_job.refine_grid_x = sampling_policy.refine_grid_x;
                 m_pipeline_job.refine_grid_y = sampling_policy.refine_grid_y;
                 m_pipeline_job.refine_total_cells = m_pipeline_job.refine_grid_x * m_pipeline_job.refine_grid_y;
+                if (FrontQualityPriorityMode)
+                {
+                    m_pipeline_job.hard_max_attempts = m_pipeline_job.refine_total_cells;
+                }
                 m_pipeline_job.samples.clear();
-                m_pipeline_job.samples.reserve(static_cast<size_t>(std::max(1, m_pipeline_job.target_paint_hits)));
+                m_pipeline_job.samples.reserve(static_cast<size_t>(
+                    std::max(1, FrontQualityPriorityMode
+                                    ? m_pipeline_job.refine_total_cells
+                                    : m_pipeline_job.target_paint_hits)));
                 RC::Output::send<RC::LogLevel::Warning>(
-                    STR("{} adaptive_sampling_policy viewport={}x{} bbox_px={}x{} target_front_hits={} preferred_front_hits={} min_front_hits={} hard_max_attempts={} refine_grid={}x{} target_side_seeds={} side_views={} side_grid={}x{} duplicate_limited={} sampling_order=stratified_grid_y_first job_stage=refined_hit scheduler=tick\n"),
+                    STR("{} adaptive_sampling_policy viewport={}x{} bbox_px={}x{} target_front_hits={} preferred_front_hits={} min_front_hits={} hard_max_attempts={} refine_grid={}x{} target_side_seeds={} side_views={} side_grid={}x{} duplicate_limited={} quality_priority={} target_stop_disabled={} sampling_order=stratified_grid_y_first job_stage=refined_hit scheduler=tick\n"),
                     ModTag,
                     viewport.width,
                     viewport.height,
@@ -12389,7 +12398,9 @@ namespace
                     sampling_policy.side_view_count,
                     sampling_policy.side_grid_x,
                     sampling_policy.side_grid_y,
-                    sampling_policy.duplicate_limited ? 1 : 0);
+                    sampling_policy.duplicate_limited ? 1 : 0,
+                    FrontQualityPriorityMode ? 1 : 0,
+                    FrontQualityPriorityMode ? 1 : 0);
                 m_pipeline_job.stage = UiPipelineStage::RefinedHit;
             }
 
@@ -12458,13 +12469,14 @@ namespace
                 m_pipeline_job.front_coverage_failed = !m_pipeline_job.front_coverage.ok;
 
                 const auto complete =
-                    (m_pipeline_job.front_coverage_ok &&
+                    (!FrontQualityPriorityMode &&
+                     m_pipeline_job.front_coverage_ok &&
                      static_cast<int>(m_pipeline_job.samples.size()) >= m_pipeline_job.target_paint_hits) ||
                     m_pipeline_job.refine_cursor >= m_pipeline_job.refine_total_cells ||
                     (m_pipeline_job.hard_max_attempts > 0 &&
                      m_pipeline_job.refined_stats.attempts >= m_pipeline_job.hard_max_attempts);
                 RC::Output::send<RC::LogLevel::Verbose>(
-                    STR("{} refined_hit_tick cursor={}/{} refined_grid_complete={} attempts={} samples={} target_samples={} min_samples={} batch={} front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} vertical_band_hits={}/{} coarse_bbox=({}, {})-({}, {}) refined_bbox=({}, {})-({}, {}) frame_budget_overrun={} hit_budget_exhausted={} job_stage=refined_hit\n"),
+                    STR("{} refined_hit_tick cursor={}/{} refined_grid_complete={} attempts={} samples={} target_samples={} min_samples={} batch={} front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} vertical_band_hits={}/{} coarse_bbox=({}, {})-({}, {}) refined_bbox=({}, {})-({}, {}) frame_budget_overrun={} hit_budget_exhausted={} quality_priority={} target_stop_disabled={} job_stage=refined_hit\n"),
                     ModTag,
                     m_pipeline_job.refine_cursor,
                     m_pipeline_job.refine_total_cells,
@@ -12489,7 +12501,9 @@ namespace
                     m_pipeline_job.refined_stats.hit_uv_count > 0 ? m_pipeline_job.refined_stats.max_nx : 0.0,
                     m_pipeline_job.refined_stats.hit_uv_count > 0 ? m_pipeline_job.refined_stats.max_ny : 0.0,
                     m_pipeline_job.refined_stats.budget_exhausted ? 1 : 0,
-                    m_pipeline_job.refined_stats.budget_exhausted ? 1 : 0);
+                    m_pipeline_job.refined_stats.budget_exhausted ? 1 : 0,
+                    FrontQualityPriorityMode ? 1 : 0,
+                    FrontQualityPriorityMode ? 1 : 0);
                 if (!complete)
                 {
                     return;
@@ -12499,7 +12513,7 @@ namespace
                                      m_pipeline_job.use_normalized_coords ? STR("normalized_0_1") : STR("viewport_pixels"),
                                      m_pipeline_job.refined_stats);
                 RC::Output::send<RC::LogLevel::Warning>(
-                    STR("{} front_coverage_report front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} refined_reaches_coarse_top={} refined_reaches_coarse_left={} refined_reaches_coarse_right={} refined_grid_complete={} vertical_band_hits={}/{} coarse_bbox=({}, {})-({}, {}) refined_bbox=({}, {})-({}, {}) refined_grid_cursor={} refined_total_cells={} samples={} target_samples={} min_samples={} hit_budget_exhausted={} job_stage=refined_hit\n"),
+                    STR("{} front_coverage_report front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} refined_reaches_coarse_top={} refined_reaches_coarse_left={} refined_reaches_coarse_right={} refined_grid_complete={} vertical_band_hits={}/{} coarse_bbox=({}, {})-({}, {}) refined_bbox=({}, {})-({}, {}) refined_grid_cursor={} refined_total_cells={} samples={} target_samples={} min_samples={} hit_budget_exhausted={} quality_priority={} target_stop_disabled={} job_stage=refined_hit\n"),
                     ModTag,
                     m_pipeline_job.front_coverage_ok ? 1 : 0,
                     m_pipeline_job.front_coverage_failed ? 1 : 0,
@@ -12524,7 +12538,9 @@ namespace
                     m_pipeline_job.samples.size(),
                     m_pipeline_job.target_paint_hits,
                     m_pipeline_job.min_paint_hits,
-                    m_pipeline_job.refined_stats.budget_exhausted ? 1 : 0);
+                    m_pipeline_job.refined_stats.budget_exhausted ? 1 : 0,
+                    FrontQualityPriorityMode ? 1 : 0,
+                    FrontQualityPriorityMode ? 1 : 0);
                 if ((!m_pipeline_job.front_coverage_ok ||
                      static_cast<int>(m_pipeline_job.samples.size()) < m_pipeline_job.min_paint_hits) &&
                     !DiagnosticsEnabled)
@@ -12774,10 +12790,17 @@ namespace
                 m_pipeline_job.brush =
                     resolve_runtime_paint_brush_settings(m_pipeline_job.component,
                                                          static_cast<int>(m_pipeline_job.apply_samples.size()));
-                m_pipeline_job.apply_samples =
-                    merge_precision_stroke_samples(m_pipeline_job.apply_samples,
-                                                   m_pipeline_job.brush.radius,
-                                                   m_pipeline_job.duplicate_merged_strokes);
+                if (FrontQualityPriorityMode)
+                {
+                    m_pipeline_job.duplicate_merged_strokes = 0;
+                }
+                else
+                {
+                    m_pipeline_job.apply_samples =
+                        merge_precision_stroke_samples(m_pipeline_job.apply_samples,
+                                                       m_pipeline_job.brush.radius,
+                                                       m_pipeline_job.duplicate_merged_strokes);
+                }
                 const auto streaming_max_replicated_strokes_per_tick =
                     read_int_property_by_name(m_pipeline_job.component, STR("MaxReplicatedPaintStrokesPerTick")).value_or(24);
                 const auto streaming_replicated_quality_min =
@@ -12793,8 +12816,10 @@ namespace
                         DiagnosticsEnabled,
                         m_pipeline_job.apply_backend.ok});
                 RC::Output::send<RC::LogLevel::Warning>(
-                    STR("{} streaming_apply_prepared readback_backend=sampled_pixel_tick bulk_readback_used=0 streaming_apply=1 brush_radius_source={} requested_brush_radius={} brush_radius={} brush_footprint_texels={} strokes_before_merge={} duplicate_merged_strokes={} front_streaming_samples={} max_replicated_strokes_per_tick={} material_evidence_probe=1 material_channels_sent={} albedo_only={} material_confidence={} material_source={} job_stage=surface_trace_sampling\n"),
+                    STR("{} streaming_apply_prepared readback_backend=sampled_pixel_tick bulk_readback_used=0 streaming_apply=1 quality_priority={} duplicate_merge_disabled={} brush_radius_source={} requested_brush_radius={} brush_radius={} brush_footprint_texels={} strokes_before_merge={} duplicate_merged_strokes={} front_streaming_samples={} max_replicated_strokes_per_tick={} material_evidence_probe=1 material_channels_sent={} albedo_only={} material_confidence={} material_source={} job_stage=surface_trace_sampling\n"),
                     ModTag,
+                    FrontQualityPriorityMode ? 1 : 0,
+                    FrontQualityPriorityMode ? 1 : 0,
                     m_pipeline_job.brush.radius_source,
                     m_pipeline_job.brush.requested_radius,
                     m_pipeline_job.brush.radius,
@@ -13065,10 +13090,18 @@ namespace
                 m_pipeline_job.brush =
                     resolve_runtime_paint_brush_settings(m_pipeline_job.component,
                                                          static_cast<int>(captured_samples.size()));
-                m_pipeline_job.apply_samples =
-                    merge_precision_stroke_samples(captured_samples,
-                                                   m_pipeline_job.brush.radius,
-                                                   m_pipeline_job.duplicate_merged_strokes);
+                if (FrontQualityPriorityMode)
+                {
+                    m_pipeline_job.apply_samples = captured_samples;
+                    m_pipeline_job.duplicate_merged_strokes = 0;
+                }
+                else
+                {
+                    m_pipeline_job.apply_samples =
+                        merge_precision_stroke_samples(captured_samples,
+                                                       m_pipeline_job.brush.radius,
+                                                       m_pipeline_job.duplicate_merged_strokes);
+                }
                 m_pipeline_job.surface_evidence.scene_capture_samples = capture_color_used;
                 m_pipeline_job.surface_evidence.accepted_samples = capture_color_used;
                 m_pipeline_job.surface_evidence.material_resolved_samples =

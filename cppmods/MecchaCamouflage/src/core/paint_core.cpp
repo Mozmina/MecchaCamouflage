@@ -318,11 +318,12 @@ namespace MecchaCamouflage::Core
 
     auto choose_adaptive_sampling_policy(const AdaptiveSamplingInput& input) -> AdaptiveSamplingPolicy
     {
-        constexpr int MinFrontHits = 2048;
-        constexpr int MaxFrontHits = 32768;
-        constexpr int MinPreferredFrontHits = 4096;
+        const auto quality_priority = input.quality_priority;
+        const int MinFrontHits = quality_priority ? 8192 : 2048;
+        const int MaxFrontHits = quality_priority ? 131072 : 32768;
+        const int MinPreferredFrontHits = quality_priority ? 16384 : 4096;
         constexpr int MinRefineGrid = 24;
-        constexpr int MaxRefineGrid = 256;
+        const int MaxRefineGrid = quality_priority ? 512 : 256;
         constexpr int MinSideSeeds = 512;
         constexpr int MaxSideSeeds = 8192;
         constexpr int MinSideViews = 6;
@@ -342,16 +343,24 @@ namespace MecchaCamouflage::Core
         const auto bbox_weight = std::sqrt(bbox_fraction);
 
         AdaptiveSamplingPolicy policy{};
+        const auto front_density_factor = quality_priority ? 48.0 : 14.0;
         policy.target_front_hits = clamp_int(
-            static_cast<int>(std::round(texture_edge * bbox_weight * 14.0)),
+            static_cast<int>(std::round(texture_edge * bbox_weight * front_density_factor)),
             MinFrontHits,
             MaxFrontHits);
-        policy.preferred_front_hits = std::max(MinPreferredFrontHits, static_cast<int>(std::round(policy.target_front_hits * 0.72)));
+        policy.preferred_front_hits =
+            std::max(MinPreferredFrontHits,
+                     static_cast<int>(std::round(policy.target_front_hits * (quality_priority ? 0.90 : 0.72))));
         policy.preferred_front_hits = std::min(policy.preferred_front_hits, policy.target_front_hits);
-        policy.min_front_hits = std::max(MinFrontHits, static_cast<int>(std::round(policy.target_front_hits * 0.28)));
+        policy.min_front_hits = std::max(
+            MinFrontHits,
+            static_cast<int>(std::round(policy.target_front_hits * (quality_priority ? 0.55 : 0.28))));
         policy.min_front_hits = std::min(policy.min_front_hits, policy.preferred_front_hits);
-        policy.hard_max_attempts = std::max(policy.target_front_hits * 4,
-                                            static_cast<int>(std::round(std::sqrt(bbox_pixels) * std::sqrt(texture_edge) * 4.0)));
+        policy.hard_max_attempts = std::max(
+            policy.target_front_hits * (quality_priority ? 8 : 4),
+            static_cast<int>(std::round(std::sqrt(bbox_pixels) *
+                                        std::sqrt(texture_edge) *
+                                        (quality_priority ? 9.0 : 4.0))));
         policy.hard_max_attempts = clamp_int(policy.hard_max_attempts, policy.target_front_hits, MaxFrontHits * 4);
 
         policy.refine_grid_x = clamp_int(

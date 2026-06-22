@@ -287,6 +287,7 @@ namespace MecchaCamouflage::Core
         int existing_seed_count{0};
         int duplicate_texels{0};
         int attempts{0};
+        bool quality_priority{false};
     };
 
     struct AdaptiveSamplingPolicy
