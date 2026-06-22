@@ -566,6 +566,53 @@ namespace MecchaCamouflage::Core
         int normal_limit{0};
     };
 
+    struct UvGapFillSeed
+    {
+        double u{0.0};
+        double v{0.0};
+        double normal_x{0.0};
+        double normal_y{0.0};
+        double normal_z{1.0};
+        Color color{};
+        bool verified{false};
+    };
+
+    struct UvGapFillPolicy
+    {
+        double brush_radius_uv{0.0};
+        double cell_size_uv{0.0};
+        int max_search_cells{8};
+        int edge_dilation_cells{3};
+        int max_fill_strokes{0};
+        double min_normal_dot{0.72};
+        bool enable_edge_extension{true};
+    };
+
+    struct UvGapFillStroke
+    {
+        double u{0.0};
+        double v{0.0};
+        Color color{};
+        int source_index{-1};
+        bool edge_extension{false};
+    };
+
+    struct UvGapFillReport
+    {
+        std::vector<UvGapFillStroke> strokes{};
+        int candidates{0};
+        int sent{0};
+        int bounded_sent{0};
+        int edge_extended_sent{0};
+        int rejected_unbounded{0};
+        int rejected_normal{0};
+        int rejected_occupied{0};
+        int direct_cells{0};
+        int considered_cells{0};
+        double coverage_before{0.0};
+        double coverage_after{0.0};
+    };
+
     struct SideCoverageInput
     {
         bool front_quality_success{false};
@@ -660,6 +707,8 @@ namespace MecchaCamouflage::Core
     auto choose_precision_brush_radius(const PrecisionBrushInput& input) -> PrecisionBrushDecision;
     auto infer_surface_stretch_seeds(const std::vector<SurfaceStretchSeed>& seeds,
                                      const SurfaceStretchPolicy& policy) -> SurfaceStretchReport;
+    auto plan_uv_gap_fill(const std::vector<UvGapFillSeed>& seeds,
+                          const UvGapFillPolicy& policy) -> UvGapFillReport;
     auto evaluate_side_coverage(const SideCoverageInput& input) -> SideCoverageReport;
     auto evaluate_side_back_coverage(const SideBackCoverageInput& input) -> SideBackCoverageReport;
     auto merge_nearby_paint_seeds(const std::vector<PaintSeed>& seeds,

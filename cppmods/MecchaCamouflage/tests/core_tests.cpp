@@ -465,6 +465,89 @@ int main()
     }
 
     {
+        const Core::UvGapFillPolicy policy{
+            0.003,
+            0.01,
+            4,
+            0,
+            4,
+            0.90,
+            false};
+        const std::vector<Core::UvGapFillSeed> seeds{
+            Core::UvGapFillSeed{0.48, 0.50, 0.0, 0.0, 1.0, Core::Color{1.0, 0.0, 0.0, 0.5, 0.0}, true},
+            Core::UvGapFillSeed{0.52, 0.50, 0.0, 0.0, 1.0, Core::Color{0.0, 1.0, 0.0, 0.5, 0.0}, true},
+            Core::UvGapFillSeed{0.50, 0.48, 0.0, 0.0, 1.0, Core::Color{0.0, 0.0, 1.0, 0.5, 0.0}, true},
+            Core::UvGapFillSeed{0.50, 0.52, 0.0, 0.0, 1.0, Core::Color{1.0, 1.0, 1.0, 0.5, 0.0}, true}};
+        const auto fill = Core::plan_uv_gap_fill(seeds, policy);
+        assert(fill.sent > 0);
+        assert(fill.bounded_sent > 0);
+        assert(fill.coverage_after > fill.coverage_before);
+        bool found_center = false;
+        for (const auto& stroke : fill.strokes)
+        {
+            found_center = found_center || (std::abs(stroke.u - 0.505) < 0.011 &&
+                                            std::abs(stroke.v - 0.505) < 0.011);
+            assert(stroke.source_index >= 0);
+            assert(!stroke.edge_extension);
+        }
+        assert(found_center);
+    }
+
+    {
+        const Core::UvGapFillPolicy policy{
+            0.003,
+            0.01,
+            4,
+            0,
+            4,
+            0.90,
+            false};
+        const std::vector<Core::UvGapFillSeed> seeds{
+            Core::UvGapFillSeed{0.48, 0.50, 0.0, 0.0, 1.0, Core::Color{1.0, 0.0, 0.0, 0.5, 0.0}, true}};
+        const auto fill = Core::plan_uv_gap_fill(seeds, policy);
+        assert(fill.sent == 0);
+        assert(fill.rejected_unbounded > 0);
+    }
+
+    {
+        const Core::UvGapFillPolicy policy{
+            0.003,
+            0.01,
+            4,
+            0,
+            4,
+            0.90,
+            false};
+        const std::vector<Core::UvGapFillSeed> seeds{
+            Core::UvGapFillSeed{0.48, 0.50, 0.0, 0.0, 1.0, Core::Color{1.0, 0.0, 0.0, 0.5, 0.0}, true},
+            Core::UvGapFillSeed{0.52, 0.50, 0.0, 0.0, -1.0, Core::Color{0.0, 1.0, 0.0, 0.5, 0.0}, true}};
+        const auto fill = Core::plan_uv_gap_fill(seeds, policy);
+        assert(fill.sent == 0);
+        assert(fill.rejected_normal > 0);
+    }
+
+    {
+        const Core::UvGapFillPolicy policy{
+            0.003,
+            0.01,
+            4,
+            2,
+            4,
+            0.90,
+            true};
+        const std::vector<Core::UvGapFillSeed> seeds{
+            Core::UvGapFillSeed{0.50, 0.50, 0.0, 0.0, 1.0, Core::Color{0.25, 0.50, 0.75, 0.5, 0.0}, true}};
+        const auto fill = Core::plan_uv_gap_fill(seeds, policy);
+        assert(fill.sent > 0);
+        assert(fill.edge_extended_sent > 0);
+        for (const auto& stroke : fill.strokes)
+        {
+            assert(stroke.edge_extension);
+            assert(stroke.source_index == 0);
+        }
+    }
+
+    {
         Core::PipelineJob job{};
         job.id = 42;
         job.stage = Core::PipelineStage::RefinedHit;

@@ -11081,6 +11081,9 @@ namespace
             int stretch_inferred_strokes{0};
             int stretch_rejected_seam{0};
             int stretch_normal_limit{0};
+            MecchaCamouflage::Core::UvGapFillReport uv_gap_fill{};
+            bool uv_gap_fill_prepared{false};
+            int uv_gap_fill_appended{0};
             int vertical_band_hits{0};
             int vertical_band_count{0};
             int apply_cursor{0};
@@ -13762,6 +13765,89 @@ namespace
                         return;
                     }
 
+                    if (!m_pipeline_job.uv_gap_fill_prepared)
+                    {
+                        std::vector<MecchaCamouflage::Core::UvGapFillSeed> gap_seeds{};
+                        gap_seeds.reserve(front_samples.size());
+                        for (const auto& sample : front_samples)
+                        {
+                            MecchaCamouflage::Core::UvGapFillSeed seed{};
+                            seed.u = sample.u;
+                            seed.v = sample.v;
+                            seed.normal_x = sample.normal.X();
+                            seed.normal_y = sample.normal.Y();
+                            seed.normal_z = sample.normal.Z();
+                            seed.color = MecchaCamouflage::Core::Color{
+                                sample.color.r,
+                                sample.color.g,
+                                sample.color.b,
+                                sample.color.roughness,
+                                sample.color.metallic};
+                            seed.verified = true;
+                            gap_seeds.push_back(seed);
+                        }
+                        const auto max_gap_fill =
+                            std::min(65536,
+                                     std::max(4096,
+                                              static_cast<int>(front_samples.size() / 2)));
+                        m_pipeline_job.uv_gap_fill =
+                            MecchaCamouflage::Core::plan_uv_gap_fill(gap_seeds,
+                                                                     MecchaCamouflage::Core::UvGapFillPolicy{
+                                                                         m_pipeline_job.brush.radius,
+                                                                         m_pipeline_job.brush.radius * 0.5,
+                                                                         10,
+                                                                         4,
+                                                                         max_gap_fill,
+                                                                         0.68,
+                                                                         true});
+                        m_pipeline_job.uv_gap_fill_prepared = true;
+                        m_pipeline_job.uv_gap_fill_appended = 0;
+                        for (const auto& stroke : m_pipeline_job.uv_gap_fill.strokes)
+                        {
+                            if (stroke.source_index < 0 ||
+                                stroke.source_index >= static_cast<int>(front_samples.size()))
+                            {
+                                continue;
+                            }
+                            auto fill_sample = front_samples[static_cast<size_t>(stroke.source_index)];
+                            fill_sample.u = clamp(stroke.u, 0.0, 0.999999);
+                            fill_sample.v = clamp(stroke.v, 0.0, 0.999999);
+                            fill_sample.capture_nx = -1.0;
+                            fill_sample.capture_ny = -1.0;
+                            fill_sample.color = Color{
+                                stroke.color.r,
+                                stroke.color.g,
+                                stroke.color.b,
+                                stroke.color.roughness,
+                                stroke.color.metallic};
+                            m_pipeline_job.apply_samples.push_back(fill_sample);
+                            m_pipeline_job.sampled_readback_colors.push_back(std::nullopt);
+                            ++m_pipeline_job.uv_gap_fill_appended;
+                        }
+                        RC::Output::send<RC::LogLevel::Warning>(
+                            STR("{} uv_gap_fill_prepared uv_gap_fill_enabled=1 uv_gap_fill_candidates={} uv_gap_fill_sent={} uv_gap_fill_appended={} uv_gap_fill_bounded={} uv_gap_fill_edge_extended={} uv_gap_fill_rejected_unbounded={} uv_gap_fill_rejected_normal={} uv_gap_fill_rejected_occupied={} uv_gap_fill_direct_cells={} uv_gap_fill_considered_cells={} uv_gap_fill_coverage_before={} uv_gap_fill_coverage_after={} brush_radius={} cell_size={} max_gap_fill={} color_source=verified_hidden_capture_neighbors readback_backend=sampled_pixel_tick texture_import_used=0 job_stage=scene_capture_supplement\n"),
+                            ModTag,
+                            m_pipeline_job.uv_gap_fill.candidates,
+                            m_pipeline_job.uv_gap_fill.sent,
+                            m_pipeline_job.uv_gap_fill_appended,
+                            m_pipeline_job.uv_gap_fill.bounded_sent,
+                            m_pipeline_job.uv_gap_fill.edge_extended_sent,
+                            m_pipeline_job.uv_gap_fill.rejected_unbounded,
+                            m_pipeline_job.uv_gap_fill.rejected_normal,
+                            m_pipeline_job.uv_gap_fill.rejected_occupied,
+                            m_pipeline_job.uv_gap_fill.direct_cells,
+                            m_pipeline_job.uv_gap_fill.considered_cells,
+                            m_pipeline_job.uv_gap_fill.coverage_before,
+                            m_pipeline_job.uv_gap_fill.coverage_after,
+                            m_pipeline_job.brush.radius,
+                            m_pipeline_job.brush.radius * 0.5,
+                            max_gap_fill);
+                        if (m_pipeline_job.uv_gap_fill_appended > 0)
+                        {
+                            return;
+                        }
+                    }
+
                     if (m_pipeline_job.full_body_metallic_base_done)
                     {
                         m_pipeline_job.side_quality_success = true;
@@ -13776,10 +13862,14 @@ namespace
                         m_state.side_budget_exhausted = 0;
                         m_pipeline_job.sampled_front_finalized = true;
                         RC::Output::send<RC::LogLevel::Warning>(
-                            STR("{} side_back_query_skipped route=f10_full_body_metallic_then_front full_body_metallic_base_done=1 front_after_full_body=1 front_material_reset=1 front_material_channels_sent=2 front_metallic=0 front_roughness=0.65 front_material_source=front_non_metallic_after_full_body_base side_enabled=0 side_backend=disabled_full_body_metallic_then_front queued_strokes={} front_streaming_samples={} material_channels_sent=2 albedo_only=0 job_stage=scene_capture_supplement\n"),
+                            STR("{} side_back_query_skipped route=f10_full_body_metallic_then_front full_body_metallic_base_done=1 front_after_full_body=1 front_material_reset=1 front_material_channels_sent=2 front_metallic=0 front_roughness=0.65 front_material_source=front_non_metallic_after_full_body_base side_enabled=0 side_backend=disabled_full_body_metallic_then_front queued_strokes={} front_streaming_samples={} material_channels_sent=2 albedo_only=0 uv_gap_fill_enabled=1 uv_gap_fill_sent={} uv_gap_fill_edge_extended={} uv_gap_fill_coverage_before={} uv_gap_fill_coverage_after={} job_stage=scene_capture_supplement\n"),
                             ModTag,
                             m_pipeline_job.apply_cursor,
-                            m_pipeline_job.sampled_front_sample_count);
+                            m_pipeline_job.sampled_front_sample_count,
+                            m_pipeline_job.uv_gap_fill_appended,
+                            m_pipeline_job.uv_gap_fill.edge_extended_sent,
+                            m_pipeline_job.uv_gap_fill.coverage_before,
+                            m_pipeline_job.uv_gap_fill.coverage_after);
                         return;
                     }
 
@@ -13958,7 +14048,7 @@ namespace
                                                           : STR("<none>"));
                     }
                     RC::Output::send<RC::LogLevel::Warning>(
-                        STR("{} play replicated_paint result reason={} success={} visible_backend={} queued_strokes={} streaming_apply=1 replicated_apply=1 replicated_strokes_sent={} local_echo_strokes={} replicated_strokes_failed={} replicated_batches_sent={} batch_strokes_sent={} batch_strokes_failed={} batch_fallback_strokes={} server_paint_batch_api={} apply_backend={} batch_size={} batch_strokes_sent_last={} local_echo_policy=per_stroke_brush_echo apply_rpc={} local_echo_rpc={} import_backend=0 texture_import_used=0 no_apply=0 albedo_only={} material_channels_sent={} replicated_partial={} quality_success={} overall_quality_success={} front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} refined_grid_complete={} vertical_band_hits={}/{} refined_grid_cursor={} refined_total_cells={} side_enabled={} side_backend={} side_quality_success={} side_quality_failed={} back_quality_success={} back_quality_failed={} side_quality_failure={} side_samples={} back_samples={} side_target_samples={} back_target_samples={} side_min_samples={} back_min_samples={} side_attempts={} back_attempts={} side_duplicate_front_texels={} side_duplicate_self_texels={} virtual_view_count={} side_inferred_samples={} side_back_inferred_color_used={} virtual_side_capture={} virtual_side_capture_started={} virtual_side_capture_failed={} virtual_side_back_complete={} stretch_enabled=0 stretch_backend=disabled_quality_regression stretch_inferred_strokes={} stretch_rejected_seam={} stretch_normal_limit={} readback_backend=sampled_pixel_tick bulk_readback_used=0 sampled_readback_cursor={}/{} atlas_source={} atlas_probe_ok={} exact_material_source=unavailable material_confidence={} material_source={} color_source=hidden_character_capture brush_payload=1 apply_mode=AlphaBlend brush_radius={} effective_brush_world_radius={} brush_seed_radius_px={} brush_radius_source={} requested_brush_radius={} brush_radius_clamped_by_game_min={} brush_footprint_texels={} strokes_before_merge={} duplicate_merged_strokes={} capture_alignment=project_world_to_screen alignment_used=1 projected_delta_avg_px={} projected_delta_p95_px={} projected_delta_max_px={} alignment_fallback_samples={} brush_subdivision_level={} brush_subdivision_pixel_size={} frame_budget_overrun={} apply_frame_overruns={} phase_ms=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) fallback_used=0 legacy_splat_success=0 job_stage=complete\n"),
+                        STR("{} play replicated_paint result reason={} success={} visible_backend={} queued_strokes={} streaming_apply=1 replicated_apply=1 replicated_strokes_sent={} local_echo_strokes={} replicated_strokes_failed={} replicated_batches_sent={} batch_strokes_sent={} batch_strokes_failed={} batch_fallback_strokes={} server_paint_batch_api={} apply_backend={} batch_size={} batch_strokes_sent_last={} local_echo_policy=per_stroke_brush_echo apply_rpc={} local_echo_rpc={} import_backend=0 texture_import_used=0 no_apply=0 albedo_only={} material_channels_sent={} replicated_partial={} quality_success={} overall_quality_success={} front_coverage_ok={} front_coverage_failed={} coverage_failure={} refined_reaches_coarse_bottom={} refined_grid_complete={} vertical_band_hits={}/{} refined_grid_cursor={} refined_total_cells={} side_enabled={} side_backend={} side_quality_success={} side_quality_failed={} back_quality_success={} back_quality_failed={} side_quality_failure={} side_samples={} back_samples={} side_target_samples={} back_target_samples={} side_min_samples={} back_min_samples={} side_attempts={} back_attempts={} side_duplicate_front_texels={} side_duplicate_self_texels={} virtual_view_count={} side_inferred_samples={} side_back_inferred_color_used={} virtual_side_capture={} virtual_side_capture_started={} virtual_side_capture_failed={} virtual_side_back_complete={} stretch_enabled=0 stretch_backend=disabled_quality_regression stretch_inferred_strokes={} stretch_rejected_seam={} stretch_normal_limit={} uv_gap_fill_enabled=1 uv_gap_fill_candidates={} uv_gap_fill_sent={} uv_gap_fill_bounded={} uv_gap_fill_edge_extended={} uv_gap_fill_rejected_unbounded={} uv_gap_fill_rejected_normal={} uv_gap_fill_rejected_occupied={} uv_gap_fill_coverage_before={} uv_gap_fill_coverage_after={} readback_backend=sampled_pixel_tick bulk_readback_used=0 sampled_readback_cursor={}/{} atlas_source={} atlas_probe_ok={} exact_material_source=unavailable material_confidence={} material_source={} color_source=hidden_character_capture brush_payload=1 apply_mode=AlphaBlend brush_radius={} effective_brush_world_radius={} brush_seed_radius_px={} brush_radius_source={} requested_brush_radius={} brush_radius_clamped_by_game_min={} brush_footprint_texels={} strokes_before_merge={} duplicate_merged_strokes={} capture_alignment=project_world_to_screen alignment_used=1 projected_delta_avg_px={} projected_delta_p95_px={} projected_delta_max_px={} alignment_fallback_samples={} brush_subdivision_level={} brush_subdivision_pixel_size={} frame_budget_overrun={} apply_frame_overruns={} phase_ms=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) fallback_used=0 legacy_splat_success=0 job_stage=complete\n"),
                         ModTag,
                         m_pipeline_job.reason.empty() ? STR("<none>") : m_pipeline_job.reason,
                         m_state.success,
@@ -14025,6 +14115,15 @@ namespace
                         m_pipeline_job.stretch_inferred_strokes,
                         m_pipeline_job.stretch_rejected_seam,
                         m_pipeline_job.stretch_normal_limit,
+                        m_pipeline_job.uv_gap_fill.candidates,
+                        m_pipeline_job.uv_gap_fill_appended,
+                        m_pipeline_job.uv_gap_fill.bounded_sent,
+                        m_pipeline_job.uv_gap_fill.edge_extended_sent,
+                        m_pipeline_job.uv_gap_fill.rejected_unbounded,
+                        m_pipeline_job.uv_gap_fill.rejected_normal,
+                        m_pipeline_job.uv_gap_fill.rejected_occupied,
+                        m_pipeline_job.uv_gap_fill.coverage_before,
+                        m_pipeline_job.uv_gap_fill.coverage_after,
                         m_pipeline_job.sampled_readback_cursor,
                         m_pipeline_job.sampled_readback_colors.size(),
                         RC::ensure_str(m_pipeline_job.atlas_probe.source.c_str()),

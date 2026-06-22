@@ -1,6 +1,7 @@
 #include "MecchaCamouflage/core/paint_core.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -1024,6 +1025,396 @@ namespace MecchaCamouflage::Core
                 report.inferred.push_back(inferred);
             }
         }
+        return report;
+    }
+
+    auto plan_uv_gap_fill(const std::vector<UvGapFillSeed>& seeds,
+                          const UvGapFillPolicy& policy) -> UvGapFillReport
+    {
+        struct Cell
+        {
+            bool covered{false};
+            bool direct_source{false};
+            double r{0.0};
+            double g{0.0};
+            double b{0.0};
+            double roughness{0.0};
+            double metallic{0.0};
+            double normal_x{0.0};
+            double normal_y{0.0};
+            double normal_z{0.0};
+            double weight{0.0};
+            double best_distance_sq{std::numeric_limits<double>::infinity()};
+            int source_index{-1};
+        };
+
+        struct SourceCell
+        {
+            bool ok{false};
+            int x{0};
+            int y{0};
+            int distance{0};
+            int source_index{-1};
+            Color color{};
+            double normal_x{0.0};
+            double normal_y{0.0};
+            double normal_z{1.0};
+        };
+
+        UvGapFillReport report{};
+        if (seeds.empty())
+        {
+            return report;
+        }
+
+        const auto brush_radius = std::max(0.000001, policy.brush_radius_uv);
+        const auto requested_cell = policy.cell_size_uv > 0.0 ? policy.cell_size_uv : brush_radius * 0.5;
+        auto grid_edge = clamp_int(static_cast<int>(std::ceil(1.0 / std::max(0.000001, requested_cell))), 4, 1024);
+        const auto cell_size = 1.0 / static_cast<double>(grid_edge);
+        const auto footprint_cells = std::max(0, static_cast<int>(std::floor(brush_radius / cell_size)));
+        const auto search_cells = std::max(1, policy.max_search_cells);
+        const auto edge_dilation_cells = std::max(0, policy.edge_dilation_cells);
+        const auto max_fill = policy.max_fill_strokes > 0
+                                  ? policy.max_fill_strokes
+                                  : static_cast<int>(seeds.size());
+        const auto min_normal_dot = clamp(policy.min_normal_dot, -1.0, 1.0);
+        std::vector<Cell> cells(static_cast<std::size_t>(grid_edge * grid_edge));
+
+        auto index_for = [grid_edge](int x, int y) -> std::size_t {
+            return static_cast<std::size_t>(y * grid_edge + x);
+        };
+        auto cell_index = [grid_edge](double value) -> int {
+            return clamp_int(static_cast<int>(std::floor(clamp(value, 0.0, 0.999999) *
+                                                         static_cast<double>(grid_edge))),
+                             0,
+                             grid_edge - 1);
+        };
+        auto normalize_normal = [](double& x, double& y, double& z) {
+            const auto length = std::sqrt(x * x + y * y + z * z);
+            if (length <= 0.000001)
+            {
+                x = 0.0;
+                y = 0.0;
+                z = 1.0;
+                return;
+            }
+            x /= length;
+            y /= length;
+            z /= length;
+        };
+        auto normal_dot = [](const SourceCell& a, const SourceCell& b) {
+            return a.normal_x * b.normal_x + a.normal_y * b.normal_y + a.normal_z * b.normal_z;
+        };
+        auto color_from_cell = [](const Cell& cell) {
+            Color color{};
+            const auto inv = cell.weight > 0.000001 ? 1.0 / cell.weight : 1.0;
+            color.r = clamp(cell.r * inv, 0.0, 1.0);
+            color.g = clamp(cell.g * inv, 0.0, 1.0);
+            color.b = clamp(cell.b * inv, 0.0, 1.0);
+            color.roughness = clamp(cell.roughness * inv, 0.0, 1.0);
+            color.metallic = clamp(cell.metallic * inv, 0.0, 1.0);
+            return color;
+        };
+
+        int min_x = grid_edge - 1;
+        int min_y = grid_edge - 1;
+        int max_x = 0;
+        int max_y = 0;
+        bool any_seed = false;
+        for (std::size_t seed_index = 0; seed_index < seeds.size(); ++seed_index)
+        {
+            const auto& seed = seeds[seed_index];
+            if (!seed.verified ||
+                !std::isfinite(seed.u) ||
+                !std::isfinite(seed.v))
+            {
+                continue;
+            }
+            const auto cx = cell_index(seed.u);
+            const auto cy = cell_index(seed.v);
+            any_seed = true;
+            min_x = std::min(min_x, cx);
+            min_y = std::min(min_y, cy);
+            max_x = std::max(max_x, cx);
+            max_y = std::max(max_y, cy);
+            for (int dy = -footprint_cells; dy <= footprint_cells; ++dy)
+            {
+                const auto y = cy + dy;
+                if (y < 0 || y >= grid_edge)
+                {
+                    continue;
+                }
+                for (int dx = -footprint_cells; dx <= footprint_cells; ++dx)
+                {
+                    const auto x = cx + dx;
+                    if (x < 0 || x >= grid_edge)
+                    {
+                        continue;
+                    }
+                    const auto distance_sq = static_cast<double>(dx * dx + dy * dy);
+                    if (footprint_cells > 0 &&
+                        distance_sq > static_cast<double>(footprint_cells * footprint_cells))
+                    {
+                        continue;
+                    }
+                    const auto weight = 1.0 / (1.0 + distance_sq);
+                    auto& cell = cells[index_for(x, y)];
+                    cell.covered = true;
+                    cell.direct_source = true;
+                    cell.r += seed.color.r * weight;
+                    cell.g += seed.color.g * weight;
+                    cell.b += seed.color.b * weight;
+                    cell.roughness += seed.color.roughness * weight;
+                    cell.metallic += seed.color.metallic * weight;
+                    cell.normal_x += seed.normal_x * weight;
+                    cell.normal_y += seed.normal_y * weight;
+                    cell.normal_z += seed.normal_z * weight;
+                    cell.weight += weight;
+                    if (distance_sq < cell.best_distance_sq)
+                    {
+                        cell.best_distance_sq = distance_sq;
+                        cell.source_index = static_cast<int>(seed_index);
+                    }
+                }
+            }
+        }
+        if (!any_seed)
+        {
+            return report;
+        }
+
+        const auto margin = std::max(search_cells, edge_dilation_cells) + footprint_cells + 1;
+        min_x = clamp_int(min_x - margin, 0, grid_edge - 1);
+        min_y = clamp_int(min_y - margin, 0, grid_edge - 1);
+        max_x = clamp_int(max_x + margin, 0, grid_edge - 1);
+        max_y = clamp_int(max_y + margin, 0, grid_edge - 1);
+        report.considered_cells = std::max(1, (max_x - min_x + 1) * (max_y - min_y + 1));
+
+        auto source_from_cell = [&](int x, int y, int distance) {
+            SourceCell source{};
+            if (x < 0 || y < 0 || x >= grid_edge || y >= grid_edge)
+            {
+                return source;
+            }
+            const auto& cell = cells[index_for(x, y)];
+            if (!cell.direct_source || cell.weight <= 0.000001)
+            {
+                return source;
+            }
+            source.ok = true;
+            source.x = x;
+            source.y = y;
+            source.distance = distance;
+            source.source_index = cell.source_index;
+            source.color = color_from_cell(cell);
+            source.normal_x = cell.normal_x;
+            source.normal_y = cell.normal_y;
+            source.normal_z = cell.normal_z;
+            normalize_normal(source.normal_x, source.normal_y, source.normal_z);
+            return source;
+        };
+        auto directional_source = [&](int x, int y, int dx, int dy) {
+            for (int distance = 1; distance <= search_cells; ++distance)
+            {
+                const auto source = source_from_cell(x + dx * distance, y + dy * distance, distance);
+                if (source.ok)
+                {
+                    return source;
+                }
+            }
+            return SourceCell{};
+        };
+        auto nearest_edge_source = [&](int x, int y) {
+            SourceCell best{};
+            if (edge_dilation_cells <= 0)
+            {
+                return best;
+            }
+            auto best_distance_sq = std::numeric_limits<int>::max();
+            for (int dy = -edge_dilation_cells; dy <= edge_dilation_cells; ++dy)
+            {
+                for (int dx = -edge_dilation_cells; dx <= edge_dilation_cells; ++dx)
+                {
+                    if (dx == 0 && dy == 0)
+                    {
+                        continue;
+                    }
+                    const auto distance_sq = dx * dx + dy * dy;
+                    if (distance_sq > edge_dilation_cells * edge_dilation_cells ||
+                        distance_sq >= best_distance_sq)
+                    {
+                        continue;
+                    }
+                    auto source = source_from_cell(x + dx, y + dy, static_cast<int>(std::round(std::sqrt(static_cast<double>(distance_sq)))));
+                    if (!source.ok)
+                    {
+                        continue;
+                    }
+                    best_distance_sq = distance_sq;
+                    best = source;
+                }
+            }
+            return best;
+        };
+        auto mark_fill_covered = [&](int cx, int cy) {
+            const auto fill_radius = std::max(0, footprint_cells);
+            for (int dy = -fill_radius; dy <= fill_radius; ++dy)
+            {
+                const auto y = cy + dy;
+                if (y < min_y || y > max_y)
+                {
+                    continue;
+                }
+                for (int dx = -fill_radius; dx <= fill_radius; ++dx)
+                {
+                    const auto x = cx + dx;
+                    if (x < min_x || x > max_x)
+                    {
+                        continue;
+                    }
+                    const auto distance_sq = dx * dx + dy * dy;
+                    if (fill_radius > 0 && distance_sq > fill_radius * fill_radius)
+                    {
+                        continue;
+                    }
+                    cells[index_for(x, y)].covered = true;
+                }
+            }
+        };
+        auto covered_count = [&]() {
+            int covered = 0;
+            for (int y = min_y; y <= max_y; ++y)
+            {
+                for (int x = min_x; x <= max_x; ++x)
+                {
+                    if (cells[index_for(x, y)].covered)
+                    {
+                        ++covered;
+                    }
+                }
+            }
+            return covered;
+        };
+
+        report.direct_cells = covered_count();
+        report.coverage_before =
+            static_cast<double>(report.direct_cells) / static_cast<double>(std::max(1, report.considered_cells));
+
+        for (int y = min_y; y <= max_y && static_cast<int>(report.strokes.size()) < max_fill; ++y)
+        {
+            for (int x = min_x; x <= max_x && static_cast<int>(report.strokes.size()) < max_fill; ++x)
+            {
+                if (cells[index_for(x, y)].covered)
+                {
+                    ++report.rejected_occupied;
+                    continue;
+                }
+
+                const auto left = directional_source(x, y, -1, 0);
+                const auto right = directional_source(x, y, 1, 0);
+                const auto up = directional_source(x, y, 0, -1);
+                const auto down = directional_source(x, y, 0, 1);
+                const auto horizontal = left.ok && right.ok;
+                const auto vertical = up.ok && down.ok;
+                if (!horizontal && !vertical)
+                {
+                    if (policy.enable_edge_extension)
+                    {
+                        const auto edge_source = nearest_edge_source(x, y);
+                        if (edge_source.ok)
+                        {
+                            ++report.candidates;
+                            UvGapFillStroke stroke{};
+                            stroke.u = (static_cast<double>(x) + 0.5) * cell_size;
+                            stroke.v = (static_cast<double>(y) + 0.5) * cell_size;
+                            stroke.color = edge_source.color;
+                            stroke.source_index = edge_source.source_index;
+                            stroke.edge_extension = true;
+                            report.strokes.push_back(stroke);
+                            ++report.edge_extended_sent;
+                            mark_fill_covered(x, y);
+                            continue;
+                        }
+                    }
+                    ++report.rejected_unbounded;
+                    continue;
+                }
+
+                std::array<SourceCell, 4> sources{left, right, up, down};
+                std::vector<SourceCell> used{};
+                used.reserve(4);
+                if (horizontal)
+                {
+                    used.push_back(left);
+                    used.push_back(right);
+                }
+                if (vertical)
+                {
+                    used.push_back(up);
+                    used.push_back(down);
+                }
+
+                auto normal_ok = true;
+                for (std::size_t i = 0; i < used.size() && normal_ok; ++i)
+                {
+                    for (std::size_t j = i + 1; j < used.size(); ++j)
+                    {
+                        if (normal_dot(used[i], used[j]) < min_normal_dot)
+                        {
+                            normal_ok = false;
+                            break;
+                        }
+                    }
+                }
+                ++report.candidates;
+                if (!normal_ok)
+                {
+                    ++report.rejected_normal;
+                    continue;
+                }
+
+                Color color{};
+                double weight_sum = 0.0;
+                int best_source = -1;
+                int best_distance = std::numeric_limits<int>::max();
+                for (const auto& source : used)
+                {
+                    const auto weight = 1.0 / static_cast<double>(std::max(1, source.distance));
+                    color.r += source.color.r * weight;
+                    color.g += source.color.g * weight;
+                    color.b += source.color.b * weight;
+                    color.roughness += source.color.roughness * weight;
+                    color.metallic += source.color.metallic * weight;
+                    weight_sum += weight;
+                    if (source.distance < best_distance)
+                    {
+                        best_distance = source.distance;
+                        best_source = source.source_index;
+                    }
+                }
+                const auto inv = weight_sum > 0.000001 ? 1.0 / weight_sum : 1.0;
+                color.r = clamp(color.r * inv, 0.0, 1.0);
+                color.g = clamp(color.g * inv, 0.0, 1.0);
+                color.b = clamp(color.b * inv, 0.0, 1.0);
+                color.roughness = clamp(color.roughness * inv, 0.0, 1.0);
+                color.metallic = clamp(color.metallic * inv, 0.0, 1.0);
+
+                UvGapFillStroke stroke{};
+                stroke.u = (static_cast<double>(x) + 0.5) * cell_size;
+                stroke.v = (static_cast<double>(y) + 0.5) * cell_size;
+                stroke.color = color;
+                stroke.source_index = best_source;
+                stroke.edge_extension = false;
+                report.strokes.push_back(stroke);
+                ++report.bounded_sent;
+                mark_fill_covered(x, y);
+            }
+        }
+
+        report.sent = static_cast<int>(report.strokes.size());
+        const auto after = covered_count();
+        report.coverage_after =
+            static_cast<double>(after) / static_cast<double>(std::max(1, report.considered_cells));
         return report;
     }
 
