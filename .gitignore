@@ -4,10 +4,26 @@
 /out/
 /dist/
 /packages/
+/p/.venv/
+/p/dist/
+/p/out/
+/p/build_pyexe/
+/p/native/bin/
+*.obj
+
 
 # External dependencies
 /external/
 /third_party/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+*.pyc.*
+*.pyd
+*$py.class
 
 # UE4SS / game runtime artifacts
 /Chameleon/

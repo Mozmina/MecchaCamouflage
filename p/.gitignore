@@ -1,0 +1,8 @@
+# Local python build/deploy artifacts
+.venv/
+dist/
+build_pyexe/
+out/
+*.spec
+*.pyc
+__pycache__/
