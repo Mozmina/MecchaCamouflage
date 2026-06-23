@@ -223,7 +223,10 @@ namespace
             return;
         }
         const double progress = total_steps > 0 ? std::max(0.0, std::min(1.0, static_cast<double>(step) / static_cast<double>(total_steps))) : 0.0;
-        const double eta_ms = progress > 0.02 ? std::max(0.0, (elapsed_ms / progress) - elapsed_ms) : 0.0;
+        const bool stream_progress = extra.find("server_batch_index") != std::string::npos ||
+                                     extra.find("server_batches") != std::string::npos ||
+                                     extra.find("server_sent") != std::string::npos;
+        const double eta_ms = stream_progress && progress > 0.02 ? std::max(0.0, (elapsed_ms / progress) - elapsed_ms) : 0.0;
         std::string json = "{\"stage\":\"" + json_escape(stage) +
                            "\",\"message\":\"" + json_escape(message) +
                            "\",\"step\":" + std::to_string(step) +
@@ -1115,6 +1118,111 @@ namespace
     auto clamp01(double value) -> double
     {
         return std::max(0.0, std::min(1.0, value));
+    }
+
+    auto sdk_luma(const Color& color) -> double
+    {
+        return color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722;
+    }
+
+    auto sdk_is_red_paint_artifact(const Color& color) -> bool
+    {
+        return color.r > 0.78 && color.g < 0.22 && color.b < 0.22;
+    }
+
+    auto sdk_infer_surface_material(Color color, bool floor_like) -> Color
+    {
+        if (floor_like)
+        {
+            color.roughness = std::max(0.86, std::min(0.99, std::max(color.roughness, 0.86)));
+            color.metallic = std::max(0.0, std::min(0.12, color.metallic));
+            return color;
+        }
+        color.roughness = std::max(0.35, std::min(0.99, color.roughness <= 0.0 ? 0.92 : color.roughness));
+        color.metallic = clamp01(color.metallic);
+        return color;
+    }
+
+    auto sdk_sanitize_background_color(const Color& captured, const Color& material_hint) -> Color
+    {
+        if (!sdk_is_red_paint_artifact(captured))
+        {
+            return captured;
+        }
+        Color fallback = material_hint;
+        if (sdk_is_red_paint_artifact(fallback))
+        {
+            fallback = Color{0.34, 0.37, 0.31, 0.94, 0.0};
+        }
+        fallback.r = std::max(0.05, std::min(0.72, fallback.r));
+        fallback.g = std::max(0.08, std::min(0.76, fallback.g));
+        fallback.b = std::max(0.06, std::min(0.70, fallback.b));
+        fallback.roughness = std::max(0.72, std::min(0.98, fallback.roughness));
+        fallback.metallic = 0.0;
+        return fallback;
+    }
+
+    auto sdk_compensate_projected_albedo_preserve_material(Color color, bool floor_like) -> Color
+    {
+        const auto roughness = clamp01(color.roughness);
+        const auto metallic = clamp01(color.metallic);
+        const auto lum = sdk_luma(color);
+        double lift = 1.02;
+        if (lum < 0.18)
+        {
+            lift = 1.10;
+        }
+        else if (lum < 0.34)
+        {
+            lift = 1.06;
+        }
+        else if (lum > 0.58)
+        {
+            lift = 1.00;
+        }
+        color.r = std::max(0.018, std::min(0.98, color.r * lift));
+        color.g = std::max(0.018, std::min(0.98, color.g * lift));
+        color.b = std::max(0.018, std::min(0.98, color.b * lift));
+        color.roughness = floor_like ? std::max(0.86, std::min(0.99, std::max(roughness, 0.86))) : roughness;
+        color.metallic = floor_like ? std::max(0.0, std::min(0.12, metallic)) : metallic;
+        return color;
+    }
+
+    auto sdk_worker_count_for_items(std::size_t item_count) -> unsigned
+    {
+        const auto hardware = std::max(1U, std::thread::hardware_concurrency());
+        const auto useful = item_count < 65536
+                                ? 1U
+                                : std::min<unsigned>(hardware, static_cast<unsigned>((item_count + 65535) / 65536));
+        return std::max(1U, useful);
+    }
+
+    template <typename Fn>
+    auto sdk_parallel_ranges(std::size_t item_count, Fn&& fn) -> void
+    {
+        const auto workers = sdk_worker_count_for_items(item_count);
+        if (workers <= 1 || item_count == 0)
+        {
+            fn(0, item_count, 0);
+            return;
+        }
+        std::vector<std::thread> threads{};
+        threads.reserve(workers);
+        for (unsigned worker = 0; worker < workers; ++worker)
+        {
+            const auto begin = (item_count * static_cast<std::size_t>(worker)) / static_cast<std::size_t>(workers);
+            const auto end = (item_count * static_cast<std::size_t>(worker + 1)) / static_cast<std::size_t>(workers);
+            threads.emplace_back([begin, end, worker, &fn]() {
+                fn(begin, end, worker);
+            });
+        }
+        for (auto& thread : threads)
+        {
+            if (thread.joinable())
+            {
+                thread.join();
+            }
+        }
     }
 
     auto prop_offset(std::uintptr_t prop) -> int
@@ -3130,11 +3238,11 @@ namespace
         int target_front_hits{80000};
         int coarse_grid_x{96};
         int coarse_grid_y{72};
-        int refine_grid_x{320};
-        int refine_grid_y{260};
+        int refine_grid_x{384};
+        int refine_grid_y{320};
         int coarse_seeds{0};
         int refine_seeds{0};
-        int hard_attempt_budget{160000};
+        int hard_attempt_budget{220000};
         int adaptive_passes{0};
         int adaptive_seeds{0};
         int adaptive_attempts{0};
@@ -5982,15 +6090,19 @@ namespace
                 ++out.missing_color;
                 continue;
             }
-            const auto color = sdk_apply_bulk_color_transform(bulk.pixels[pixel_index], best_transform);
+            const auto raw_color = sdk_apply_bulk_color_transform(bulk.pixels[pixel_index], best_transform);
+            const auto floor_like = projected_sample.surface.floor_like;
+            const auto material_hint = sdk_infer_surface_material(raw_color, floor_like);
+            auto color = sdk_sanitize_background_color(raw_color, material_hint);
+            color = sdk_compensate_projected_albedo_preserve_material(color, floor_like);
             FrontSample sample = projected_sample.surface;
             sample.r = clamp01(color.r);
             sample.g = clamp01(color.g);
             sample.b = clamp01(color.b);
-            sample.metallic = 0.0;
-            sample.roughness = 0.65;
+            sample.metallic = clamp01(color.metallic);
+            sample.roughness = clamp01(color.roughness);
             sample.radius = std::max(0.0015, std::min(0.0035, 2.5 / static_cast<double>(std::max(out.width, out.height))));
-            sample.floor_like = false;
+            sample.floor_like = floor_like;
             sample.atlas_priority = 11;
             sample.atlas_radius = 2;
             sample.atlas_weight = 72.0;
@@ -6563,11 +6675,15 @@ namespace
 
         std::vector<std::uint8_t> painted_mask = direct_mask;
         constexpr int fill_radius = 6;
-        for (int y = 0; y < height; ++y)
-        {
-            for (int x = 0; x < width; ++x)
+        auto extended_texels = texels;
+        const auto fill_workers = sdk_worker_count_for_items(pixels);
+        std::vector<int> fill_counts(static_cast<std::size_t>(fill_workers), 0);
+        sdk_parallel_ranges(pixels, [&](std::size_t begin, std::size_t end, unsigned worker) {
+            auto& local_filled = fill_counts[static_cast<std::size_t>(worker)];
+            for (std::size_t index = begin; index < end; ++index)
             {
-                const auto index = static_cast<std::size_t>(y * width + x);
+                const auto y = static_cast<int>(index / static_cast<std::size_t>(width));
+                const auto x = static_cast<int>(index - static_cast<std::size_t>(y * width));
                 if (direct_mask[index])
                 {
                     continue;
@@ -6606,16 +6722,22 @@ namespace
                 {
                     continue;
                 }
-                texels[index] = texels[best_index];
+                extended_texels[index] = texels[best_index];
                 painted_mask[index] = 1;
-                ++out.stats.filled_by_extension;
+                ++local_filled;
             }
+        });
+        texels.swap(extended_texels);
+        for (const auto count : fill_counts)
+        {
+            out.stats.filled_by_extension += count;
         }
 
         out.albedo = before_albedo.bytes;
         out.metallic = before_metallic.bytes;
         out.roughness = before_roughness.bytes;
         out.painted_mask = std::move(painted_mask);
+        out.stats.worker_threads = static_cast<int>(sdk_worker_count_for_items(pixels));
         auto write_scalar = [](std::vector<std::uint8_t>& bytes,
                                int bytes_per_pixel,
                                std::size_t index,
@@ -6642,21 +6764,29 @@ namespace
                 bytes[index] = value;
             }
         };
-        for (std::size_t index = 0; index < pixels; ++index)
-        {
-            if (!out.painted_mask[index] || texels[index].weight <= 0.000001)
+        std::vector<int> preserved_counts(static_cast<std::size_t>(std::max(1, out.stats.worker_threads)), 0);
+        sdk_parallel_ranges(pixels, [&](std::size_t begin, std::size_t end, unsigned worker) {
+            auto& local_preserved = preserved_counts[static_cast<std::size_t>(worker)];
+            for (std::size_t index = begin; index < end; ++index)
             {
-                ++out.stats.preserved_original;
-                continue;
+                if (!out.painted_mask[index] || texels[index].weight <= 0.000001)
+                {
+                    ++local_preserved;
+                    continue;
+                }
+                const auto inv = 1.0 / texels[index].weight;
+                const auto offset = index * 4;
+                out.albedo[offset + 0] = sdk_byte_from_unit(std::max(0.02, std::min(0.98, texels[index].r * inv)));
+                out.albedo[offset + 1] = sdk_byte_from_unit(std::max(0.02, std::min(0.98, texels[index].g * inv)));
+                out.albedo[offset + 2] = sdk_byte_from_unit(std::max(0.02, std::min(0.98, texels[index].b * inv)));
+                out.albedo[offset + 3] = before_albedo.bytes[offset + 3];
+                write_scalar(out.metallic, before_metallic.bytes_per_pixel, index, sdk_byte_from_unit(texels[index].metallic * inv));
+                write_scalar(out.roughness, before_roughness.bytes_per_pixel, index, sdk_byte_from_unit(texels[index].roughness * inv));
             }
-            const auto inv = 1.0 / texels[index].weight;
-            const auto offset = index * 4;
-            out.albedo[offset + 0] = sdk_byte_from_unit(std::max(0.02, std::min(0.98, texels[index].r * inv)));
-            out.albedo[offset + 1] = sdk_byte_from_unit(std::max(0.02, std::min(0.98, texels[index].g * inv)));
-            out.albedo[offset + 2] = sdk_byte_from_unit(std::max(0.02, std::min(0.98, texels[index].b * inv)));
-            out.albedo[offset + 3] = before_albedo.bytes[offset + 3];
-            write_scalar(out.metallic, before_metallic.bytes_per_pixel, index, sdk_byte_from_unit(texels[index].metallic * inv));
-            write_scalar(out.roughness, before_roughness.bytes_per_pixel, index, sdk_byte_from_unit(texels[index].roughness * inv));
+        });
+        for (const auto count : preserved_counts)
+        {
+            out.stats.preserved_original += count;
         }
         out.hash = hash_bytes(out.albedo);
         out.metallic_hash = hash_bytes(out.metallic);
@@ -7330,105 +7460,6 @@ namespace
             atlas_target_channel = meccha_sdk::EPaintChannel::Albedo;
             atlas_use_world_position = false;
         }
-        else if (false && front_texture_import)
-        {
-            auto make_filled_channel = [](const ChannelBuffer& source, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
-                auto bytes = source.bytes;
-                if (bytes.empty())
-                {
-                    return bytes;
-                }
-                if (source.bytes_per_pixel == 4 || bytes.size() % 4 == 0)
-                {
-                    for (std::size_t offset = 0; offset + 3 < bytes.size(); offset += 4)
-                    {
-                        bytes[offset + 0] = r;
-                        bytes[offset + 1] = g;
-                        bytes[offset + 2] = b;
-                        bytes[offset + 3] = 255;
-                    }
-                }
-                else
-                {
-                    std::fill(bytes.begin(), bytes.end(), r);
-                }
-                return bytes;
-            };
-
-            emit_progress("metallic_base_prepared", "prepared full-body white metallic channel base", 1, 9, elapsed_now_ms());
-            emit_progress("metallic_base_apply_tick", "importing full-body white metallic base before front texture", 1, 9, elapsed_now_ms());
-
-            auto metallic_base_albedo = make_filled_channel(before0, 255, 255, 255);
-            auto metallic_base_metallic = make_filled_channel(before1, 255, 255, 255);
-            auto metallic_base_roughness = make_filled_channel(before2, 0, 0, 0);
-            std::string metallic_import_failure0{};
-            std::string metallic_import_failure1{};
-            std::string metallic_import_failure2{};
-            const bool metallic_import0_ok = sdk_import_channel_bytes(ctx, 0, metallic_base_albedo, metallic_import_failure0);
-            const bool metallic_import1_ok = sdk_import_channel_bytes(ctx, 1, metallic_base_metallic, metallic_import_failure1);
-            const bool metallic_import2_ok = sdk_import_channel_bytes(ctx, 2, metallic_base_roughness, metallic_import_failure2);
-            Sleep(120);
-            auto after_metallic0 = sdk_export_channel_bytes(ref, ctx, 0);
-            auto after_metallic1 = sdk_export_channel_bytes(ref, ctx, 1);
-            auto after_metallic2 = sdk_export_channel_bytes(ref, ctx, 2);
-            const auto metallic_base_albedo_hash = hash_bytes(metallic_base_albedo);
-            const auto metallic_base_metallic_hash = hash_bytes(metallic_base_metallic);
-            const auto metallic_base_roughness_hash = hash_bytes(metallic_base_roughness);
-            const bool metallic_base_observed = metallic_import0_ok && metallic_import1_ok && metallic_import2_ok &&
-                                                after_metallic0.ok && after_metallic1.ok && after_metallic2.ok &&
-                                                after_metallic0.hash == metallic_base_albedo_hash &&
-                                                after_metallic1.hash == metallic_base_metallic_hash &&
-                                                after_metallic2.hash == metallic_base_roughness_hash;
-            metadata += std::string(",\"metallic_base_apply_backend\":\"ImportChannelFromBytes.full_body_base_before_front_texture\"") +
-                        ",\"metallic_base_requested\":3" +
-                        ",\"metallic_base_server_sent\":0" +
-                        ",\"metallic_base_server_failed\":0" +
-                        ",\"metallic_base_batch_calls\":0" +
-                        ",\"metallic_base_single_calls\":0" +
-                        ",\"metallic_base_client_mirror_sent\":0" +
-                        ",\"metallic_base_client_mirror_failed\":0" +
-                        ",\"metallic_base_server_rpc\":\"none\"" +
-                        ",\"metallic_base_client_mirror_rpc\":\"none\"" +
-                        ",\"metallic_base_import_albedo_ok\":" + json_bool(metallic_import0_ok) +
-                        ",\"metallic_base_import_metallic_ok\":" + json_bool(metallic_import1_ok) +
-                        ",\"metallic_base_import_roughness_ok\":" + json_bool(metallic_import2_ok) +
-                        ",\"metallic_base_import_albedo_failure\":\"" + json_escape(metallic_import_failure0) + "\"" +
-                        ",\"metallic_base_import_metallic_failure\":\"" + json_escape(metallic_import_failure1) + "\"" +
-                        ",\"metallic_base_import_roughness_failure\":\"" + json_escape(metallic_import_failure2) + "\"" +
-                        sdk_channel_metadata("after_metallic_albedo", after_metallic0) +
-                        sdk_channel_metadata("after_metallic_metallic", after_metallic1) +
-                        sdk_channel_metadata("after_metallic_roughness", after_metallic2) +
-                        ",\"metallic_base_hash_changed\":" + json_bool((after_metallic0.ok && after_metallic0.hash != before0.hash) ||
-                                                                        (after_metallic1.ok && after_metallic1.hash != before1.hash) ||
-                                                                        (after_metallic2.ok && after_metallic2.hash != before2.hash)) +
-                        ",\"metallic_base_visible\":" + json_bool(metallic_base_observed) +
-                        ",\"metallic_base_observed\":" + json_bool(metallic_base_observed) +
-                        ",\"metallic_base_channel0_observed\":" + json_bool(after_metallic0.ok && after_metallic0.hash == metallic_base_albedo_hash) +
-                        ",\"metallic_base_channel1_observed\":" + json_bool(after_metallic1.ok && after_metallic1.hash == metallic_base_metallic_hash) +
-                        ",\"metallic_base_channel2_observed\":" + json_bool(after_metallic2.ok && after_metallic2.hash == metallic_base_roughness_hash) +
-                        ",\"metallic_base_settle_checks\":0" +
-                        ",\"metallic_base_settled_before_front\":true" +
-                        ",\"metallic_base_changed_during_settle\":false";
-            if (!metallic_base_observed)
-            {
-                metadata += ",\"bridge_events\":[\"texture_import_api_ready\",\"metallic_base_prepared\",\"metallic_base_apply_tick\",\"metallic_base_not_visible\"]";
-                return response_json(false,
-                                     "metallic_base_not_visible",
-                                     0,
-                                     1,
-                                     "full-body white metallic base import was not observed on all channels",
-                                     metadata);
-            }
-            before0 = after_metallic0;
-            before1 = after_metallic1;
-            before2 = after_metallic2;
-            emit_progress("metallic_base_visible", "full-body white metallic base observed", 2, 9, elapsed_now_ms());
-            emit_progress("metallic_base_done", "full-body white metallic base completed before front texture", 2, 9, elapsed_now_ms());
-            paint_api_probe_selected = "skipped_front_texture_import_diagnostic";
-            atlas_target_channel = meccha_sdk::EPaintChannel::Albedo;
-            atlas_use_world_position = false;
-            metadata += ",\"paint_api_probe_skipped\":true";
-        }
         else if (front_metallic_texture_route)
         {
             SdkReplicatedStats metallic_stats{};
@@ -7783,11 +7814,18 @@ namespace
             for (auto& sample : captured_front.samples)
             {
                 ++material_samples;
-                const auto source_metallic_value = 0.0;
-                const auto metallic_value = source_metallic_value;
-                const auto roughness_value = sample.floor_like ? 0.94 : 0.92;
-                sample.metallic = metallic_value;
-                sample.roughness = roughness_value;
+                Color color{sample.r, sample.g, sample.b, sample.roughness, sample.metallic};
+                const auto source_metallic_value = clamp01(color.metallic);
+                const auto material_hint = sdk_infer_surface_material(color, sample.floor_like);
+                color = sdk_sanitize_background_color(color, material_hint);
+                color = sdk_compensate_projected_albedo_preserve_material(color, sample.floor_like);
+                sample.r = clamp01(color.r);
+                sample.g = clamp01(color.g);
+                sample.b = clamp01(color.b);
+                sample.metallic = clamp01(color.metallic);
+                sample.roughness = clamp01(color.roughness);
+                const auto metallic_value = sample.metallic;
+                const auto roughness_value = sample.roughness;
                 ++material_valid;
                 if (metallic_value >= 0.95 && roughness_value <= 0.05)
                 {
@@ -7804,7 +7842,7 @@ namespace
                 roughness_sum += roughness_value;
             }
             const auto denom = static_cast<double>(std::max(1, material_samples));
-            metadata += std::string(",\"front_material_source\":\"38923_infer_surface_material_no_trace\"") +
+            metadata += std::string(",\"front_material_source\":\"38923_capture_sanitize_compensate_no_trace\"") +
                         ",\"front_material_trace_evidence_ported\":false" +
                         ",\"front_material_metallic_override\":\"none\"" +
                         ",\"front_material_samples\":" + std::to_string(material_samples) +
@@ -7861,7 +7899,7 @@ namespace
         const auto& atlas_base_roughness = before2;
         auto atlas = sdk_assemble_texture_atlas(atlas_base_albedo, atlas_base_metallic, atlas_base_roughness, atlas_samples);
         metadata += sdk_atlas_metadata(atlas) +
-                    ",\"atlas_base_source\":\"" + std::string(front_texture_import ? "full_body_white_metallic_base" : "current_channels") + "\"" +
+                    ",\"atlas_base_source\":\"" + std::string(front_texture_import ? "current_exported_channels_38923_parity" : "current_channels") + "\"" +
                     ",\"atlas_base_hash\":\"" + std::to_string(atlas_base_albedo.hash) + "\"" +
                     ",\"atlas_base_metallic_hash\":\"" + std::to_string(atlas_base_metallic.hash) + "\"" +
                     ",\"atlas_base_roughness_hash\":\"" + std::to_string(atlas_base_roughness.hash) + "\"" +
