@@ -4077,8 +4077,8 @@ namespace
         const int target_samples = std::max(result.min_front_hits, result.target_front_hits);
         const int hard_attempts = std::max(result.hard_attempt_budget, target_samples * 2);
         result.hard_attempt_budget = hard_attempts;
-        std::vector<std::uint64_t> unique_texels{};
-        unique_texels.reserve(static_cast<std::size_t>(target_samples));
+        std::unordered_set<std::uint64_t> unique_texels{};
+        unique_texels.reserve(static_cast<std::size_t>(target_samples) * 2U);
         result.samples.reserve(static_cast<std::size_t>(target_samples));
 
         auto cell_jitter = [](int x, int y, int salt) -> double {
@@ -4208,12 +4208,11 @@ namespace
             const auto ux = static_cast<std::uint64_t>(std::max(0, std::min(4095, static_cast<int>(clamp01(hit.u) * 4096.0))));
             const auto uy = static_cast<std::uint64_t>(std::max(0, std::min(4095, static_cast<int>(clamp01(hit.v) * 4096.0))));
             const auto key = (uy << 32) | ux;
-            if (std::find(unique_texels.begin(), unique_texels.end(), key) != unique_texels.end())
+            if (!unique_texels.insert(key).second)
             {
                 ++result.duplicate_uv;
                 return false;
             }
-            unique_texels.push_back(key);
 
             FrontSample sample{};
             sample.u = clamp01(hit.u);
@@ -7814,16 +7813,7 @@ namespace
             for (auto& sample : captured_front.samples)
             {
                 ++material_samples;
-                Color color{sample.r, sample.g, sample.b, sample.roughness, sample.metallic};
-                const auto source_metallic_value = clamp01(color.metallic);
-                const auto material_hint = sdk_infer_surface_material(color, sample.floor_like);
-                color = sdk_sanitize_background_color(color, material_hint);
-                color = sdk_compensate_projected_albedo_preserve_material(color, sample.floor_like);
-                sample.r = clamp01(color.r);
-                sample.g = clamp01(color.g);
-                sample.b = clamp01(color.b);
-                sample.metallic = clamp01(color.metallic);
-                sample.roughness = clamp01(color.roughness);
+                const auto source_metallic_value = clamp01(sample.metallic);
                 const auto metallic_value = sample.metallic;
                 const auto roughness_value = sample.roughness;
                 ++material_valid;
@@ -7844,6 +7834,7 @@ namespace
             const auto denom = static_cast<double>(std::max(1, material_samples));
             metadata += std::string(",\"front_material_source\":\"38923_capture_sanitize_compensate_no_trace\"") +
                         ",\"front_material_trace_evidence_ported\":false" +
+                        ",\"front_material_compensation_passes\":1" +
                         ",\"front_material_metallic_override\":\"none\"" +
                         ",\"front_material_samples\":" + std::to_string(material_samples) +
                         ",\"front_material_valid\":" + std::to_string(material_valid) +
@@ -7862,7 +7853,7 @@ namespace
 
         SdkAtlasSideBackResult side_back{};
         std::vector<FrontSample> atlas_samples = captured_front.samples;
-        const bool collect_side_back_for_texture = front_texture_import || !front_metallic_texture_route;
+        const bool collect_side_back_for_texture = !front_texture_import && !front_metallic_texture_route;
         if (collect_side_back_for_texture)
         {
             side_back = sdk_collect_atlas_side_back_samples(ref, ctx, native_front, captured_front.samples, before0.width, before0.height);
@@ -7889,17 +7880,50 @@ namespace
         }
         else
         {
-            metadata += ",\"side_back_attempts\":0,\"side_back_success\":0,\"side_back_owner_hits\":0,\"side_back_uv_hits\":0" \
-                        ",\"side_hits\":0,\"back_hits\":0,\"side_back_duplicate_texels\":0,\"side_back_nearest_sources\":0" \
-                        ",\"side_back_failure\":\"skipped_front_only_route\"";
+            metadata += std::string(",\"side_back_attempts\":0,\"side_back_success\":0,\"side_back_owner_hits\":0,\"side_back_uv_hits\":0") +
+                        ",\"side_hits\":0,\"back_hits\":0,\"side_back_duplicate_texels\":0,\"side_back_nearest_sources\":0" +
+                        ",\"side_back_failure\":\"" + std::string(front_texture_import ? "skipped_front_texture_back_metallic_route" : "skipped_front_only_route") + "\"";
         }
 
-        const auto& atlas_base_albedo = before0;
-        const auto& atlas_base_metallic = before1;
-        const auto& atlas_base_roughness = before2;
+        auto make_filled_channel = [](const ChannelBuffer& source, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+            auto bytes = source.bytes;
+            if (bytes.empty())
+            {
+                return bytes;
+            }
+            if (source.bytes_per_pixel >= 4 || bytes.size() % 4 == 0)
+            {
+                for (std::size_t offset = 0; offset + 3 < bytes.size(); offset += 4)
+                {
+                    bytes[offset + 0] = r;
+                    bytes[offset + 1] = g;
+                    bytes[offset + 2] = b;
+                    bytes[offset + 3] = 255;
+                }
+            }
+            else
+            {
+                std::fill(bytes.begin(), bytes.end(), r);
+            }
+            return bytes;
+        };
+        ChannelBuffer atlas_base_albedo = before0;
+        ChannelBuffer atlas_base_metallic = before1;
+        ChannelBuffer atlas_base_roughness = before2;
+        if (front_texture_import)
+        {
+            atlas_base_albedo.bytes = make_filled_channel(before0, 255, 255, 255);
+            atlas_base_metallic.bytes = make_filled_channel(before1, 255, 255, 255);
+            atlas_base_roughness.bytes = make_filled_channel(before2, 0, 0, 0);
+            atlas_base_albedo.hash = hash_bytes(atlas_base_albedo.bytes);
+            atlas_base_metallic.hash = hash_bytes(atlas_base_metallic.bytes);
+            atlas_base_roughness.hash = hash_bytes(atlas_base_roughness.bytes);
+        }
         auto atlas = sdk_assemble_texture_atlas(atlas_base_albedo, atlas_base_metallic, atlas_base_roughness, atlas_samples);
         metadata += sdk_atlas_metadata(atlas) +
-                    ",\"atlas_base_source\":\"" + std::string(front_texture_import ? "current_exported_channels_38923_parity" : "current_channels") + "\"" +
+                    ",\"atlas_base_source\":\"" + std::string(front_texture_import ? "full_body_white_metallic_remainder_front_texture_overlay" : "current_channels") + "\"" +
+                    ",\"front_texture_back_metallic_white\":" + json_bool(front_texture_import) +
+                    ",\"front_texture_side_back_texture_skipped\":" + json_bool(front_texture_import) +
                     ",\"atlas_base_hash\":\"" + std::to_string(atlas_base_albedo.hash) + "\"" +
                     ",\"atlas_base_metallic_hash\":\"" + std::to_string(atlas_base_metallic.hash) + "\"" +
                     ",\"atlas_base_roughness_hash\":\"" + std::to_string(atlas_base_roughness.hash) + "\"" +
