@@ -14,21 +14,12 @@ if (-not (Test-Path $GameRoot -PathType Container)) {
     throw "Game root was not found or not a directory: $GameRoot"
 }
 if (-not $ExePath) {
-    $DistDir = Join-Path $RuntimeRoot ".build\dist"
-    if (Test-Path $DistDir) {
-        $RuntimeName = [System.IO.Path]::GetFileNameWithoutExtension($ExeName)
-        $ExeCandidates = Get-ChildItem -Path $DistDir -File -Filter "$RuntimeName*.exe" -ErrorAction SilentlyContinue
-        if ($ExeCandidates) {
-            $ExePath = ($ExeCandidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-        }
-    }
-    if (-not $ExePath) {
-        $ExePath = Join-Path $RuntimeRoot ".build\dist\meccha-camouflage.exe"
-    }
+    $RuntimeName = [System.IO.Path]::GetFileNameWithoutExtension($ExeName)
+    $ExePath = Join-Path $RuntimeRoot ".build\native\bin\$RuntimeName.exe"
 }
 
 if (-not (Test-Path $ExePath -PathType Leaf)) {
-    throw "Executable not found: $ExePath. Run scripts/build_exe.ps1 first."
+    throw "Executable not found: $ExePath. Run scripts/build_native.ps1 first."
 }
 
 $GameBin = Join-Path $GameRoot $InstallSubDir

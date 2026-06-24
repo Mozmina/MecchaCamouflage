@@ -4,15 +4,14 @@
 
 # Meccha Camouflage Runtime
 
-This repository is now centered on the Xenos-injected `p` runtime. The active runtime lives at the repository root:
+This repository is centered on the Xenos-injected native runtime.
 
-- `src/`: Python orchestration service and CLI.
-- `native/`: C++ injector and injected bridge.
-- `scripts/`: build, deploy, and SDK dump workflow scripts.
+- `native/`: C++ controller, injected bridge, and SDK-backed paint runtime.
+- `scripts/`: build, deploy, package, and SDK dump workflows.
 - `dumper-sdk/`: managed Dumper7 SDK output for the target game build.
 - `tools/Dumper-7/`: local Dumper-7 tool source.
 
-The old UE4SS runtime is not part of the active build/deploy path.
+The runtime release artifact is a single `meccha-camouflage.exe`. The bridge DLL is embedded in that EXE and extracted under `%LOCALAPPDATA%\MecchaCamouflage\runtime\native\` at startup before injection.
 
 ## Build
 
@@ -26,11 +25,10 @@ Build output is written under `.build/`:
 
 ```text
 .build/
-  native/bin/                 # injected DLL and injector exe
-  native/obj/                 # native object files
-  pyinstaller/                # PyInstaller work/spec files
-  venv/                       # Python virtualenv
-  dist/meccha-camouflage.exe  # runtime exe
+  native/bin/meccha-camouflage.exe       # controller/runtime EXE
+  native/bin/meccha-xenos-bridge.dll     # embedded into the controller at build time
+  native/bin/meccha-xenos-injector.exe   # development helper for SDK tooling
+  native/obj/                            # native object/resource files
 ```
 
 ## Deploy
@@ -39,27 +37,29 @@ Build output is written under `.build/`:
 ./scripts/dev_flow.sh -Action deploy -GameRoot 'C:\Program Files (x86)\Steam\steamapps\common\MECCHA CHAMELEON'
 ```
 
-The deploy script installs `.build/dist/meccha-camouflage.exe` into:
+The deploy script installs `.build/native/bin/meccha-camouflage.exe` into:
 
 ```text
 C:\Program Files (x86)\Steam\steamapps\common\MECCHA CHAMELEON\Chameleon\Binaries\Win64
 ```
 
-If the target exe is locked, deploy stages a `.pending.exe` and starts the replacement watcher.
+If the target EXE is locked, deploy stages a `.pending.exe` and starts the replacement watcher.
 
 ## Run
 
-The default runtime mode is the Xenos service path:
+The default runtime mode is the native Xenos service path:
 
 ```bash
 ./scripts/dev_flow.sh -Action run
 ```
 
-Direct Python usage is still supported for development:
+Useful direct modes:
 
 ```bash
-python -m src --mode service --adapter xenos --print-summary
-python -m src --mode loop --adapter noop --loop-frames 5 --print-summary
+.build/native/bin/meccha-camouflage.exe --mode service
+.build/native/bin/meccha-camouflage.exe --mode probe
+.build/native/bin/meccha-camouflage.exe --mode apply --native-apply-mode texture_sync_strict_probe
+.build/native/bin/meccha-camouflage.exe --mode shutdown
 ```
 
 Runtime diagnostics are written to:
@@ -79,4 +79,4 @@ High-level rules:
 - Active multiplayer candidates must go through Xenos/native SDK routes.
 - Local-only texture import is not a default runtime path.
 - Material swap, synthetic UV placement, and memory-scan fallback are forbidden.
-- Python remains as orchestration in phase 1; a C++ service replacement is tracked in `docs/cpp-service-roadmap.md`.
+- Paint and texture quality changes are intentionally separate from runtime/controller refactors.

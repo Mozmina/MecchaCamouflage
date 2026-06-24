@@ -6,12 +6,11 @@
 /packages/
 *.obj
 
-
 # External dependencies
 /external/
 /third_party/
 
-# Python
+# Bytecode / generated local caches
 __pycache__/
 *.py[cod]
 *.pyo

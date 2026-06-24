@@ -11,37 +11,35 @@ $ErrorActionPreference = "Stop"
 if (-not $OutDir) {
     $OutDir = Join-Path $RuntimeRoot ".build\package"
 }
-$ArtifactName = "meccha-camouflage-python-$Version"
+$ArtifactName = "meccha-camouflage-$Version"
 if (-not $ExePath) {
-    $ExePath = Join-Path $RuntimeRoot ".build\dist\meccha-camouflage.exe"
+    $ExePath = Join-Path $RuntimeRoot ".build\native\bin\meccha-camouflage.exe"
 }
 if (-not (Test-Path $ExePath -PathType Leaf)) {
-    throw "Executable not found: $ExePath. Run scripts/build_exe.ps1 first."
+    throw "Executable not found: $ExePath. Run scripts/build_native.ps1 first."
 }
 
 $TmpRoot = Join-Path $OutDir "tmp-release"
 Remove-Item -Recurse -Force $TmpRoot -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $TmpRoot | Out-Null
 
-$ExeRel = Join-Path $TmpRoot $([System.IO.Path]::GetFileName($ExePath))
-Copy-Item -Force $ExePath $ExeRel
-    Copy-Item -Force (Join-Path $RuntimeRoot "README.md") (Join-Path $TmpRoot "README.md")
+Copy-Item -Force $ExePath (Join-Path $TmpRoot $([System.IO.Path]::GetFileName($ExePath)))
+Copy-Item -Force (Join-Path $RuntimeRoot "README.md") (Join-Path $TmpRoot "README.md")
 
 Set-Content -Encoding ASCII -Path (Join-Path $TmpRoot "runtime-config.json") -Value @'
 {
   "version": "%VERSION%",
-  "runtime": "python",
+  "runtime": "cpp",
   "mode": "service",
-  "adapter": "xenos",
   "game_process_name": "PenguinHotel-Win64-Shipping.exe",
   "log_dir": "%LOCALAPPDATA%\\MecchaCamouflage\\runtime"
 }
 '@.Replace("%VERSION%", $Version)
 
 if ($IncludeRuntimeSource) {
-    Copy-Item -Recurse -Force (Join-Path $RuntimeRoot "src") (Join-Path $TmpRoot "src")
-    Copy-Item -Force (Join-Path $RuntimeRoot "pyproject.toml") (Join-Path $TmpRoot "pyproject.toml")
+    Copy-Item -Recurse -Force (Join-Path $RuntimeRoot "native") (Join-Path $TmpRoot "native")
     Copy-Item -Recurse -Force (Join-Path $RuntimeRoot "scripts") (Join-Path $TmpRoot "scripts")
+    Copy-Item -Recurse -Force (Join-Path $RuntimeRoot "docs") (Join-Path $TmpRoot "docs")
 }
 
 Add-Type -AssemblyName System.IO.Compression

@@ -1,6 +1,7 @@
 param(
     [string]$RuntimeRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-    [string]$OutDir = ""
+    [string]$OutDir = "",
+    [string]$ExeName = "meccha-camouflage"
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,18 +15,10 @@ New-Item -ItemType Directory -Force -Path $ObjDir | Out-Null
 
 $BridgeSource = Join-Path $RuntimeRoot "native\src\meccha_xenos_bridge.cpp"
 $InjectorSource = Join-Path $RuntimeRoot "native\src\meccha_xenos_injector.cpp"
-if (-not (Test-Path $BridgeSource)) {
-    throw "Bridge source not found: $BridgeSource"
-}
-if (-not (Test-Path $InjectorSource)) {
-    throw "Injector source not found: $InjectorSource"
-}
-
-function Invoke-Cl {
-    param([Parameter(Mandatory = $true)][string[]]$CompilerArgs)
-    & cl.exe @CompilerArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "cl.exe failed with exit code $LASTEXITCODE"
+$ControllerSource = Join-Path $RuntimeRoot "native\src\meccha_runtime_controller.cpp"
+foreach ($source in @($BridgeSource, $InjectorSource, $ControllerSource)) {
+    if (-not (Test-Path $source)) {
+        throw "Source not found: $source"
     }
 }
 
@@ -52,38 +45,56 @@ function Get-VsDevCmd {
     return ""
 }
 
-function Invoke-NativeBuildCommand {
-    param([Parameter(Mandatory = $true)][string[]]$CompilerArgs)
-    if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
-        Invoke-Cl -CompilerArgs $CompilerArgs
+function Invoke-VsToolCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$ToolName,
+        [Parameter(Mandatory = $true)][string[]]$ToolArgs
+    )
+    if (Get-Command $ToolName -ErrorAction SilentlyContinue) {
+        & $ToolName @ToolArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "$ToolName failed with exit code $LASTEXITCODE"
+        }
         return
     }
 
     $VsDevCmd = Get-VsDevCmd
     if (-not $VsDevCmd) {
-        throw "cl.exe was not found. Install Visual Studio 2022 Build Tools or run from a VS Developer PowerShell."
+        throw "$ToolName was not found. Install Visual Studio 2022 Build Tools or run from a VS Developer PowerShell."
     }
-    $ArgText = ($CompilerArgs | ForEach-Object { Quote-CmdArg $_ }) -join " "
-    $CommandLine = "$(Quote-CmdArg $VsDevCmd) -arch=x64 -host_arch=x64 >nul && cl.exe $ArgText"
+    $ArgText = ($ToolArgs | ForEach-Object { Quote-CmdArg $_ }) -join " "
+    $CommandLine = "$(Quote-CmdArg $VsDevCmd) -arch=x64 -host_arch=x64 >nul && $ToolName $ArgText"
     cmd /d /c $CommandLine
     if ($LASTEXITCODE -ne 0) {
-        throw "cl.exe failed with exit code $LASTEXITCODE"
+        throw "$ToolName failed with exit code $LASTEXITCODE"
     }
 }
+
+function Get-ExeBaseName {
+    param([string]$Name)
+    $candidate = (New-Object System.IO.FileInfo($Name)).BaseName
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        return "meccha-camouflage"
+    }
+    return $candidate
+}
+
+$ExeName = Get-ExeBaseName -Name $ExeName
 
 Push-Location $RuntimeRoot
 try {
     $BridgeOutput = Join-Path $OutDir "meccha-xenos-bridge.dll"
     $InjectorOutput = Join-Path $OutDir "meccha-xenos-injector.exe"
+    $ControllerOutput = Join-Path $OutDir "$ExeName.exe"
 
-    Invoke-NativeBuildCommand -CompilerArgs @(
+    Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs @(
         "/nologo", "/std:c++17", "/EHsc", "/O2", "/LD", $BridgeSource,
         "/Fo:$(Join-Path $ObjDir 'meccha_xenos_bridge.obj')",
         "/Fe:$BridgeOutput",
         "Ws2_32.lib",
         "User32.lib"
     )
-    Invoke-NativeBuildCommand -CompilerArgs @(
+    Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs @(
         "/nologo", "/EHsc", "/O2", $InjectorSource,
         "/Fo:$(Join-Path $ObjDir 'meccha_xenos_injector.obj')",
         "/Fe:$InjectorOutput"
@@ -91,6 +102,28 @@ try {
 
     if (-not (Test-Path $BridgeOutput)) {
         throw "Bridge DLL was not produced: $BridgeOutput"
+    }
+
+    $ResourceRc = Join-Path $ObjDir "meccha_runtime_controller.rc"
+    $ResourceRes = Join-Path $ObjDir "meccha_runtime_controller.res"
+    $BridgeResourcePath = ((Resolve-Path $BridgeOutput).Path -replace '\\', '\\')
+    Set-Content -Encoding ASCII -Path $ResourceRc -Value "101 RCDATA `"$BridgeResourcePath`"`r`n"
+    Invoke-VsToolCommand -ToolName "rc.exe" -ToolArgs @(
+        "/nologo",
+        "/fo", $ResourceRes,
+        $ResourceRc
+    )
+
+    Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs @(
+        "/nologo", "/std:c++17", "/EHsc", "/O2", $ControllerSource, $ResourceRes,
+        "/Fo:$(Join-Path $ObjDir 'meccha_runtime_controller.obj')",
+        "/Fe:$ControllerOutput",
+        "Ws2_32.lib",
+        "User32.lib"
+    )
+
+    if (-not (Test-Path $ControllerOutput)) {
+        throw "Controller EXE was not produced: $ControllerOutput"
     }
     if (-not (Test-Path $InjectorOutput)) {
         throw "Injector EXE was not produced: $InjectorOutput"
@@ -101,5 +134,6 @@ finally {
 }
 
 Write-Host "Built native artifacts:"
+Write-Host "  $(Join-Path $OutDir "$ExeName.exe")"
 Write-Host "  $(Join-Path $OutDir 'meccha-xenos-bridge.dll')"
 Write-Host "  $(Join-Path $OutDir 'meccha-xenos-injector.exe')"
