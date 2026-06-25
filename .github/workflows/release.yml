@@ -44,6 +44,26 @@ jobs:
         shell: pwsh
         run: .\scripts\package_release.ps1 -Version "${{ steps.version.outputs.version }}"
 
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ".build" | Out-Null
+          @"
+          # Meccha Camouflage ${{ steps.version.outputs.version }}
+
+          This release focuses on a simple, stable front-facing camouflage workflow.
+
+          Requested experimental features were removed from the default runtime because they were not stable enough for release. The current build intentionally keeps the workflow small: launch the executable, wait for it to attach to the game process, then press F10.
+
+          Usage:
+          1. Start MECCHA CHAMELEON.
+          2. Start `meccha-camouflage.exe`.
+          3. Wait until the terminal shows `waiting for user to press F10...`.
+          4. Press F10 to apply the camouflage.
+
+          The executable automatically finds `PenguinHotel-Win64-Shipping.exe` and injects the runtime bridge. No Python environment is required.
+          "@ | Set-Content -Path ".build/release-notes.md" -Encoding UTF8
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -54,4 +74,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          body_path: .build/release-notes.md
           files: .build/package/*.zip
