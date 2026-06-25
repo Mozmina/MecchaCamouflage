@@ -68,11 +68,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: meccha-camouflage
-          path: .build/package/*.zip
+          path: |
+            .build/bin/meccha-camouflage.exe
+            .build/package/*.zip
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           body_path: .build/release-notes.md
-          files: .build/package/*.zip
+          files: |
+            .build/bin/meccha-camouflage.exe
+            .build/package/*.zip
