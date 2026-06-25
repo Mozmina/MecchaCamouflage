@@ -8956,7 +8956,7 @@ namespace
         const auto send_batch_function = ref.find_function(ctx.component, "SendStrokeBatchToServer");
 
         metadata += ",\"route\":\"template_uv_brush_auto_flush_probe\"";
-        metadata += ",\"artist_template_like\":true";
+        metadata += ",\"template_brush_like\":true";
         metadata += ",\"texture_import_used\":false";
         metadata += ",\"paint_at_screen_position_used\":false";
         metadata += ",\"paint_at_uv_with_brush_used\":true";
@@ -9406,7 +9406,6 @@ namespace
         bool restore_called{false};
         bool screen_capture_attempted{false};
         bool screen_capture_ready{false};
-        bool trace_parity{false};
         double brush_radius{0.008};
         double rgb_min{1.0};
         double rgb_max{0.0};
@@ -9431,10 +9430,8 @@ namespace
 
     auto is_template_uv_brush_request(const std::string& request) -> bool
     {
-        return request.find("\"native_apply_mode\":\"artist_template_brush_paint\"") != std::string::npos ||
-               request.find("\"route\":\"f10_artist_template_brush_paint\"") != std::string::npos ||
-               request.find("\"native_apply_mode\":\"artist_trace_parity\"") != std::string::npos ||
-               request.find("\"route\":\"f10_artist_trace_parity\"") != std::string::npos;
+        return request.find("\"native_apply_mode\":\"template_brush_paint\"") != std::string::npos ||
+               request.find("\"route\":\"f10_template_brush_paint\"") != std::string::npos;
     }
 
     void complete_template_uv_brush_job(const std::shared_ptr<TemplateUvBrushAsyncJob>& job, const std::string& response)
@@ -9451,7 +9448,7 @@ namespace
         g_paint_jobs_cv.notify_all();
     }
 
-    auto artist_add_template_point(const std::shared_ptr<TemplateUvBrushAsyncJob>& job,
+    auto template_add_template_point(const std::shared_ptr<TemplateUvBrushAsyncJob>& job,
                                    double screen_x,
                                    double screen_y,
                                    double u,
@@ -9490,7 +9487,7 @@ namespace
         return true;
     }
 
-    auto artist_hit_to_point(const std::shared_ptr<TemplateUvBrushAsyncJob>& job, double screen_x, double screen_y) -> bool
+    auto template_hit_to_point(const std::shared_ptr<TemplateUvBrushAsyncJob>& job, double screen_x, double screen_y) -> bool
     {
         meccha_sdk::RuntimePaintableComponent_HitTestAtScreenPosition hit{};
         hit.MeshComponent = reinterpret_cast<void*>(job->mesh);
@@ -9502,10 +9499,10 @@ namespace
         {
             return false;
         }
-        return artist_add_template_point(job, screen_x, screen_y, hit.ReturnValue.HitUV.X, hit.ReturnValue.HitUV.Y);
+        return template_add_template_point(job, screen_x, screen_y, hit.ReturnValue.HitUV.X, hit.ReturnValue.HitUV.Y);
     }
 
-    auto artist_call_two_bools_direct(std::uintptr_t object, std::uintptr_t function, bool first, bool second) -> bool
+    auto template_call_two_bools_direct(std::uintptr_t object, std::uintptr_t function, bool first, bool second) -> bool
     {
         if (!object || !function)
         {
@@ -9530,7 +9527,7 @@ namespace
         return bool_index > 0 && process_event(object, function, params.data(), failure);
     }
 
-    auto artist_capture_client_rgb(const std::shared_ptr<TemplateUvBrushAsyncJob>& job) -> bool
+    auto template_capture_client_rgb(const std::shared_ptr<TemplateUvBrushAsyncJob>& job) -> bool
     {
         if (!job || job->viewport_width <= 0 || job->viewport_height <= 0)
         {
@@ -9612,19 +9609,17 @@ namespace
 
     auto start_template_uv_brush_async_job(const std::string& request, const std::shared_ptr<QueuedPaintJob>& queued_job) -> bool
     {
-        const bool trace_parity = request.find("\"native_apply_mode\":\"artist_trace_parity\"") != std::string::npos ||
-                                  request.find("\"route\":\"f10_artist_trace_parity\"") != std::string::npos;
         {
             std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
             if (g_template_uv_brush_job)
             {
                 complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
                                                response_json(false,
-                                                             "artist_template_busy",
+                                                             "template_busy",
                                                              0,
                                                              1,
-                                                             "artist template brush job is already running",
-                                                             "\"route\":\"artist_template_brush_paint\""));
+                                                             "template brush job is already running",
+                                                             "\"route\":\"template_brush_paint\""));
                 return true;
             }
         }
@@ -9639,9 +9634,8 @@ namespace
         }
         const auto ctx = sdk_resolve_context(ref);
         std::string metadata = sdk_context_metadata(ref, ctx);
-        metadata += std::string(",\"route\":\"") + (trace_parity ? "artist_trace_parity" : "artist_template_brush_paint") + "\"";
-        metadata += std::string(",\"artist_trace_parity\":") + json_bool(trace_parity);
-        metadata += ",\"artist_static_parity\":\"phase0_template_points_template_load\"";
+        metadata += ",\"route\":\"template_brush_paint\"";
+        metadata += ",\"template_pipeline\":\"phase0_template_points_template_load\"";
         metadata += ",\"texture_import_used\":false";
         metadata += ",\"paint_at_uv_with_brush_used\":true";
         metadata += ",\"paint_at_screen_position_used\":false";
@@ -9650,7 +9644,7 @@ namespace
         metadata += ",\"batched_source_required\":true";
         metadata += ",\"uv_expand_enabled\":false";
         metadata += ",\"screen_fill_enabled\":true";
-        metadata += ",\"artist_profile\":\"stable_scene_capture_template_trace\"";
+        metadata += ",\"template_profile\":\"stable_scene_capture_template\"";
         metadata += ",\"inferred_fields\":[\"brush_radius_formula\",\"scene_capture_hide_component_as_hide_gbuffer_batched\"]";
         if (!ctx.ok)
         {
@@ -9695,19 +9689,19 @@ namespace
         if (!mesh || !hit_test_function)
         {
             complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
-                                           response_json(false, "artist_phase0_surface_unavailable", 0, 1, "front mesh HitTestAtScreenPosition is unavailable", metadata));
+                                           response_json(false, "template_phase0_surface_unavailable", 0, 1, "front mesh HitTestAtScreenPosition is unavailable", metadata));
             return true;
         }
         if (!paint_uv_function || !begin_stroke_function || !end_stroke_function)
         {
             complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
-                                           response_json(false, "artist_template_paint_api_unavailable", 0, 1, "PaintAtUVWithBrush or stroke functions are unavailable", metadata));
+                                           response_json(false, "template_paint_api_unavailable", 0, 1, "PaintAtUVWithBrush or stroke functions are unavailable", metadata));
             return true;
         }
         if (!flush_recorded_function && !send_batch_function)
         {
             complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
-                                           response_json(false, "artist_template_commit_unavailable", 0, 1, "recorded stroke flush functions are unavailable", metadata));
+                                           response_json(false, "template_commit_unavailable", 0, 1, "recorded stroke flush functions are unavailable", metadata));
             return true;
         }
 
@@ -9718,7 +9712,6 @@ namespace
 
         auto job = std::make_shared<TemplateUvBrushAsyncJob>();
         job->queued = queued_job;
-        job->trace_parity = trace_parity;
         job->world = ctx.world;
         job->controller = ctx.controller;
         job->component = ctx.component;
@@ -9746,11 +9739,11 @@ namespace
         job->brush.Falloff = meccha_sdk::EBrushFalloff::Spherical;
         job->brush.BlendMode = meccha_sdk::EPaintBlendMode::Normal;
         job->metadata = metadata;
-        job->metadata += ",\"artist_base_cols\":" + std::to_string(job->base_cols);
-        job->metadata += ",\"artist_base_rows\":" + std::to_string(job->base_rows);
-        job->metadata += ",\"artist_dense_cols\":" + std::to_string(job->dense_cols);
-        job->metadata += ",\"artist_dense_rows\":" + std::to_string(job->dense_rows);
-        job->metadata += ",\"artist_point_target\":" + std::to_string(job->point_target);
+        job->metadata += ",\"template_base_cols\":" + std::to_string(job->base_cols);
+        job->metadata += ",\"template_base_rows\":" + std::to_string(job->base_rows);
+        job->metadata += ",\"template_dense_cols\":" + std::to_string(job->dense_cols);
+        job->metadata += ",\"template_dense_rows\":" + std::to_string(job->dense_rows);
+        job->metadata += ",\"template_point_target\":" + std::to_string(job->point_target);
         job->started = std::chrono::steady_clock::now();
         job->last_tick = job->started;
         job->points.reserve(static_cast<std::size_t>(job->point_target));
@@ -9759,8 +9752,8 @@ namespace
             std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
             g_template_uv_brush_job = job;
         }
-        write_bridge_progress("artist_phase0_begin",
-                              "artist phase0 source generation started",
+        write_bridge_progress("template_phase0_begin",
+                              "template phase0 source generation started",
                               0,
                               100,
                               0.0,
@@ -9808,7 +9801,7 @@ namespace
                                                          job->paint_success,
                                                          1,
                                                          message,
-                                                         job->metadata + ",\"route\":\"artist_template_brush_paint\",\"async_phase_failed\":true"));
+                                                         job->metadata + ",\"route\":\"template_brush_paint\",\"async_phase_failed\":true"));
             {
                 std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
                 if (g_template_uv_brush_job == job)
@@ -9865,7 +9858,7 @@ namespace
             if (percent != job->progress_percent)
             {
                 job->progress_percent = percent;
-                write_bridge_progress("artist_phase0_base_grid",
+                write_bridge_progress("template_phase0_base_grid",
                                       "phase0 base grid bounds",
                                       percent,
                                       100,
@@ -9877,7 +9870,7 @@ namespace
             {
                 if (job->base_hits <= 0 || job->bbox_max_nx <= job->bbox_min_nx || job->bbox_max_ny <= job->bbox_min_ny)
                 {
-                    fail_job("artist_phase0_no_surface_bounds", "artist phase0 base grid found no surface bounds");
+                    fail_job("template_phase0_no_surface_bounds", "template phase0 base grid found no surface bounds");
                     return;
                 }
                 const double span_x = std::max(0.04, job->bbox_max_nx - job->bbox_min_nx);
@@ -9907,7 +9900,7 @@ namespace
                 const double nx = job->bbox_min_nx + (job->bbox_max_nx - job->bbox_min_nx) * tx;
                 const double ny = job->bbox_min_ny + (job->bbox_max_ny - job->bbox_min_ny) * ty;
                 ++job->dense_attempts;
-                if (artist_hit_to_point(job, nx * static_cast<double>(job->viewport_width), ny * static_cast<double>(job->viewport_height)))
+                if (template_hit_to_point(job, nx * static_cast<double>(job->viewport_width), ny * static_cast<double>(job->viewport_height)))
                 {
                     ++job->dense_hits;
                 }
@@ -9916,7 +9909,7 @@ namespace
             if (percent != job->progress_percent)
             {
                 job->progress_percent = percent;
-                write_bridge_progress("artist_phase0_dense",
+                write_bridge_progress("template_phase0_dense",
                                       "phase0 dense surface samples",
                                       percent,
                                       100,
@@ -9957,7 +9950,7 @@ namespace
                 const double nx = job->bbox_min_nx + (job->bbox_max_nx - job->bbox_min_nx) * tx;
                 const double ny = lower_start + (job->bbox_max_ny - lower_start) * ty;
                 ++job->lower_attempts;
-                if (artist_hit_to_point(job, nx * static_cast<double>(job->viewport_width), ny * static_cast<double>(job->viewport_height)))
+                if (template_hit_to_point(job, nx * static_cast<double>(job->viewport_width), ny * static_cast<double>(job->viewport_height)))
                 {
                     ++job->lower_hits;
                 }
@@ -9966,7 +9959,7 @@ namespace
             if (percent != job->progress_percent)
             {
                 job->progress_percent = percent;
-                write_bridge_progress("artist_phase0_lower_rescan",
+                write_bridge_progress("template_phase0_lower_rescan",
                                       "phase0 lower rescan",
                                       percent,
                                       100,
@@ -9992,7 +9985,7 @@ namespace
             const int original_count = static_cast<int>(job->points.size());
             if (original_count <= 0)
             {
-                fail_job("artist_phase0_no_template_points", "artist phase0 produced no template points");
+                fail_job("template_phase0_no_template_points", "template phase0 produced no template points");
                 return;
             }
             constexpr int chunk = 2400;
@@ -10005,16 +9998,16 @@ namespace
                     continue;
                 }
                 const auto p = job->points[static_cast<std::size_t>(job->uv_expand_index)];
-                if (artist_add_template_point(job, p.x, p.y, p.u + uv_delta, p.v)) ++job->uv_expand_added;
-                if (artist_add_template_point(job, p.x, p.y, p.u - uv_delta, p.v)) ++job->uv_expand_added;
-                if (artist_add_template_point(job, p.x, p.y, p.u, p.v + uv_delta)) ++job->uv_expand_added;
-                if (artist_add_template_point(job, p.x, p.y, p.u, p.v - uv_delta)) ++job->uv_expand_added;
+                if (template_add_template_point(job, p.x, p.y, p.u + uv_delta, p.v)) ++job->uv_expand_added;
+                if (template_add_template_point(job, p.x, p.y, p.u - uv_delta, p.v)) ++job->uv_expand_added;
+                if (template_add_template_point(job, p.x, p.y, p.u, p.v + uv_delta)) ++job->uv_expand_added;
+                if (template_add_template_point(job, p.x, p.y, p.u, p.v - uv_delta)) ++job->uv_expand_added;
             }
             const int percent = 40 + static_cast<int>((static_cast<long long>(job->uv_expand_index) * 6LL) / std::max(1, original_count));
             if (percent != job->progress_percent)
             {
                 job->progress_percent = percent;
-                write_bridge_progress("artist_phase0_uv_expand",
+                write_bridge_progress("template_phase0_uv_expand",
                                       "phase0 uv expand",
                                       percent,
                                       100,
@@ -10057,7 +10050,7 @@ namespace
                 {
                     continue;
                 }
-                if (artist_add_template_point(job, (a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.u + b.u) * 0.5, (a.v + b.v) * 0.5))
+                if (template_add_template_point(job, (a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.u + b.u) * 0.5, (a.v + b.v) * 0.5))
                 {
                     ++job->screen_fill_added;
                 }
@@ -10066,7 +10059,7 @@ namespace
             if (percent != job->progress_percent)
             {
                 job->progress_percent = percent;
-                write_bridge_progress("artist_phase0_screen_fill",
+                write_bridge_progress("template_phase0_screen_fill",
                                       "phase0 screen fill",
                                       percent,
                                       100,
@@ -10092,7 +10085,7 @@ namespace
         {
             if (job->points.empty())
             {
-                fail_job("artist_phase0_no_template_points", "artist phase0 produced no template points");
+                fail_job("template_phase0_no_template_points", "template phase0 produced no template points");
                 return;
             }
 
@@ -10122,9 +10115,9 @@ namespace
                 }
                 job->viewport_width = live_viewport.width;
                 job->viewport_height = live_viewport.height;
-                job->metadata += ",\"artist_viewport_refreshed_before_capture\":true";
-                job->metadata += ",\"artist_live_viewport_width\":" + std::to_string(live_viewport.width);
-                job->metadata += ",\"artist_live_viewport_height\":" + std::to_string(live_viewport.height);
+                job->metadata += ",\"template_viewport_refreshed_before_capture\":true";
+                job->metadata += ",\"template_live_viewport_width\":" + std::to_string(live_viewport.width);
+                job->metadata += ",\"template_live_viewport_height\":" + std::to_string(live_viewport.height);
             }
 
             SdkNativeFrontSampleResult native_front{};
@@ -10132,7 +10125,7 @@ namespace
             native_front.hit_test_function = job->hit_test_function;
             native_front.viewport_width = job->viewport_width;
             native_front.viewport_height = job->viewport_height;
-            native_front.sampling_backend = "artist_template_points_cached_hit_test";
+            native_front.sampling_backend = "template_points_cached_hit_test";
             native_front.min_front_hits = std::max(64, std::min(2048, static_cast<int>(job->points.size())));
             native_front.target_front_hits = static_cast<int>(job->points.size());
             native_front.target_unique_atlas_texels = 0;
@@ -10151,7 +10144,7 @@ namespace
                 native_front.samples.push_back(sample);
             }
 
-            write_bridge_progress("artist_phase0_hide_gbuffer_batched",
+            write_bridge_progress("template_phase0_hide_gbuffer_batched",
                                   "phase0 hide_gbuffer_batched capture started",
                                   52,
                                   100,
@@ -10159,13 +10152,13 @@ namespace
                                   "\"template_points\":" + std::to_string(job->points.size()) +
                                       ",\"source_path\":\"hide_gbuffer_batched\"");
 
-            constexpr int kArtistCaptureMaxDimension = 1600;
+            constexpr int kTemplateCaptureMaxDimension = 1600;
             int capture_request_width = std::max(1, job->viewport_width);
             int capture_request_height = std::max(1, job->viewport_height);
             const int request_max_dimension = std::max(capture_request_width, capture_request_height);
-            if (request_max_dimension > kArtistCaptureMaxDimension)
+            if (request_max_dimension > kTemplateCaptureMaxDimension)
             {
-                const double scale = static_cast<double>(kArtistCaptureMaxDimension) / static_cast<double>(request_max_dimension);
+                const double scale = static_cast<double>(kTemplateCaptureMaxDimension) / static_cast<double>(request_max_dimension);
                 capture_request_width = std::max(1, static_cast<int>(std::round(static_cast<double>(capture_request_width) * scale)));
                 capture_request_height = std::max(1, static_cast<int>(std::round(static_cast<double>(capture_request_height) * scale)));
             }
@@ -10173,12 +10166,12 @@ namespace
             const auto capture = sdk_capture_front_colors(ref, ctx, native_front, capture_request_width, capture_request_height);
             const auto capture_elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - capture_started).count();
             job->metadata += sdk_capture_metadata(capture);
-            job->metadata += ",\"artist_capture_request_width\":" + std::to_string(capture_request_width);
-            job->metadata += ",\"artist_capture_request_height\":" + std::to_string(capture_request_height);
-            job->metadata += ",\"artist_capture_elapsed_ms\":" + std::to_string(capture_elapsed_ms);
+            job->metadata += ",\"template_capture_request_width\":" + std::to_string(capture_request_width);
+            job->metadata += ",\"template_capture_request_height\":" + std::to_string(capture_request_height);
+            job->metadata += ",\"template_capture_elapsed_ms\":" + std::to_string(capture_elapsed_ms);
             if (!capture.bulk_readback_used || !capture.image_bulk_calibration_ok || capture.samples.empty())
             {
-                fail_job("artist_hide_gbuffer_batched_unavailable", "hide_gbuffer_batched bulk capture failed: " + capture.failure);
+                fail_job("template_hide_gbuffer_batched_unavailable", "hide_gbuffer_batched bulk capture failed: " + capture.failure);
                 return;
             }
 
@@ -10213,7 +10206,7 @@ namespace
                 if (a.y == b.y) return a.x < b.x;
                 return a.y < b.y;
             });
-            write_bridge_progress("artist_phase0_hide_gbuffer_batched_done",
+            write_bridge_progress("template_phase0_hide_gbuffer_batched_done",
                                   "phase0 hide_gbuffer_batched capture done",
                                   60,
                                   100,
@@ -10232,7 +10225,7 @@ namespace
             const int template_count = static_cast<int>(job->points.size());
             if (template_count <= 0)
             {
-                fail_job("artist_template_points_unavailable", "artist route produced no direct template points; uv_expand/screen_fill are disabled");
+                fail_job("template_points_unavailable", "template route produced no direct template points");
                 return;
             }
             job->paint_tick_budget_ms = 2.0;
@@ -10262,10 +10255,10 @@ namespace
             }
             if (!job->begin_called)
             {
-                fail_job("artist_template_begin_stroke_failed", "BeginStroke failed for artist template brush route");
+                fail_job("template_begin_stroke_failed", "BeginStroke failed for template brush route");
                 return;
             }
-            write_bridge_progress("artist_template_load_begin",
+            write_bridge_progress("template_load_begin",
                                   "template_load BeginStroke and auto flush configured",
                                   62,
                                   100,
@@ -10339,7 +10332,7 @@ namespace
             if (percent != job->progress_percent)
             {
                 job->progress_percent = percent;
-                write_bridge_progress("artist_template_load_paint",
+                write_bridge_progress("template_load_paint",
                                       "template_load PaintAtUVWithBrush stream",
                                       percent,
                                       100,
@@ -10421,10 +10414,10 @@ namespace
             metadata += ",\"gbuffer_metallic_avg\":" + std::to_string(job->metallic_sum / denom);
             metadata += ",\"gbuffer_roughness_avg\":" + std::to_string(job->roughness_sum / denom);
             metadata += std::string(",\"first_failure\":\"") + json_escape(job->first_failure) + "\"";
-            metadata += ",\"bridge_events\":[\"artist_phase0_begin\",\"artist_template_points_done\",\"artist_template_load_done\"]";
+            metadata += ",\"bridge_events\":[\"template_phase0_begin\",\"template_points_done\",\"template_load_done\"]";
 
-            write_bridge_progress("artist_template_load_done",
-                                  "artist template brush paint completed",
+            write_bridge_progress("template_load_done",
+                                  "template brush paint completed",
                                   100,
                                   100,
                                   job_elapsed_ms(),
@@ -10434,10 +10427,10 @@ namespace
             const bool ok = job->paint_success > 0 && job->end_called && (job->flush_called || job->send_batch_called);
             complete_template_uv_brush_job(job,
                                            response_json(ok,
-                                                         ok ? "artist_template_brush_paint_done" : "template_commit_failed",
+                                                         ok ? "template_brush_paint_done" : "template_commit_failed",
                                                          job->paint_success,
                                                          ok ? 0 : 1,
-                                                         ok ? "artist-style template brush paint completed" : "artist-style template brush paint did not commit",
+                                                         ok ? "template brush paint completed" : "template brush paint did not commit",
                                                          metadata));
             {
                 std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
@@ -10474,10 +10467,8 @@ namespace
         const bool legacy_diagnostic_import = false;
         const bool texture_sync_probe = false;
         const bool static_hybrid_probe = false;
-        const bool template_uv_brush_probe = request.find("\"native_apply_mode\":\"artist_template_brush_paint\"") != std::string::npos ||
-                                             request.find("\"route\":\"f10_artist_template_brush_paint\"") != std::string::npos ||
-                                             request.find("\"native_apply_mode\":\"artist_trace_parity\"") != std::string::npos ||
-                                             request.find("\"route\":\"f10_artist_trace_parity\"") != std::string::npos;
+        const bool template_uv_brush_probe = request.find("\"native_apply_mode\":\"template_brush_paint\"") != std::string::npos ||
+                                             request.find("\"route\":\"f10_template_brush_paint\"") != std::string::npos;
         const bool color_transfer_probe = false;
         const bool front_texture_import = texture_sync_probe || static_hybrid_probe;
         const bool strict_38923_front_texture_import = texture_sync_probe;
@@ -10491,18 +10482,16 @@ namespace
         const bool disabled_mesh_route = false;
         const bool front_metallic_texture_route = disabled_metallic_stream;
         const bool front_paint_route = false;
-        const bool artist_trace_parity_route = request.find("\"native_apply_mode\":\"artist_trace_parity\"") != std::string::npos ||
-                                               request.find("\"route\":\"f10_artist_trace_parity\"") != std::string::npos;
-        const std::string route_name = template_uv_brush_probe ? (artist_trace_parity_route ? "artist_trace_parity" : "artist_template_brush_paint") : "unsupported_route";
+        const std::string route_name = template_uv_brush_probe ? "template_brush_paint" : "unsupported_route";
         if (!is_probe && !is_deep_probe && !texture_sync_probe && !static_hybrid_probe && !template_uv_brush_probe)
         {
             return response_json(false,
                                  "unsupported_route",
                                  0,
                                  1,
-                                 "unsupported native apply mode; only artist_template_brush_paint and artist_trace_parity are available",
+                                 "unsupported native apply mode; only template_brush_paint is available",
                                  std::string("\"route\":\"") + json_escape(route_name) + "\"" +
-                                     ",\"supported_native_apply_modes\":[\"artist_template_brush_paint\",\"artist_trace_parity\"]");
+                                     ",\"supported_native_apply_modes\":[\"template_brush_paint\"]");
         }
         static volatile LONG paint_busy = 0;
         static volatile LONG dump_busy = 0;
@@ -10594,10 +10583,10 @@ namespace
         if (template_uv_brush_probe)
         {
             return response_json(false,
-                                 "artist_template_requires_async_dispatch",
+                                 "template_requires_async_dispatch",
                                  0,
                                  1,
-                                 "artist template brush route must run through the game-thread async dispatcher",
+                                 "template brush route must run through the game-thread async dispatcher",
                                  metadata + ",\"route\":\"" + json_escape(route_name) + "\",\"async_dispatch_required\":true");
         }
         if (is_deep_probe)

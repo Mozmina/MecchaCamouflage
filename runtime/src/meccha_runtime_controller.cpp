@@ -48,7 +48,7 @@ namespace
         int service_max_frames{0};
         double service_max_duration_seconds{0.0};
         std::wstring service_stop_file{};
-        std::string native_apply_mode{"artist_template_brush_paint"};
+        std::string native_apply_mode{"template_brush_paint"};
         bool auto_sdk_probe{false};
         bool auto_sdk_deep_probe{false};
         bool print_summary{false};
@@ -753,15 +753,13 @@ namespace
 
     auto mode_to_route(const std::string& native_apply_mode) -> std::string
     {
-        if (native_apply_mode == "artist_template_brush_paint") return "f10_artist_template_brush_paint";
-        if (native_apply_mode == "artist_trace_parity") return "f10_artist_trace_parity";
+        if (native_apply_mode == "template_brush_paint") return "f10_template_brush_paint";
         return "unsupported_route";
     }
 
     auto is_supported_native_apply_mode(const std::string& native_apply_mode) -> bool
     {
-        return native_apply_mode == "artist_template_brush_paint" ||
-               native_apply_mode == "artist_trace_parity";
+        return native_apply_mode == "template_brush_paint";
     }
 
     auto paint_payload(const Config& config, const ProcessInfo& process) -> std::string
@@ -854,7 +852,7 @@ namespace
         if (!is_supported_native_apply_mode(config.native_apply_mode))
         {
             const std::string details = std::string("{\"native_apply_mode\":") + json_string(config.native_apply_mode) +
-                                        ",\"supported_native_apply_modes\":[\"artist_template_brush_paint\",\"artist_trace_parity\"]}";
+                                        ",\"supported_native_apply_modes\":[\"template_brush_paint\"]}";
             diagnostics.record_error("unsupported_route", "unsupported native apply mode", details, run_id);
             diagnostics.event("paint_failed", "error", "unsupported_route", "unsupported native apply mode", details, run_id);
             return false;
