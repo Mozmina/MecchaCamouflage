@@ -16,7 +16,7 @@ Download the latest `meccha-camouflage.exe` from GitHub Releases:
 
 - https://github.com/acentrist/MecchaCamouflage/releases/latest
 
-The EXE is self-contained. It does not need to be placed next to `PenguinHotel-Win64-Shipping.exe`; it finds the running game process by name.
+The EXE is self-contained. it finds the running game process by name.
 
 ## Usage
 
@@ -43,36 +43,11 @@ If the game crashes after a MECCHA CHAMELEON update, the tracked SDK may need to
 
 ## Development
 
-Use Windows with Visual Studio 2022 Build Tools. PowerShell 7 is recommended.
-
 ```bash
 git clone https://github.com/acentrist/MecchaCamouflage.git
 cd MecchaCamouflage
-make build
-```
-
-The development EXE is generated at:
-
-```text
-.build/bin/meccha-camouflage.exe
-```
-
-To run the controller from the repo:
-
-```bash
 make run
 ```
-
-The default development mode is configured at the top of `Makefile`.
-`make build`, `make run`, and `make package` wrap `scripts/build.ps1`,
-`scripts/dev.ps1`, and `scripts/release.ps1`.
-
-## Runtime SDK Resolution
-
-The runtime resolves the global object/name tables at startup and uses the
-minimal declarations in `runtime/sdk/meccha_sdk_min.hpp`. Generated SDK output
-is not part of this repository. If a game update breaks runtime
-reflection or a field layout, update the minimal runtime declarations directly.
 
 ## License
 
