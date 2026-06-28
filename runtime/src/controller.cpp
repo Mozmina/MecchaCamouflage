@@ -1110,8 +1110,10 @@ namespace
 
     auto paint_payload(const Config& config, const ProcessInfo& process) -> std::string
     {
+        const bool research_artifacts = std::getenv("MECCHA_RESEARCH_ARTIFACTS") != nullptr;
         auto payload = std::string("{\"native_apply_mode\":") + json_string(config.native_apply_mode) +
                        ",\"route\":" + json_string(mode_to_route(config.native_apply_mode)) +
+                       ",\"research_artifacts\":" + (research_artifacts ? "true" : "false") +
                        ",\"process\":{\"pid\":" + std::to_string(process.pid) +
                        ",\"name\":" + json_string(wide_to_utf8(process.name)) + "}" +
                        ",\"tuning\":{\"quality_preset\":" + json_string(config.tuning.quality_preset) +

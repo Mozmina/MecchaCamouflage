@@ -404,6 +404,23 @@ namespace
         return ok && written == text.size();
     }
 
+    auto write_binary_file_w(const std::wstring& path, const std::vector<std::uint8_t>& bytes) -> bool
+    {
+        if (path.empty() || bytes.empty())
+        {
+            return false;
+        }
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        DWORD written = 0;
+        const auto ok = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+        CloseHandle(file);
+        return ok && written == bytes.size();
+    }
+
     auto read_bridge_sidecar_text(const wchar_t* suffix, std::string& text) -> bool
     {
         text.clear();
@@ -966,6 +983,7 @@ namespace
         int uv_island{-1};
         int dominant_bone{-1};
         int mesh_region{0};
+        int plan_index{-1};
         std::string body_region{"unknown"};
         bool has_world_position{false};
         sdk::FVector world_position{};
@@ -1109,6 +1127,133 @@ namespace
             }
         }
         return structure;
+    }
+
+    auto array_inner_property_for_struct_fields(Reflection& ref,
+                                                std::uintptr_t array_prop,
+                                                std::initializer_list<const char*> field_names) -> std::uintptr_t
+    {
+        const std::uintptr_t candidate_offsets[]{
+            0x68,
+            0x70,
+            0x78,
+            0x80,
+            0x88,
+            0x90,
+            0x98,
+            0xA0,
+            0xA8,
+        };
+        for (const auto offset : candidate_offsets)
+        {
+            const auto inner = safe_read<std::uintptr_t>(array_prop + offset);
+            if (!inner)
+            {
+                continue;
+            }
+            const auto structure = struct_type(ref, inner, field_names);
+            if (!structure)
+            {
+                continue;
+            }
+            bool has_all_fields = true;
+            for (const auto* field_name : field_names)
+            {
+                if (!field_name || !find_property_any(ref, structure, {field_name}))
+                {
+                    has_all_fields = false;
+                    break;
+                }
+            }
+            if (has_all_fields)
+            {
+                return inner;
+            }
+        }
+        return 0;
+    }
+
+    auto reflected_field_offset(Reflection& ref, std::uintptr_t structure, const char* field_name) -> int
+    {
+        const auto prop = find_property_any(ref, structure, {field_name});
+        return prop ? prop_offset(prop) : -1;
+    }
+
+    auto reflected_field_size(Reflection& ref, std::uintptr_t structure, const char* field_name) -> int
+    {
+        const auto prop = find_property_any(ref, structure, {field_name});
+        return prop ? prop_element_size(prop) : -1;
+    }
+
+    auto paint_stroke_reflection_metadata(Reflection& ref, std::uintptr_t server_batch_function) -> std::string
+    {
+        if (!server_batch_function)
+        {
+            return ",\"paint_stroke_reflection_ok\":false,\"paint_stroke_reflection_failure\":\"server_batch_unavailable\"";
+        }
+        const auto batch_prop = ref.find_property(server_batch_function, "Batch");
+        if (!batch_prop)
+        {
+            return ",\"paint_stroke_reflection_ok\":false,\"paint_stroke_reflection_failure\":\"batch_param_unavailable\"";
+        }
+        const auto batch_struct = struct_type(ref, batch_prop, {"Strokes"});
+        const auto strokes_prop = find_property_any(ref, batch_struct, {"Strokes"});
+        if (!batch_struct || !strokes_prop)
+        {
+            return ",\"paint_stroke_reflection_ok\":false,\"paint_stroke_reflection_failure\":\"strokes_array_unavailable\"";
+        }
+        const auto stroke_inner = array_inner_property_for_struct_fields(ref, strokes_prop, {"Uv", "WorldPosition", "BrushSettings", "ChannelData"});
+        const auto stroke_struct = struct_type(ref, stroke_inner, {"Uv", "WorldPosition", "BrushSettings", "ChannelData"});
+        if (!stroke_inner || !stroke_struct)
+        {
+            return ",\"paint_stroke_reflection_ok\":false,\"paint_stroke_reflection_failure\":\"stroke_struct_unavailable\"" +
+                   std::string(",\"paint_stroke_reflected_batch_offset\":") + std::to_string(prop_offset(batch_prop)) +
+                   ",\"paint_stroke_reflected_strokes_offset\":" + std::to_string(prop_offset(strokes_prop));
+        }
+        const int reflected_size = prop_element_size(stroke_inner);
+        const int uv_offset = reflected_field_offset(ref, stroke_struct, "Uv");
+        const int world_offset = reflected_field_offset(ref, stroke_struct, "WorldPosition");
+        const int has_world_offset = reflected_field_offset(ref, stroke_struct, "bHasWorldPosition");
+        const int local_offset = reflected_field_offset(ref, stroke_struct, "LocalPosition");
+        const int has_local_offset = reflected_field_offset(ref, stroke_struct, "bHasLocalPosition");
+        const int has_triangle_offset = reflected_field_offset(ref, stroke_struct, "bHasSkeletalTriangleAnchor");
+        const int triangle_index_offset = reflected_field_offset(ref, stroke_struct, "SkeletalTriangleIndex");
+        const int bary_offset = reflected_field_offset(ref, stroke_struct, "SkeletalTriangleBarycentric");
+        const int brush_offset = reflected_field_offset(ref, stroke_struct, "BrushSettings");
+        const int channel_offset = reflected_field_offset(ref, stroke_struct, "ChannelData");
+        const int target_offset = reflected_field_offset(ref, stroke_struct, "TargetChannel");
+        const bool static_layout_matches =
+            reflected_size == static_cast<int>(sizeof(sdk::FPaintStroke)) &&
+            uv_offset == static_cast<int>(offsetof(sdk::FPaintStroke, Uv)) &&
+            world_offset == static_cast<int>(offsetof(sdk::FPaintStroke, WorldPosition)) &&
+            has_world_offset == static_cast<int>(offsetof(sdk::FPaintStroke, bHasWorldPosition)) &&
+            local_offset == static_cast<int>(offsetof(sdk::FPaintStroke, LocalPosition)) &&
+            has_local_offset == static_cast<int>(offsetof(sdk::FPaintStroke, bHasLocalPosition)) &&
+            has_triangle_offset == static_cast<int>(offsetof(sdk::FPaintStroke, bHasSkeletalTriangleAnchor)) &&
+            triangle_index_offset == static_cast<int>(offsetof(sdk::FPaintStroke, SkeletalTriangleIndex)) &&
+            bary_offset == static_cast<int>(offsetof(sdk::FPaintStroke, SkeletalTriangleBarycentric)) &&
+            brush_offset == static_cast<int>(offsetof(sdk::FPaintStroke, BrushSettings)) &&
+            channel_offset == static_cast<int>(offsetof(sdk::FPaintStroke, ChannelData)) &&
+            target_offset == static_cast<int>(offsetof(sdk::FPaintStroke, TargetChannel));
+        return ",\"paint_stroke_reflection_ok\":true"
+               ",\"paint_stroke_static_layout_matches\":" + std::string(static_layout_matches ? "true" : "false") +
+               ",\"paint_stroke_reflected_size\":" + std::to_string(reflected_size) +
+               ",\"paint_stroke_static_size\":" + std::to_string(sizeof(sdk::FPaintStroke)) +
+               ",\"paint_stroke_reflected_batch_offset\":" + std::to_string(prop_offset(batch_prop)) +
+               ",\"paint_stroke_reflected_strokes_offset\":" + std::to_string(prop_offset(strokes_prop)) +
+               ",\"paint_stroke_reflected_strokes_size\":" + std::to_string(prop_element_size(strokes_prop)) +
+               ",\"paint_stroke_reflected_uv_offset\":" + std::to_string(uv_offset) +
+               ",\"paint_stroke_reflected_world_offset\":" + std::to_string(world_offset) +
+               ",\"paint_stroke_reflected_has_world_offset\":" + std::to_string(has_world_offset) +
+               ",\"paint_stroke_reflected_local_offset\":" + std::to_string(local_offset) +
+               ",\"paint_stroke_reflected_has_local_offset\":" + std::to_string(has_local_offset) +
+               ",\"paint_stroke_reflected_has_triangle_offset\":" + std::to_string(has_triangle_offset) +
+               ",\"paint_stroke_reflected_triangle_index_offset\":" + std::to_string(triangle_index_offset) +
+               ",\"paint_stroke_reflected_bary_offset\":" + std::to_string(bary_offset) +
+               ",\"paint_stroke_reflected_brush_offset\":" + std::to_string(brush_offset) +
+               ",\"paint_stroke_reflected_channel_offset\":" + std::to_string(channel_offset) +
+               ",\"paint_stroke_reflected_target_offset\":" + std::to_string(target_offset) +
+               ",\"paint_stroke_reflected_bary_size\":" + std::to_string(reflected_field_size(ref, stroke_struct, "SkeletalTriangleBarycentric"));
     }
 
     auto early_hex_address(std::uintptr_t value) -> std::string
@@ -2529,6 +2674,7 @@ namespace
         std::uintptr_t mesh{0};
         std::uintptr_t hit_test_function{0};
         std::string sampling_backend{"unset"};
+        bool keep_occluded_projected_samples{false};
         int viewport_width{0};
         int viewport_height{0};
         int min_front_hits{0};
@@ -3267,6 +3413,17 @@ namespace
                             const sdk::FPaintChannelData& channel,
                             const sdk::FRuntimeBrushSettings& brush,
                             sdk::EPaintChannel target_channel) -> sdk::FPaintStroke;
+    auto sdk_make_mesh_anchor_stroke(double u,
+                                     double v,
+                                     const sdk::FPaintChannelData& channel,
+                                     const sdk::FRuntimeBrushSettings& brush,
+                                     sdk::EPaintChannel target_channel,
+                                     const sdk::FVector& world_position,
+                                     const sdk::FVector& local_position,
+                                     int triangle_index,
+                                     double barycentric_a,
+                                     double barycentric_b,
+                                     double barycentric_c) -> sdk::FPaintStroke;
     auto sdk_call_paint_batch_function(std::uintptr_t component,
                                        std::uintptr_t function,
                                        const std::vector<sdk::FPaintStroke>& strokes,
@@ -3278,6 +3435,10 @@ namespace
                                      std::size_t offset,
                                      std::size_t count,
                                      std::string& failure) -> bool;
+    auto sdk_call_paint_at_uv_with_brush(std::uintptr_t component,
+                                         std::uintptr_t function,
+                                         const sdk::FPaintStroke& stroke,
+                                         std::string& failure) -> bool;
 
     auto sdk_resolve_skinned_pose(Reflection& ref,
                                   std::uintptr_t mesh,
@@ -4391,6 +4552,27 @@ namespace
         std::vector<MeshFirstRuntimeTriangle> triangles{};
     };
 
+    struct MeshFirstRuntimeTriangleCoordinateSelection
+    {
+        bool swapped{false};
+        double direct_avg_error{0.0};
+        double swapped_avg_error{0.0};
+        double selected_avg_error{0.0};
+        int samples{0};
+        std::string mode{"world_local"};
+    };
+
+    struct MeshFirstRuntimeTriangleProjectionSelection
+    {
+        std::string mode{"field0_world_field1_local"};
+        int samples{0};
+        int source_candidates{0};
+        int project_ok{0};
+        int inside_view{0};
+        int best_score{0};
+        std::string summary{};
+    };
+
     struct MeshFirstPlanStats
     {
         int total_triangles{0};
@@ -4674,6 +4856,193 @@ namespace
         return out;
     }
 
+    auto mesh_first_select_runtime_triangle_coordinates(std::vector<MeshFirstRuntimeTriangle>& triangles,
+                                                        const sdk::FTransform& component_to_world) -> MeshFirstRuntimeTriangleCoordinateSelection
+    {
+        MeshFirstRuntimeTriangleCoordinateSelection out{};
+        if (triangles.empty())
+        {
+            return out;
+        }
+        double direct_sum = 0.0;
+        double swapped_sum = 0.0;
+        int samples = 0;
+        const int step = std::max(1, static_cast<int>(triangles.size() / 256));
+        for (std::size_t tri = 0; tri < triangles.size(); tri += static_cast<std::size_t>(step))
+        {
+            const auto& triangle = triangles[tri];
+            for (int vertex = 0; vertex < 3; ++vertex)
+            {
+                const auto direct_world_from_local = mesh_first_transform_apply_point(component_to_world, triangle.local[vertex]);
+                const auto swapped_world_from_local = mesh_first_transform_apply_point(component_to_world, triangle.world[vertex]);
+                const double direct_error = sdk_vec_len(sdk_vec_sub(triangle.world[vertex], direct_world_from_local));
+                const double swapped_error = sdk_vec_len(sdk_vec_sub(triangle.local[vertex], swapped_world_from_local));
+                if (!std::isfinite(direct_error) || !std::isfinite(swapped_error))
+                {
+                    continue;
+                }
+                direct_sum += direct_error;
+                swapped_sum += swapped_error;
+                ++samples;
+            }
+        }
+        out.samples = samples;
+        if (samples <= 0)
+        {
+            return out;
+        }
+        out.direct_avg_error = direct_sum / static_cast<double>(samples);
+        out.swapped_avg_error = swapped_sum / static_cast<double>(samples);
+        out.swapped = out.swapped_avg_error + 0.001 < out.direct_avg_error;
+        out.selected_avg_error = out.swapped ? out.swapped_avg_error : out.direct_avg_error;
+        out.mode = out.swapped ? "local_world_swapped" : "world_local";
+        if (out.swapped)
+        {
+            for (auto& triangle : triangles)
+            {
+                for (int vertex = 0; vertex < 3; ++vertex)
+                {
+                    std::swap(triangle.world[vertex], triangle.local[vertex]);
+                }
+            }
+        }
+        return out;
+    }
+
+    auto mesh_first_runtime_triangle_with_coordinate_mode(const MeshFirstRuntimeTriangle& raw,
+                                                          const sdk::FTransform& component_to_world,
+                                                          const std::string& mode) -> MeshFirstRuntimeTriangle
+    {
+        MeshFirstRuntimeTriangle out = raw;
+        if (mode == "field1_world_field0_local")
+        {
+            for (int vertex = 0; vertex < 3; ++vertex)
+            {
+                out.world[vertex] = raw.local[vertex];
+                out.local[vertex] = raw.world[vertex];
+            }
+        }
+        else if (mode == "field0_local_component_world")
+        {
+            for (int vertex = 0; vertex < 3; ++vertex)
+            {
+                out.local[vertex] = raw.world[vertex];
+                out.world[vertex] = mesh_first_transform_apply_point(component_to_world, raw.world[vertex]);
+            }
+        }
+        else if (mode == "field1_local_component_world")
+        {
+            for (int vertex = 0; vertex < 3; ++vertex)
+            {
+                out.local[vertex] = raw.local[vertex];
+                out.world[vertex] = mesh_first_transform_apply_point(component_to_world, raw.local[vertex]);
+            }
+        }
+        return out;
+    }
+
+    auto mesh_first_select_runtime_triangle_projection_coordinates(Reflection& ref,
+                                                                  const SdkContext& ctx,
+                                                                  std::vector<MeshFirstRuntimeTriangle>& triangles,
+                                                                  const sdk::FTransform& component_to_world,
+                                                                  const sdk::FVector& camera_location,
+                                                                  const sdk::FVector& camera_direction,
+                                                                  const SdkViewportInfo& viewport) -> MeshFirstRuntimeTriangleProjectionSelection
+    {
+        MeshFirstRuntimeTriangleProjectionSelection out{};
+        if (triangles.empty() || viewport.width <= 0 || viewport.height <= 0)
+        {
+            return out;
+        }
+        struct Candidate
+        {
+            std::string mode{};
+            int samples{0};
+            int source_candidates{0};
+            int project_ok{0};
+            int inside_view{0};
+            int score{0};
+        };
+        std::vector<Candidate> candidates{
+            {"field0_world_field1_local"},
+            {"field1_world_field0_local"},
+            {"field0_local_component_world"},
+            {"field1_local_component_world"},
+        };
+        const int step = std::max(1, static_cast<int>(triangles.size() / 256));
+        const auto view_direction = sdk_vec_normalize(camera_direction);
+        for (auto& candidate : candidates)
+        {
+            for (std::size_t tri = 0; tri < triangles.size(); tri += static_cast<std::size_t>(step))
+            {
+                const auto triangle = mesh_first_runtime_triangle_with_coordinate_mode(triangles[tri], component_to_world, candidate.mode);
+                const auto world_normal = sdk_vec_normalize(sdk_vec_cross(sdk_vec_sub(triangle.world[1], triangle.world[0]),
+                                                                          sdk_vec_sub(triangle.world[2], triangle.world[0])));
+                if (sdk_vec_len(world_normal) <= 0.000001)
+                {
+                    continue;
+                }
+                ++candidate.samples;
+                const auto center = sdk_vec_mul(sdk_vec_add(sdk_vec_add(triangle.world[0], triangle.world[1]), triangle.world[2]), 1.0 / 3.0);
+                const double depth = sdk_vec_dot(sdk_vec_sub(center, camera_location), view_direction);
+                const double facing = sdk_vec_dot(world_normal, view_direction);
+                if (!std::isfinite(depth) || depth <= 0.0 || !std::isfinite(facing) || facing >= -0.001)
+                {
+                    continue;
+                }
+                ++candidate.source_candidates;
+                double x = 0.0;
+                double y = 0.0;
+                if (!sdk_project_world_to_screen(ref, ctx, center, x, y))
+                {
+                    continue;
+                }
+                ++candidate.project_ok;
+                if (x >= 0.0 && y >= 0.0 &&
+                    x < static_cast<double>(viewport.width) &&
+                    y < static_cast<double>(viewport.height))
+                {
+                    ++candidate.inside_view;
+                }
+            }
+            candidate.score = candidate.inside_view * 100000 + candidate.project_ok * 100 + candidate.source_candidates;
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            if (a.score != b.score)
+            {
+                return a.score > b.score;
+            }
+            return a.mode < b.mode;
+        });
+        const auto& best = candidates.front();
+        out.mode = best.mode;
+        out.samples = best.samples;
+        out.source_candidates = best.source_candidates;
+        out.project_ok = best.project_ok;
+        out.inside_view = best.inside_view;
+        out.best_score = best.score;
+        for (const auto& candidate : candidates)
+        {
+            if (!out.summary.empty())
+            {
+                out.summary += ";";
+            }
+            out.summary += candidate.mode + ":samples=" + std::to_string(candidate.samples) +
+                           ",source=" + std::to_string(candidate.source_candidates) +
+                           ",project=" + std::to_string(candidate.project_ok) +
+                           ",inside=" + std::to_string(candidate.inside_view) +
+                           ",score=" + std::to_string(candidate.score);
+        }
+        if (best.mode != "field0_world_field1_local")
+        {
+            for (auto& triangle : triangles)
+            {
+                triangle = mesh_first_runtime_triangle_with_coordinate_mode(triangle, component_to_world, best.mode);
+            }
+        }
+        return out;
+    }
+
     auto mesh_first_emit_runtime_triangle_sample(std::vector<MeshFirstPlanSample>& samples,
                                                  const MeshFirstRuntimeTriangle& triangle,
                                                  const MeshFirstProfile::TriangleMeta& meta,
@@ -4753,13 +5122,11 @@ namespace
             for (int vertex_slot = 0; vertex_slot < 3; ++vertex_slot)
             {
                 const int vertex_index = profile.indices[index_base + static_cast<std::size_t>(vertex_slot)];
-                if (vertex_index < 0 || vertex_index >= static_cast<int>(skinned_world_positions.size()))
+                if (vertex_index < 0 || vertex_index >= profile.vertex_count)
                 {
                     valid_indices = false;
                     continue;
                 }
-                triangle.local[vertex_slot] = skinned_component_positions[static_cast<std::size_t>(vertex_index)];
-                triangle.world[vertex_slot] = skinned_world_positions[static_cast<std::size_t>(vertex_index)];
             }
             if (!valid_indices)
             {
@@ -4892,9 +5259,13 @@ namespace
         };
         auto transfer_key = [&](const std::string& body, const std::string& transfer_group) -> std::string {
             if (!transfer_group.empty())
+            {
                 return transfer_group;
+            }
             if (!unknown_body(body))
+            {
                 return body;
+            }
             return "__unknown";
         };
         std::vector<std::string> source_keys{};
@@ -4903,7 +5274,9 @@ namespace
             for (int i = 0; i < static_cast<int>(source_keys.size()); ++i)
             {
                 if (source_keys[static_cast<std::size_t>(i)] == key)
+                {
                     return i;
+                }
             }
             source_keys.push_back(key);
             source_bins.emplace_back();
@@ -4938,6 +5311,7 @@ namespace
             {
                 sample.unsafe = true;
                 sample.source_distance_uv = std::numeric_limits<double>::infinity();
+                sample.source_distance_component = std::numeric_limits<double>::infinity();
             }
             else
             {
@@ -4962,9 +5336,13 @@ namespace
                 if (sample_bin < 0)
                 {
                     if (!sample_transfer_group.empty())
+                    {
                         source_limb_mismatch = true;
+                    }
                     else
+                    {
                         source_body_mismatch = true;
+                    }
                 }
                 const auto* candidate_indices = sample_bin >= 0 ? &source_bins[static_cast<std::size_t>(sample_bin)] : nullptr;
                 if (candidate_indices)
@@ -5083,6 +5461,143 @@ namespace
                                         static_cast<std::size_t>(std::floor(static_cast<double>(component_distances.size() - 1) * 0.95)));
             stats.source_distance_p95_component = component_distances[index];
         }
+    }
+
+    auto mesh_first_write_bmp_rgb(const std::wstring& path,
+                                  int width,
+                                  int height,
+                                  const std::vector<std::uint8_t>& rgb) -> bool
+    {
+        if (width <= 0 || height <= 0 ||
+            rgb.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3)
+        {
+            return false;
+        }
+        const int row_stride = ((width * 3 + 3) / 4) * 4;
+        const std::uint32_t pixel_bytes = static_cast<std::uint32_t>(row_stride * height);
+        const std::uint32_t file_size = 54U + pixel_bytes;
+        std::vector<std::uint8_t> bytes{};
+        bytes.resize(file_size, 0);
+        bytes[0] = 'B';
+        bytes[1] = 'M';
+        auto put_u16 = [&](std::size_t offset, std::uint16_t value) {
+            bytes[offset + 0] = static_cast<std::uint8_t>(value & 0xff);
+            bytes[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xff);
+        };
+        auto put_u32 = [&](std::size_t offset, std::uint32_t value) {
+            bytes[offset + 0] = static_cast<std::uint8_t>(value & 0xff);
+            bytes[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xff);
+            bytes[offset + 2] = static_cast<std::uint8_t>((value >> 16) & 0xff);
+            bytes[offset + 3] = static_cast<std::uint8_t>((value >> 24) & 0xff);
+        };
+        put_u32(2, file_size);
+        put_u32(10, 54);
+        put_u32(14, 40);
+        put_u32(18, static_cast<std::uint32_t>(width));
+        put_u32(22, static_cast<std::uint32_t>(height));
+        put_u16(26, 1);
+        put_u16(28, 24);
+        put_u32(34, pixel_bytes);
+        for (int y = 0; y < height; ++y)
+        {
+            const int src_y = height - 1 - y;
+            auto* dst = bytes.data() + 54 + static_cast<std::size_t>(y) * static_cast<std::size_t>(row_stride);
+            const auto* src = rgb.data() + (static_cast<std::size_t>(src_y) * static_cast<std::size_t>(width)) * 3;
+            for (int x = 0; x < width; ++x)
+            {
+                dst[x * 3 + 0] = src[x * 3 + 2];
+                dst[x * 3 + 1] = src[x * 3 + 1];
+                dst[x * 3 + 2] = src[x * 3 + 0];
+            }
+        }
+        return write_binary_file_w(path, bytes);
+    }
+
+    auto mesh_first_write_uv_debug_artifacts(const std::vector<MeshFirstPlanSample>& samples,
+                                             int texture_size,
+                                             bool enable_front,
+                                             bool enable_side,
+                                             bool enable_back,
+                                             std::string& metadata) -> void
+    {
+        const auto dir = runtime_log_dir_path();
+        if (dir.empty())
+        {
+            metadata += ",\"mesh_debug_artifacts_written\":false";
+            metadata += ",\"mesh_debug_artifacts_failure\":\"runtime_log_dir_unavailable\"";
+            return;
+        }
+        const int size = std::max(64, std::min(2048, texture_size));
+        const auto stamp = std::to_wstring(GetTickCount64());
+        const auto color_path = dir + L"\\mesh-first-uv-color-" + stamp + L".bmp";
+        const auto region_path = dir + L"\\mesh-first-uv-region-" + stamp + L".bmp";
+        std::vector<std::uint8_t> color_rgb(static_cast<std::size_t>(size) * static_cast<std::size_t>(size) * 3, 8);
+        std::vector<std::uint8_t> region_rgb(static_cast<std::size_t>(size) * static_cast<std::size_t>(size) * 3, 8);
+        auto draw = [&](std::vector<std::uint8_t>& image, double u, double v, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+            const int cx = std::max(0, std::min(size - 1, static_cast<int>(std::round(clamp01(u) * static_cast<double>(size - 1)))));
+            const int cy = std::max(0, std::min(size - 1, static_cast<int>(std::round((1.0 - clamp01(v)) * static_cast<double>(size - 1)))));
+            for (int dy = -1; dy <= 1; ++dy)
+            {
+                for (int dx = -1; dx <= 1; ++dx)
+                {
+                    const int x = cx + dx;
+                    const int y = cy + dy;
+                    if (x < 0 || y < 0 || x >= size || y >= size)
+                    {
+                        continue;
+                    }
+                    const auto index = (static_cast<std::size_t>(y) * static_cast<std::size_t>(size) + static_cast<std::size_t>(x)) * 3;
+                    image[index + 0] = r;
+                    image[index + 1] = g;
+                    image[index + 2] = b;
+                }
+            }
+        };
+        int written_samples = 0;
+        for (const auto& sample : samples)
+        {
+            const bool enabled = (sample.region == MeshFirstRegion::Front && enable_front) ||
+                                 (sample.region == MeshFirstRegion::Side && enable_side) ||
+                                 (sample.region == MeshFirstRegion::Back && enable_back);
+            if (!enabled || sample.unsafe)
+            {
+                continue;
+            }
+            draw(color_rgb,
+                 sample.u,
+                 sample.v,
+                 static_cast<std::uint8_t>(std::round(clamp01(sample.r) * 255.0)),
+                 static_cast<std::uint8_t>(std::round(clamp01(sample.g) * 255.0)),
+                 static_cast<std::uint8_t>(std::round(clamp01(sample.b) * 255.0)));
+            if (sample.region == MeshFirstRegion::Front)
+            {
+                draw(region_rgb, sample.u, sample.v, 255, 80, 80);
+            }
+            else if (sample.region == MeshFirstRegion::Side)
+            {
+                draw(region_rgb, sample.u, sample.v, 80, 220, 120);
+            }
+            else
+            {
+                draw(region_rgb, sample.u, sample.v, 100, 150, 255);
+            }
+            ++written_samples;
+        }
+        const bool color_ok = mesh_first_write_bmp_rgb(color_path, size, size, color_rgb);
+        const bool region_ok = mesh_first_write_bmp_rgb(region_path, size, size, region_rgb);
+        auto narrow = [](const std::wstring& value) {
+            std::string out{};
+            out.reserve(value.size());
+            for (const auto ch : value)
+            {
+                out.push_back(ch >= 0 && ch < 128 ? static_cast<char>(ch) : '?');
+            }
+            return out;
+        };
+        metadata += ",\"mesh_debug_artifacts_written\":" + std::string(json_bool(color_ok && region_ok));
+        metadata += ",\"mesh_debug_artifact_samples\":" + std::to_string(written_samples);
+        metadata += ",\"mesh_debug_uv_color_bmp\":\"" + json_escape(narrow(color_path)) + "\"";
+        metadata += ",\"mesh_debug_uv_region_bmp\":\"" + json_escape(narrow(region_path)) + "\"";
     }
 
     auto mesh_first_plan_stats_metadata(const MeshFirstPlanStats& stats) -> std::string
@@ -5249,12 +5764,14 @@ namespace
         std::shared_ptr<QueuedPaintJob> queued{};
         std::uintptr_t component{0};
         std::uintptr_t server_paint_batch_function{0};
+        std::uintptr_t local_paint_at_uv_function{0};
         std::vector<sdk::FPaintStroke> strokes{};
         std::string metadata{};
         MeshFirstChannelChecksum albedo_before{};
         MeshFirstReplicationSnapshot replication_before{};
         int server_batch_limit{ServerPaintBatchStrokeLimit};
         int server_batch_delay_ms{ServerPaintBatchDelayMs};
+        int local_visual_sync_batch_limit{512};
         int replay_front{0};
         int replay_side{0};
         int replay_back{0};
@@ -5264,7 +5781,14 @@ namespace
         int server_strokes_sent{0};
         std::size_t offset{0};
         std::string first_failure{};
+        bool local_sync_started{false};
+        std::size_t local_offset{0};
+        int local_stroke_calls{0};
+        int local_stroke_success{0};
+        int local_stroke_failures{0};
+        std::string local_visual_sync_failure{};
         std::chrono::steady_clock::time_point started{};
+        std::chrono::steady_clock::time_point local_sync_started_at{};
         std::chrono::steady_clock::time_point server_next_batch_time{};
         UINT_PTR server_batch_timer_id{0};
     };
@@ -5284,6 +5808,7 @@ namespace
         const bool enable_front = json_bool_field(request, "enable_front_paint", true);
         const bool enable_side = json_bool_field(request, "enable_side_paint", true);
         const bool enable_back = json_bool_field(request, "enable_back_paint", true);
+        const bool research_artifacts = json_bool_field(request, "research_artifacts", false);
         const std::string quality_preset = json_string_field(request, "quality_preset", "High");
         const double tuning_stroke_size_texels = clamp_range(json_number_field(request, "stroke_size_texels", 4.0), 1.0, 12.0);
         const double tuning_coverage_step_texels = clamp_range(json_number_field(request, "coverage_step_texels", 6.0), 1.0, 12.0);
@@ -5301,6 +5826,7 @@ namespace
         metadata += ",\"old_dense_hittest_fallback_used\":false";
         metadata += ",\"runtime_hit_test_used\":false";
         metadata += ",\"server_paint_batch_required\":true";
+        metadata += ",\"research_artifacts_requested\":" + std::string(json_bool(research_artifacts));
         metadata += ",\"enable_front_paint\":" + std::string(json_bool(enable_front));
         metadata += ",\"enable_side_paint\":" + std::string(json_bool(enable_side));
         metadata += ",\"enable_back_paint\":" + std::string(json_bool(enable_back));
@@ -5376,6 +5902,7 @@ namespace
 
         metadata += ",";
         metadata += sdk_context_metadata(ref, ctx);
+        metadata += paint_stroke_reflection_metadata(ref, ctx.server_paint_batch_function);
         if (!ctx.ok)
         {
             return response_json(false, ctx.stage.c_str(), 0, 1, ctx.message, metadata);
@@ -5505,12 +6032,15 @@ namespace
         metadata += ",";
         metadata += mesh_first_pose_displacement_metadata(profile, skinned_component_positions);
 
-        const auto runtime_triangle_cache = mesh_first_resolve_runtime_triangle_cache(ctx.component, profile);
+        auto runtime_triangle_cache = mesh_first_resolve_runtime_triangle_cache(ctx.component, profile);
         metadata += ",\"runtime_triangle_cache_used\":" + std::string(json_bool(runtime_triangle_cache.ok));
         metadata += ",\"runtime_triangle_cache_offset\":\"" + (runtime_triangle_cache.owner_offset >= 0 ? hex_address(static_cast<std::uintptr_t>(runtime_triangle_cache.owner_offset)) : std::string("none")) + "\"";
         metadata += ",\"runtime_triangle_cache_stride\":" + std::to_string(runtime_triangle_cache.stride);
         metadata += ",\"runtime_triangle_cache_triangles\":" + std::to_string(runtime_triangle_cache.triangle_count);
         metadata += ",\"runtime_triangle_cache_profile_uv_avg_error\":" + std::to_string(runtime_triangle_cache.profile_uv_avg_error);
+        metadata += ",\"planner_position_source\":\"runtime_paintable_cached_current_triangles\"";
+        metadata += ",\"pose_used_for_projection\":false";
+        metadata += ",\"pose_used_for_replay_anchor\":false";
         if (!runtime_triangle_cache.ok)
         {
             return response_json(false,
@@ -5520,6 +6050,15 @@ namespace
                                  "RuntimePaintable cached triangles are unavailable; mesh-first paint cannot plan safely",
                                  metadata + ",\"replay_blocked\":true");
         }
+        auto runtime_coordinate_probe_triangles = runtime_triangle_cache.triangles;
+        const auto runtime_coordinate_selection =
+            mesh_first_select_runtime_triangle_coordinates(runtime_coordinate_probe_triangles, component_to_world);
+        metadata += ",\"runtime_triangle_coordinate_mode\":\"" + json_escape(runtime_coordinate_selection.mode) + "\"";
+        metadata += ",\"runtime_triangle_coordinates_swapped\":" + std::string(runtime_coordinate_selection.swapped ? "true" : "false");
+        metadata += ",\"runtime_triangle_coordinate_samples\":" + std::to_string(runtime_coordinate_selection.samples);
+        metadata += ",\"runtime_triangle_coordinate_direct_avg_error\":" + std::to_string(runtime_coordinate_selection.direct_avg_error);
+        metadata += ",\"runtime_triangle_coordinate_swapped_avg_error\":" + std::to_string(runtime_coordinate_selection.swapped_avg_error);
+        metadata += ",\"runtime_triangle_coordinate_selected_avg_error\":" + std::to_string(runtime_coordinate_selection.selected_avg_error);
 
         const auto viewport = sdk_get_viewport_info(ref, ctx);
         if (viewport.width <= 0 || viewport.height <= 0)
@@ -5550,6 +6089,30 @@ namespace
         metadata += ",\"camera_direction_x\":" + std::to_string(camera_direction.X);
         metadata += ",\"camera_direction_y\":" + std::to_string(camera_direction.Y);
         metadata += ",\"camera_direction_z\":" + std::to_string(camera_direction.Z);
+        const auto runtime_projection_selection =
+            mesh_first_select_runtime_triangle_projection_coordinates(ref,
+                                                                     ctx,
+                                                                     runtime_triangle_cache.triangles,
+                                                                     component_to_world,
+                                                                     center_ray.location,
+                                                                     camera_direction,
+                                                                     viewport);
+        metadata += ",\"runtime_triangle_projection_mode\":\"" + json_escape(runtime_projection_selection.mode) + "\"";
+        metadata += ",\"runtime_triangle_projection_samples\":" + std::to_string(runtime_projection_selection.samples);
+        metadata += ",\"runtime_triangle_projection_source_candidates\":" + std::to_string(runtime_projection_selection.source_candidates);
+        metadata += ",\"runtime_triangle_projection_project_ok\":" + std::to_string(runtime_projection_selection.project_ok);
+        metadata += ",\"runtime_triangle_projection_inside_view\":" + std::to_string(runtime_projection_selection.inside_view);
+        metadata += ",\"runtime_triangle_projection_best_score\":" + std::to_string(runtime_projection_selection.best_score);
+        metadata += ",\"runtime_triangle_projection_summary\":\"" + json_escape(runtime_projection_selection.summary) + "\"";
+        if (runtime_projection_selection.inside_view <= 0)
+        {
+            return response_json(false,
+                                 "runtime_triangle_coordinate_projection_unavailable",
+                                 0,
+                                 1,
+                                 "no runtime triangle coordinate mode projects camera-facing samples into the viewport",
+                                 metadata + ",\"replay_blocked\":true");
+        }
 
         MeshFirstPlanStats plan_stats{};
         std::vector<MeshFirstPlanSample> plan_samples{};
@@ -5681,6 +6244,15 @@ namespace
                                  "mesh-first planner found unsafe color-transfer candidates in enabled regions",
                                  metadata + ",\"replay_blocked\":true");
         }
+        if (research_artifacts)
+        {
+            mesh_first_write_uv_debug_artifacts(plan_samples,
+                                                profile.texture_size,
+                                                enable_front,
+                                                enable_side,
+                                                enable_back,
+                                                metadata);
+        }
 
         sdk::FRuntimeBrushSettings brush{};
         safe_copy(&brush,
@@ -5688,12 +6260,14 @@ namespace
                   sizeof(brush));
         brush.Hardness = 1.0f;
         brush.Opacity = 1.0f;
-        const double stroke_radius_uv = tuning_stroke_size_texels / static_cast<double>(std::max(1, profile.texture_size));
+        const double stroke_radius_texels = tuning_stroke_size_texels;
+        const double stroke_radius_uv = stroke_radius_texels / static_cast<double>(std::max(1, profile.texture_size));
         brush.Radius = static_cast<float>(stroke_radius_uv);
         brush.Spacing = 1.0f;
         brush.Falloff = sdk::EBrushFalloff::Spherical;
         brush.BlendMode = sdk::EPaintBlendMode::Normal;
-        metadata += ",\"stroke_radius_texels\":" + std::to_string(tuning_stroke_size_texels);
+        metadata += ",\"stroke_size_texels\":" + std::to_string(tuning_stroke_size_texels);
+        metadata += ",\"stroke_radius_texels\":" + std::to_string(stroke_radius_texels);
         metadata += ",\"stroke_radius_uv\":" + std::to_string(stroke_radius_uv);
 
         std::vector<sdk::FPaintStroke> strokes{};
@@ -5701,6 +6275,9 @@ namespace
         int replay_front = 0;
         int replay_side = 0;
         int replay_back = 0;
+        int replay_world_anchors = 0;
+        int replay_local_anchors = 0;
+        int replay_triangle_anchors = 0;
         for (const auto& sample : plan_samples)
         {
             const bool enabled = (sample.region == MeshFirstRegion::Front && enable_front) ||
@@ -5716,11 +6293,29 @@ namespace
                                                   sample.metallic,
                                                   sample.roughness,
                                                   sdk::EPaintChannelApplyMode::Override);
-            auto stroke = sdk_make_uv_stroke(sample.u,
-                                             sample.v,
-                                             channel,
-                                             brush,
-                                             sdk::EPaintChannel::Albedo);
+            auto stroke = sdk_make_mesh_anchor_stroke(sample.u,
+                                                      sample.v,
+                                                      channel,
+                                                      brush,
+                                                      sdk::EPaintChannel::Albedo,
+                                                      sample.world_position,
+                                                      sample.local_position,
+                                                      sample.triangle_index,
+                                                      sample.barycentric_a,
+                                                      sample.barycentric_b,
+                                                      sample.barycentric_c);
+            if (stroke.bHasWorldPosition)
+            {
+                ++replay_world_anchors;
+            }
+            if (stroke.bHasLocalPosition)
+            {
+                ++replay_local_anchors;
+            }
+            if (stroke.bHasSkeletalTriangleAnchor)
+            {
+                ++replay_triangle_anchors;
+            }
             strokes.push_back(stroke);
             if (sample.region == MeshFirstRegion::Front)
             {
@@ -5782,11 +6377,19 @@ namespace
         const int estimated_replay_ms = std::max(0, estimated_batches - 1) * std::max(1, tuning_server_batch_delay_ms);
         metadata += ",\"server_batch_estimated_calls\":" + std::to_string(estimated_batches);
         metadata += ",\"estimated_replay_ms\":" + std::to_string(estimated_replay_ms);
-        metadata += ",\"skeletal_triangle_anchor_used\":false";
+        metadata += ",\"skeletal_triangle_anchor_used\":true";
+        metadata += ",\"replay_anchor_mode\":\"skeletal_triangle\"";
+        metadata += ",\"replay_world_anchors\":" + std::to_string(replay_world_anchors);
+        metadata += ",\"replay_local_anchors\":" + std::to_string(replay_local_anchors);
+        metadata += ",\"replay_triangle_anchors\":" + std::to_string(replay_triangle_anchors);
         metadata += ",\"server_batch_rpc\":\"ServerPaintBatch\"";
         metadata += ",\"server_paint_batch_used\":true";
-        metadata += ",\"local_paint_rpc\":\"disabled\"";
-        metadata += ",\"authoritative_replay\":\"server_paint_batch_only\"";
+        const auto local_paint_at_uv_function = ref.find_function(ctx.component, "PaintAtUVWithBrush");
+        metadata += ",\"local_paint_rpc\":\"PaintAtUVWithBrush\"";
+        metadata += ",\"local_paint_available\":" + std::string(json_bool(local_paint_at_uv_function != 0));
+        metadata += ",\"local_visual_sync_required\":true";
+        metadata += ",\"local_visual_sync_after_server_success\":true";
+        metadata += ",\"authoritative_replay\":\"server_paint_batch_then_local_visual_sync\"";
 
         const auto albedo_before = mesh_first_export_channel_checksum(ref, ctx.component, sdk::EPaintChannel::Albedo);
         metadata += ",\"albedo_export_before_ok\":" + std::string(json_bool(albedo_before.ok));
@@ -5813,6 +6416,7 @@ namespace
             async_job->queued = queued_job;
             async_job->component = ctx.component;
             async_job->server_paint_batch_function = ctx.server_paint_batch_function;
+            async_job->local_paint_at_uv_function = local_paint_at_uv_function;
             async_job->strokes = std::move(strokes);
             async_job->metadata = metadata + ",\"server_batch_schedule\":\"timer_drained\"";
             async_job->albedo_before = albedo_before;
@@ -5944,14 +6548,86 @@ namespace
 
         if (job->offset >= job->strokes.size())
         {
-            const double batch_elapsed_ms = elapsed_ms();
+            const double server_elapsed_ms = elapsed_ms();
+            if (!job->local_sync_started)
+            {
+                job->local_sync_started = true;
+                job->local_sync_started_at = std::chrono::steady_clock::now();
+                if (!job->local_paint_at_uv_function)
+                {
+                    job->local_visual_sync_failure = "PaintAtUVWithBrush_unavailable";
+                }
+                write_bridge_progress("mesh_local_visual_sync",
+                                      "Syncing local visual paint",
+                                      99,
+                                      100,
+                                      server_elapsed_ms,
+                                      "\"local_sync_strokes_total\":" + std::to_string(job->strokes.size()) +
+                                          ",\"server_strokes_sent\":" + std::to_string(job->server_strokes_sent));
+            }
+
+            if (job->local_visual_sync_failure.empty() && job->local_offset < job->strokes.size())
+            {
+                const std::size_t local_count =
+                    std::min<std::size_t>(static_cast<std::size_t>(std::max(1, job->local_visual_sync_batch_limit)),
+                                          job->strokes.size() - job->local_offset);
+                for (std::size_t index = 0; index < local_count; ++index)
+                {
+                    std::string local_failure{};
+                    ++job->local_stroke_calls;
+                    if (!sdk_call_paint_at_uv_with_brush(job->component,
+                                                         job->local_paint_at_uv_function,
+                                                         job->strokes[job->local_offset],
+                                                         local_failure))
+                    {
+                        ++job->local_stroke_failures;
+                        job->local_visual_sync_failure = local_failure.empty() ? "PaintAtUVWithBrush_failed" : local_failure;
+                        break;
+                    }
+                    ++job->local_stroke_success;
+                    ++job->local_offset;
+                }
+
+                write_bridge_progress("mesh_local_visual_sync",
+                                      "Syncing local visual paint",
+                                      99,
+                                      100,
+                                      elapsed_ms(),
+                                      "\"local_strokes_synced\":" + std::to_string(job->local_stroke_success) +
+                                          ",\"local_strokes_total\":" + std::to_string(job->strokes.size()) +
+                                          ",\"local_sync_batch_limit\":" + std::to_string(job->local_visual_sync_batch_limit));
+
+                if (job->local_visual_sync_failure.empty() && job->local_offset < job->strokes.size())
+                {
+                    post_next_after(0);
+                    return;
+                }
+            }
+
+            const double total_elapsed_ms = elapsed_ms();
+            const double local_sync_elapsed_ms =
+                job->local_sync_started
+                    ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job->local_sync_started_at).count()
+                    : 0.0;
+            const bool local_visual_sync_ok =
+                job->local_visual_sync_failure.empty() &&
+                job->local_stroke_success == static_cast<int>(job->strokes.size());
+            const std::string final_failure = !job->first_failure.empty() ? job->first_failure : job->local_visual_sync_failure;
             std::string metadata = job->metadata;
             metadata += ",\"server_batch_calls\":" + std::to_string(job->server_batch_calls);
             metadata += ",\"server_batch_success\":" + std::to_string(job->server_batch_success);
             metadata += ",\"server_batch_failures\":" + std::to_string(job->server_batch_failures);
             metadata += ",\"server_strokes_sent\":" + std::to_string(job->server_strokes_sent);
-            metadata += ",\"server_batch_elapsed_ms\":" + std::to_string(batch_elapsed_ms);
-            metadata += ",\"first_failure\":\"" + json_escape(job->first_failure) + "\"";
+            metadata += ",\"server_batch_elapsed_ms\":" + std::to_string(server_elapsed_ms);
+            metadata += ",\"local_stroke_calls\":" + std::to_string(job->local_stroke_calls);
+            metadata += ",\"local_stroke_success\":" + std::to_string(job->local_stroke_success);
+            metadata += ",\"local_stroke_failures\":" + std::to_string(job->local_stroke_failures);
+            metadata += ",\"local_visual_sync_used\":" + std::string(json_bool(job->local_paint_at_uv_function != 0));
+            metadata += ",\"local_visual_sync_ok\":" + std::string(json_bool(local_visual_sync_ok));
+            metadata += ",\"local_visual_sync_failure\":\"" + json_escape(job->local_visual_sync_failure) + "\"";
+            metadata += ",\"local_visual_sync_elapsed_ms\":" + std::to_string(local_sync_elapsed_ms);
+            metadata += ",\"total_replay_elapsed_ms\":" + std::to_string(total_elapsed_ms);
+            metadata += ",\"first_failure\":\"" + json_escape(final_failure) + "\"";
 
             Reflection ref{};
             std::string init_failure{};
@@ -5979,21 +6655,24 @@ namespace
             metadata += mesh_first_replication_snapshot_metadata("mesh_rep_before", job->replication_before);
 
             write_bridge_progress("mesh_paint_done",
-                                  "mesh-first paint completed",
+                                  local_visual_sync_ok ? "mesh-first paint completed" : "mesh-first local visual sync failed",
                                   100,
                                   100,
-                                  batch_elapsed_ms,
+                                  total_elapsed_ms,
                                   "\"server_strokes_sent\":" + std::to_string(job->server_strokes_sent) +
                                       ",\"server_batch_calls\":" + std::to_string(job->server_batch_calls) +
+                                      ",\"local_strokes_synced\":" + std::to_string(job->local_stroke_success) +
                                       ",\"front_strokes\":" + std::to_string(job->replay_front) +
                                       ",\"side_strokes\":" + std::to_string(job->replay_side) +
                                       ",\"back_strokes\":" + std::to_string(job->replay_back));
             complete_mesh_first_batch_job(job,
-                                          response_json(true,
-                                                        "mesh_first_paint_done",
+                                          response_json(local_visual_sync_ok,
+                                                        local_visual_sync_ok ? "mesh_first_paint_done" : "mesh_local_visual_sync_failed",
                                                         job->server_strokes_sent,
-                                                        0,
-                                                        "mesh-first paint dispatched through ServerPaintBatch",
+                                                        local_visual_sync_ok ? 0 : 1,
+                                                        local_visual_sync_ok
+                                                            ? "mesh-first paint dispatched through ServerPaintBatch and local visual sync"
+                                                            : "ServerPaintBatch succeeded but local visual sync failed: " + final_failure,
                                                         metadata));
             return;
         }
@@ -6519,6 +7198,31 @@ namespace
         return stroke;
     }
 
+    auto sdk_make_mesh_anchor_stroke(double u,
+                                     double v,
+                                     const sdk::FPaintChannelData& channel,
+                                     const sdk::FRuntimeBrushSettings& brush,
+                                     sdk::EPaintChannel target_channel,
+                                     const sdk::FVector& world_position,
+                                     const sdk::FVector& local_position,
+                                     int triangle_index,
+                                     double barycentric_a,
+                                     double barycentric_b,
+                                     double barycentric_c) -> sdk::FPaintStroke
+    {
+        auto stroke = sdk_make_stroke(u, v, channel, brush, target_channel, world_position);
+        stroke.bHasWorldPosition = true;
+        stroke.WorldPosition = world_position;
+        stroke.bHasLocalPosition = true;
+        stroke.LocalPosition = local_position;
+        stroke.bHasSkeletalTriangleAnchor = true;
+        stroke.SkeletalTriangleIndex = std::max(0, triangle_index);
+        stroke.SkeletalTriangleBarycentric.X = barycentric_a;
+        stroke.SkeletalTriangleBarycentric.Y = barycentric_b;
+        stroke.SkeletalTriangleBarycentric.Z = barycentric_c;
+        return stroke;
+    }
+
     auto sdk_call_paint_batch_function(std::uintptr_t component,
                                        std::uintptr_t function,
                                        const std::vector<sdk::FPaintStroke>& strokes,
@@ -6559,6 +7263,29 @@ namespace
                                              offset,
                                              count,
                                              failure);
+    }
+
+    auto sdk_call_paint_at_uv_with_brush(std::uintptr_t component,
+                                         std::uintptr_t function,
+                                         const sdk::FPaintStroke& stroke,
+                                         std::string& failure) -> bool
+    {
+        if (!function)
+        {
+            failure = "PaintAtUVWithBrush_unavailable";
+            return false;
+        }
+        if (!live_uobject(component))
+        {
+            failure = "paint_component_unavailable";
+            return false;
+        }
+        sdk::RuntimePaintableComponent_PaintAtUVWithBrush params{};
+        params.Uv = stroke.Uv;
+        params.ChannelData = stroke.ChannelData;
+        params.BrushSettings = stroke.BrushSettings;
+        params.Channel = stroke.TargetChannel;
+        return process_event(component, function, reinterpret_cast<std::uint8_t*>(&params), failure);
     }
 
     struct SdkFrontColorStats
@@ -8045,7 +8772,7 @@ namespace
         }
         out.visibility_input = static_cast<int>(projected.size());
         out.visibility_kept = out.visibility_input;
-        if (has_depth_samples)
+        if (has_depth_samples && !native_front.keep_occluded_projected_samples)
         {
             constexpr int kVisibilityCellPx = 4;
             constexpr double kVisibilityDepthTolerance = 6.0;
