@@ -4740,6 +4740,7 @@ namespace
         int unsafe_source_distance{0};
         int source_depth_rejected{0};
         int source_facing_rejected{0};
+        int source_direct_assignments{0};
         double source_distance_avg_uv{0.0};
         double source_distance_p95_uv{0.0};
         double source_distance_max_uv{0.0};
@@ -5431,6 +5432,14 @@ namespace
             const auto source_group = mesh_first_transfer_group_for_bone(profile, source.dominant_bone);
             source_bins[static_cast<std::size_t>(source_bin_for_key(transfer_key(source_body, source_group)))].push_back(i);
         }
+        std::vector<const FrontSample*> direct_source_by_plan_index(samples.size(), nullptr);
+        for (const auto& source : source_samples)
+        {
+            if (source.plan_index >= 0 && source.plan_index < static_cast<int>(direct_source_by_plan_index.size()))
+            {
+                direct_source_by_plan_index[static_cast<std::size_t>(source.plan_index)] = &source;
+            }
+        }
         auto component_distance_limit = [&](MeshFirstRegion region) -> double {
             if (region == MeshFirstRegion::Side)
             {
@@ -5438,8 +5447,9 @@ namespace
             }
             return clamp_range(front_back_source_max_uv * 250.0, 40.0, 180.0);
         };
-        for (auto& sample : samples)
+        for (std::size_t sample_index = 0; sample_index < samples.size(); ++sample_index)
         {
+            auto& sample = samples[sample_index];
             const bool enabled = (sample.region == MeshFirstRegion::Front && enable_front) ||
                                  (sample.region == MeshFirstRegion::Side && enable_side) ||
                                  (sample.region == MeshFirstRegion::Back && enable_back);
@@ -5457,6 +5467,23 @@ namespace
             }
             else
             {
+                const auto* direct_source = direct_source_by_plan_index[sample_index];
+                if (sample.source_candidate && direct_source)
+                {
+                    sample.source_distance_component = 0.0;
+                    sample.source_distance_uv = 0.0;
+                    component_distances.push_back(0.0);
+                    uv_distances.push_back(0.0);
+                    sample.r = clamp01(direct_source->r);
+                    sample.g = clamp01(direct_source->g);
+                    sample.b = clamp01(direct_source->b);
+                    sample.roughness = clamp01(std::max(0.35, direct_source->roughness));
+                    sample.metallic = clamp01(direct_source->metallic);
+                    sample.unsafe = false;
+                    ++stats.source_direct_assignments;
+                    ++stats.enabled_samples;
+                    continue;
+                }
                 const auto sample_body = lower_copy(sample.body_region);
                 const auto sample_transfer_group = mesh_first_transfer_group_for_bone(profile, sample.dominant_bone);
                 bool saw_body_candidate = false;
@@ -5766,6 +5793,7 @@ namespace
                ",\"unsafe_source_distance\":" + std::to_string(stats.unsafe_source_distance) +
                ",\"source_depth_rejected\":" + std::to_string(stats.source_depth_rejected) +
                ",\"source_facing_rejected\":" + std::to_string(stats.source_facing_rejected) +
+               ",\"source_direct_assignments\":" + std::to_string(stats.source_direct_assignments) +
                ",\"source_distance_avg_uv\":" + std::to_string(stats.source_distance_avg_uv) +
                ",\"source_distance_p95_uv\":" + std::to_string(stats.source_distance_p95_uv) +
                ",\"source_distance_max_uv\":" + std::to_string(stats.source_distance_max_uv) +
@@ -6303,13 +6331,15 @@ namespace
         native_front.target_front_hits = plan_stats.source_samples;
         native_front.hard_attempt_budget = plan_stats.total_samples;
         native_front.samples.reserve(static_cast<std::size_t>(plan_stats.source_samples));
-        for (const auto& sample : plan_samples)
+        for (std::size_t sample_index = 0; sample_index < plan_samples.size(); ++sample_index)
         {
+            const auto& sample = plan_samples[sample_index];
             if (!sample.source_candidate)
             {
                 continue;
             }
             FrontSample front{};
+            front.plan_index = static_cast<int>(sample_index);
             front.u = sample.u;
             front.v = sample.v;
             front.roughness = 0.65;
