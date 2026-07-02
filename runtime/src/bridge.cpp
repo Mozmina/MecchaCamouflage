@@ -6805,8 +6805,8 @@ namespace
         constexpr bool enable_side = true;
         constexpr bool enable_back = true;
         const bool research_artifacts = json_bool_field(request, "research_artifacts", false);
-        const double tuning_stroke_size_texels = clamp_range(json_number_field(request, "stroke_size_texels", 5.0), 1.0, 12.0);
-        const double tuning_coverage_step_texels = clamp_range(json_number_field(request, "coverage_step_texels", 5.0), 1.0, 12.0);
+        const double tuning_stroke_size_texels = clamp_range(json_number_field(request, "stroke_size_texels", 9.0), 1.0, 12.0);
+        const double tuning_coverage_step_texels = clamp_range(json_number_field(request, "coverage_step_texels", 9.0), 1.0, 12.0);
         const double tuning_side_source_max_uv = clamp_range(json_number_field(request, "side_source_max_uv", 0.08), 0.001, 0.50);
         const double tuning_front_back_source_max_uv = clamp_range(json_number_field(request, "front_back_source_max_uv", 0.45), 0.001, 2.00);
         const double tuning_metallic = clamp_range(json_number_field(request, "metallic", 0.0), 0.0, 1.0);

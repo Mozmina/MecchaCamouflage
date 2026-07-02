@@ -9,8 +9,8 @@ namespace meccha
 
     struct PaintTuning
     {
-        double stroke_size_texels{5.0};
-        double coverage_step_texels{5.0};
+        double stroke_size_texels{9.0};
+        double coverage_step_texels{9.0};
         double side_source_max_uv{0.08};
         double front_back_source_max_uv{0.45};
         int server_batch_limit{1000000};
