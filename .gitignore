@@ -29,6 +29,8 @@
 # Research tool artifacts
 /tools/**/bin/
 /tools/**/obj/
+/third_party/CUE4Parse
+/third_party/UnrealMappingsDumper/
 /third_party/UnrealMappingsDumper/**/x64/
 /third_party/UnrealMappingsDumper/**/Debug/
 /third_party/UnrealMappingsDumper/**/Release/

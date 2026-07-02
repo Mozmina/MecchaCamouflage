@@ -24,7 +24,8 @@ Settings are read-only until `Edit` is selected. Use `Save` to apply changes or
 
 v1.4.0 uses the mesh-first paint route. Game-derived mesh profiles are prepared
 locally from the research tools after game updates; they are not ordinary source
-files.
+files. See [docs/research-tools.md](docs/research-tools.md) for the local tool
+setup and update workflow.
 
 Logs are written under:
 
