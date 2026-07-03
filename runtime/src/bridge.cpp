@@ -50,6 +50,7 @@ namespace
     constexpr int MeshFirstServerTextureSyncMaxPolls = 40;
     constexpr int MeshFirstTextureSyncObserverPollMs = 50;
     constexpr int MeshFirstTextureSyncObserverMaxPolls = 40;
+    constexpr bool MeshFirstPostImportTextureSyncEnabled = false;
     constexpr double MeshFirstRuntimeCoordinateMaxAvgErrorCm = 50.0;
 
     constexpr std::uintptr_t OffClass = 0x10;
@@ -7359,6 +7360,11 @@ namespace
             return;
         }
         job->server_texture_sync_after_import_started = true;
+        if (!MeshFirstPostImportTextureSyncEnabled)
+        {
+            job->server_texture_sync_after_import_route = "disabled";
+            return;
+        }
 
         job->server_texture_sync_after_import_server_relay =
             sdk_call_object_param_detail(ref,
@@ -8419,6 +8425,7 @@ namespace
         metadata += ",\"local_texture_import_required\":true";
         metadata += ",\"authoritative_replay\":\"server_paint_batch_with_local_channel_import_preview\"";
         metadata += ",\"server_texture_sync_mode\":\"request_full_texture_sync_after_server_batch\"";
+        metadata += ",\"post_import_texture_sync_enabled\":" + std::string(json_bool(MeshFirstPostImportTextureSyncEnabled));
         metadata += ",\"server_texture_sync_poll_ms\":" + std::to_string(MeshFirstServerTextureSyncPollMs);
         metadata += ",\"server_texture_sync_max_polls\":" + std::to_string(MeshFirstServerTextureSyncMaxPolls);
         metadata += ",\"fast_apply_manager\":\"" + hex_address(replication_manager) + "\"";
@@ -8430,7 +8437,7 @@ namespace
         const auto sync_channel_function = ref.find_function(ctx.component, "MulticastSyncChannelData");
         const auto sync_compressed_channel_function = ref.find_function(ctx.component, "MulticastSyncCompressedChannelData");
         reset_texture_sync_observer(sync_channel_function, sync_compressed_channel_function);
-        metadata += ",\"texture_sync_hidden_route\":\"relay_or_component_full_texture_sync_after_local_import\"";
+        metadata += ",\"texture_sync_hidden_route\":\"disabled_after_local_import_preview\"";
         metadata += ",\"texture_sync_relay_component\":\"" + hex_address(ctx.relay_component) + "\"";
         metadata += ",\"texture_sync_relay_component_class\":\"" + json_escape(ref.class_name(ctx.relay_component)) + "\"";
         metadata += ",\"function_server_relay_texture_sync_available\":" +
@@ -9156,7 +9163,8 @@ namespace
             if (result.ok)
             {
                 mesh_first_request_texture_sync_after_import(ref, job);
-                if (job->server_texture_sync_after_import_route != "unavailable")
+                if (job->server_texture_sync_after_import_route != "unavailable" &&
+                    job->server_texture_sync_after_import_route != "disabled")
                 {
                     begin_texture_sync_observe();
                     return;
@@ -12147,6 +12155,14 @@ namespace
         std::unique_lock<std::mutex> lock(g_paint_jobs_mutex);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(240);
         const auto dispatch_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        auto finish_response = [&](std::string response) -> std::string {
+            if (lock.owns_lock())
+            {
+                lock.unlock();
+            }
+            uninstall_process_event_hook();
+            return response;
+        };
         bool completed = job->done;
         while (!completed)
         {
@@ -12185,13 +12201,13 @@ namespace
                                               "game thread did not start paint job",
                                               "\"queued_paint_removed\":true");
                 job->done = true;
-                return job->response;
+                return finish_response(job->response);
             }
             job->response = response_json(false, "game_thread_dispatch_timeout", 0, 1, "game thread did not process paint job");
             job->done = true;
-            return job->response;
+            return finish_response(job->response);
         }
-        return job->response;
+        return finish_response(job->response);
     }
 
     auto handle_request(const std::string& line) -> std::string
