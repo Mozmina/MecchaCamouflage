@@ -213,12 +213,16 @@ namespace meccha
         settings.tuning.front_back_source_max_uv = clamp_double(settings.tuning.front_back_source_max_uv, 0.001, 2.00);
         settings.tuning.metallic = clamp_double(settings.tuning.metallic, 0.0, 1.0);
         settings.tuning.roughness = clamp_double(settings.tuning.roughness, 0.0, 1.0);
-        settings.tuning.server_batch_limit = std::max(1, std::min(1000000, settings.tuning.server_batch_limit));
-        settings.tuning.server_batch_delay_ms = std::max(0, std::min(1000, settings.tuning.server_batch_delay_ms));
+        settings.tuning.server_batch_limit = 1;
+        settings.tuning.server_batch_delay_ms = std::max(1, std::min(1000, settings.tuning.server_batch_delay_ms));
         if (settings.start_hotkey.empty())
             settings.start_hotkey = "F10";
         if (settings.stop_hotkey.empty())
             settings.stop_hotkey = "F9";
+        if (settings.preview_hotkey.empty())
+            settings.preview_hotkey = "F8";
+        if (settings.unpreview_hotkey.empty())
+            settings.unpreview_hotkey = "F7";
     }
 
     auto load_settings() -> AppSettings
@@ -247,6 +251,10 @@ namespace meccha
             settings.start_hotkey = legacy_hotkey;
         if (const auto hotkey = extract_json_string(text, "stop_hotkey"); !hotkey.empty())
             settings.stop_hotkey = hotkey;
+        if (const auto hotkey = extract_json_string(text, "preview_hotkey"); !hotkey.empty())
+            settings.preview_hotkey = hotkey;
+        if (const auto hotkey = extract_json_string(text, "unpreview_hotkey"); !hotkey.empty())
+            settings.unpreview_hotkey = hotkey;
         settings.tuning.stroke_size_texels = extract_json_number(text, "stroke_size_texels", settings.tuning.stroke_size_texels);
         settings.tuning.coverage_step_texels = extract_json_number(text, "coverage_step_texels", settings.tuning.coverage_step_texels);
         settings.tuning.side_source_max_uv = extract_json_number(text, "side_source_max_uv", settings.tuning.side_source_max_uv);
@@ -254,6 +262,7 @@ namespace meccha
         settings.tuning.enable_front_paint = extract_json_bool(text, "enable_front_paint", settings.tuning.enable_front_paint);
         settings.tuning.enable_side_paint = extract_json_bool(text, "enable_side_paint", settings.tuning.enable_side_paint);
         settings.tuning.enable_back_paint = extract_json_bool(text, "enable_back_paint", settings.tuning.enable_back_paint);
+        settings.tuning.auto_material_properties = extract_json_bool(text, "auto_material_properties", settings.tuning.auto_material_properties);
         settings.tuning.metallic = extract_json_number(text, "metallic", settings.tuning.metallic);
         settings.tuning.roughness = extract_json_number(text, "roughness", settings.tuning.roughness);
         if (layout_version < 20 && settings.tuning.roughness <= 0.000001)
@@ -279,6 +288,8 @@ namespace meccha
             "  \"opacity\": " + std::to_string(settings.opacity) + ",\n" +
             "  \"start_hotkey\": " + json_string(settings.start_hotkey) + ",\n" +
             "  \"stop_hotkey\": " + json_string(settings.stop_hotkey) + ",\n" +
+            "  \"preview_hotkey\": " + json_string(settings.preview_hotkey) + ",\n" +
+            "  \"unpreview_hotkey\": " + json_string(settings.unpreview_hotkey) + ",\n" +
             "  \"stroke_size_texels\": " + std::to_string(settings.tuning.stroke_size_texels) + ",\n" +
             "  \"coverage_step_texels\": " + std::to_string(settings.tuning.coverage_step_texels) + ",\n" +
             "  \"side_source_max_uv\": " + std::to_string(settings.tuning.side_source_max_uv) + ",\n" +
@@ -288,6 +299,7 @@ namespace meccha
             "  \"enable_back_paint\": " + std::string(settings.tuning.enable_back_paint ? "true" : "false") + ",\n" +
             "  \"server_batch_limit\": " + std::to_string(settings.tuning.server_batch_limit) + ",\n" +
             "  \"server_batch_delay_ms\": " + std::to_string(settings.tuning.server_batch_delay_ms) + ",\n" +
+            "  \"auto_material_properties\": " + std::string(settings.tuning.auto_material_properties ? "true" : "false") + ",\n" +
             "  \"metallic\": " + std::to_string(settings.tuning.metallic) + ",\n" +
             "  \"roughness\": " + std::to_string(settings.tuning.roughness) + "\n" +
             "}\n";

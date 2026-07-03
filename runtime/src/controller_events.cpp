@@ -100,14 +100,14 @@ namespace meccha
                 if (event.stage == "mesh_server_batch_begin")
                 {
                     const double total = extract_json_number(event.details_json, "server_strokes_total", -1.0);
-                    return prefix + "Server batch " + progress_bar_text(0.0) + " 0/" + format_count(total);
+                    return prefix + "Server strokes " + progress_bar_text(0.0) + " 0/" + format_count(total);
                 }
                 if (event.stage == "mesh_server_batch")
                 {
                     const double sent = extract_json_number(event.details_json, "server_strokes_sent", -1.0);
                     const double total = extract_json_number(event.details_json, "server_strokes_total", -1.0);
                     const double progress = total > 0.0 ? sent / total : event.progress;
-                    return prefix + "Server batch " + progress_bar_text(progress) + " " +
+                    return prefix + "Server strokes " + progress_bar_text(progress) + " " +
                            format_count(sent) + "/" + format_count(total);
                 }
                 if (event.stage == "mesh_local_visual_sync")

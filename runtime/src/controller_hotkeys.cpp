@@ -138,6 +138,8 @@ namespace meccha
 
         constexpr int StartHotkeyId = 1;
         constexpr int StopHotkeyId = 2;
+        constexpr int PreviewHotkeyId = 3;
+        constexpr int UnPreviewHotkeyId = 4;
     }
 
     auto parse_hotkey_binding(const std::string& text, UINT default_vk) -> HotkeyBinding
@@ -171,12 +173,23 @@ namespace meccha
         return out;
     }
 
-    auto hotkey_backend_json(const HotkeyBinding& start, bool start_registered, const HotkeyBinding& stop, bool stop_registered) -> std::string
+    auto hotkey_backend_json(const HotkeyBinding& start,
+                             bool start_registered,
+                             const HotkeyBinding& stop,
+                             bool stop_registered,
+                             const HotkeyBinding& preview,
+                             bool preview_registered,
+                             const HotkeyBinding& unpreview,
+                             bool unpreview_registered) -> std::string
     {
         return std::string("{\"start\":\"") + (start_registered ? "register_hotkey" : "async_state") +
                "\",\"start_key\":\"" + hotkey_to_string(start) +
                "\",\"stop\":\"" + (stop_registered ? "register_hotkey" : "async_state") +
-               "\",\"stop_key\":\"" + hotkey_to_string(stop) + "\"}";
+               "\",\"stop_key\":\"" + hotkey_to_string(stop) +
+               "\",\"preview\":\"" + (preview_registered ? "register_hotkey" : "async_state") +
+               "\",\"preview_key\":\"" + hotkey_to_string(preview) +
+               "\",\"unpreview\":\"" + (unpreview_registered ? "register_hotkey" : "async_state") +
+               "\",\"unpreview_key\":\"" + hotkey_to_string(unpreview) + "\"}";
     }
 
     auto try_capture_hotkey_from_message(const MSG& msg, HotkeyBinding& out, std::string& error, bool& cancel) -> bool
@@ -206,16 +219,18 @@ namespace meccha
         return true;
     }
 
-    OverlayHotkeys::OverlayHotkeys(HotkeyBinding start, HotkeyBinding stop)
-        : start_(start), stop_(stop)
+    OverlayHotkeys::OverlayHotkeys(HotkeyBinding start, HotkeyBinding stop, HotkeyBinding preview, HotkeyBinding unpreview)
+        : start_(start), stop_(stop), preview_(preview), unpreview_(unpreview)
     {
-        set_hotkeys(start_, stop_);
+        set_hotkeys(start_, stop_, preview_, unpreview_);
     }
 
     OverlayHotkeys::~OverlayHotkeys()
     {
         unregister_start();
         unregister_stop();
+        unregister_preview();
+        unregister_unpreview();
     }
 
     void OverlayHotkeys::unregister_start()
@@ -230,6 +245,20 @@ namespace meccha
         if (stop_registered_)
             UnregisterHotKey(nullptr, StopHotkeyId);
         stop_registered_ = false;
+    }
+
+    void OverlayHotkeys::unregister_preview()
+    {
+        if (preview_registered_)
+            UnregisterHotKey(nullptr, PreviewHotkeyId);
+        preview_registered_ = false;
+    }
+
+    void OverlayHotkeys::unregister_unpreview()
+    {
+        if (unpreview_registered_)
+            UnregisterHotKey(nullptr, UnPreviewHotkeyId);
+        unpreview_registered_ = false;
     }
 
     auto OverlayHotkeys::set_start_hotkey(HotkeyBinding start, std::string* error) -> bool
@@ -284,19 +313,29 @@ namespace meccha
         return true;
     }
 
-    auto OverlayHotkeys::set_hotkeys(HotkeyBinding start, HotkeyBinding stop, std::string* error) -> bool
+    auto OverlayHotkeys::set_hotkeys(HotkeyBinding start, HotkeyBinding stop, HotkeyBinding preview, HotkeyBinding unpreview, std::string* error) -> bool
     {
         const HotkeyBinding previous_start = start_;
         const HotkeyBinding previous_stop = stop_;
+        const HotkeyBinding previous_preview = preview_;
+        const HotkeyBinding previous_unpreview = unpreview_;
         const bool previous_start_registered = start_registered_;
         const bool previous_stop_registered = stop_registered_;
+        const bool previous_preview_registered = preview_registered_;
+        const bool previous_unpreview_registered = unpreview_registered_;
 
         unregister_start();
         unregister_stop();
+        unregister_preview();
+        unregister_unpreview();
         start_ = start;
         stop_ = stop;
+        preview_ = preview;
+        unpreview_ = unpreview;
         start_down_ = false;
         stop_down_ = false;
+        preview_down_ = false;
+        unpreview_down_ = false;
 
         start_registered_ = RegisterHotKey(nullptr, StartHotkeyId, start_.modifiers | MOD_NOREPEAT, start_.vk) != FALSE;
         if (!start_registered_)
@@ -306,10 +345,16 @@ namespace meccha
                 *error = "RegisterHotKey start failed win32=" + std::to_string(code);
             start_ = previous_start;
             stop_ = previous_stop;
+            preview_ = previous_preview;
+            unpreview_ = previous_unpreview;
             if (previous_start_registered)
                 start_registered_ = RegisterHotKey(nullptr, StartHotkeyId, start_.modifiers | MOD_NOREPEAT, start_.vk) != FALSE;
             if (previous_stop_registered)
                 stop_registered_ = RegisterHotKey(nullptr, StopHotkeyId, stop_.modifiers | MOD_NOREPEAT, stop_.vk) != FALSE;
+            if (previous_preview_registered)
+                preview_registered_ = RegisterHotKey(nullptr, PreviewHotkeyId, preview_.modifiers | MOD_NOREPEAT, preview_.vk) != FALSE;
+            if (previous_unpreview_registered)
+                unpreview_registered_ = RegisterHotKey(nullptr, UnPreviewHotkeyId, unpreview_.modifiers | MOD_NOREPEAT, unpreview_.vk) != FALSE;
             return false;
         }
 
@@ -322,10 +367,63 @@ namespace meccha
             unregister_start();
             start_ = previous_start;
             stop_ = previous_stop;
+            preview_ = previous_preview;
+            unpreview_ = previous_unpreview;
             if (previous_start_registered)
                 start_registered_ = RegisterHotKey(nullptr, StartHotkeyId, start_.modifiers | MOD_NOREPEAT, start_.vk) != FALSE;
             if (previous_stop_registered)
                 stop_registered_ = RegisterHotKey(nullptr, StopHotkeyId, stop_.modifiers | MOD_NOREPEAT, stop_.vk) != FALSE;
+            if (previous_preview_registered)
+                preview_registered_ = RegisterHotKey(nullptr, PreviewHotkeyId, preview_.modifiers | MOD_NOREPEAT, preview_.vk) != FALSE;
+            if (previous_unpreview_registered)
+                unpreview_registered_ = RegisterHotKey(nullptr, UnPreviewHotkeyId, unpreview_.modifiers | MOD_NOREPEAT, unpreview_.vk) != FALSE;
+            return false;
+        }
+
+        preview_registered_ = RegisterHotKey(nullptr, PreviewHotkeyId, preview_.modifiers | MOD_NOREPEAT, preview_.vk) != FALSE;
+        if (!preview_registered_)
+        {
+            const DWORD code = GetLastError();
+            if (error)
+                *error = "RegisterHotKey preview failed win32=" + std::to_string(code);
+            unregister_start();
+            unregister_stop();
+            start_ = previous_start;
+            stop_ = previous_stop;
+            preview_ = previous_preview;
+            unpreview_ = previous_unpreview;
+            if (previous_start_registered)
+                start_registered_ = RegisterHotKey(nullptr, StartHotkeyId, start_.modifiers | MOD_NOREPEAT, start_.vk) != FALSE;
+            if (previous_stop_registered)
+                stop_registered_ = RegisterHotKey(nullptr, StopHotkeyId, stop_.modifiers | MOD_NOREPEAT, stop_.vk) != FALSE;
+            if (previous_preview_registered)
+                preview_registered_ = RegisterHotKey(nullptr, PreviewHotkeyId, preview_.modifiers | MOD_NOREPEAT, preview_.vk) != FALSE;
+            if (previous_unpreview_registered)
+                unpreview_registered_ = RegisterHotKey(nullptr, UnPreviewHotkeyId, unpreview_.modifiers | MOD_NOREPEAT, unpreview_.vk) != FALSE;
+            return false;
+        }
+
+        unpreview_registered_ = RegisterHotKey(nullptr, UnPreviewHotkeyId, unpreview_.modifiers | MOD_NOREPEAT, unpreview_.vk) != FALSE;
+        if (!unpreview_registered_)
+        {
+            const DWORD code = GetLastError();
+            if (error)
+                *error = "RegisterHotKey unpreview failed win32=" + std::to_string(code);
+            unregister_start();
+            unregister_stop();
+            unregister_preview();
+            start_ = previous_start;
+            stop_ = previous_stop;
+            preview_ = previous_preview;
+            unpreview_ = previous_unpreview;
+            if (previous_start_registered)
+                start_registered_ = RegisterHotKey(nullptr, StartHotkeyId, start_.modifiers | MOD_NOREPEAT, start_.vk) != FALSE;
+            if (previous_stop_registered)
+                stop_registered_ = RegisterHotKey(nullptr, StopHotkeyId, stop_.modifiers | MOD_NOREPEAT, stop_.vk) != FALSE;
+            if (previous_preview_registered)
+                preview_registered_ = RegisterHotKey(nullptr, PreviewHotkeyId, preview_.modifiers | MOD_NOREPEAT, preview_.vk) != FALSE;
+            if (previous_unpreview_registered)
+                unpreview_registered_ = RegisterHotKey(nullptr, UnPreviewHotkeyId, unpreview_.modifiers | MOD_NOREPEAT, unpreview_.vk) != FALSE;
             return false;
         }
 
@@ -336,7 +434,7 @@ namespace meccha
 
     auto OverlayHotkeys::backend_json() const -> std::string
     {
-        return hotkey_backend_json(start_, start_registered_, stop_, stop_registered_);
+        return hotkey_backend_json(start_, start_registered_, stop_, stop_registered_, preview_, preview_registered_, unpreview_, unpreview_registered_);
     }
 
     void OverlayHotkeys::handle_message(const MSG& msg, OverlayHotkeyState& state) const
@@ -345,6 +443,10 @@ namespace meccha
             state.start_requested = true;
         if (msg.message == WM_HOTKEY && msg.wParam == StopHotkeyId)
             state.stop_requested = true;
+        if (msg.message == WM_HOTKEY && msg.wParam == PreviewHotkeyId)
+            state.preview_requested = true;
+        if (msg.message == WM_HOTKEY && msg.wParam == UnPreviewHotkeyId)
+            state.unpreview_requested = true;
     }
 
     void OverlayHotkeys::poll_fallback(OverlayHotkeyState& state)
@@ -360,6 +462,18 @@ namespace meccha
             const bool down = (GetAsyncKeyState(static_cast<int>(stop_.vk)) & 0x8000) != 0;
             state.stop_requested = state.stop_requested || (down && !stop_down_);
             stop_down_ = down;
+        }
+        if (!preview_registered_)
+        {
+            const bool down = (GetAsyncKeyState(static_cast<int>(preview_.vk)) & 0x8000) != 0;
+            state.preview_requested = state.preview_requested || (down && !preview_down_);
+            preview_down_ = down;
+        }
+        if (!unpreview_registered_)
+        {
+            const bool down = (GetAsyncKeyState(static_cast<int>(unpreview_.vk)) & 0x8000) != 0;
+            state.unpreview_requested = state.unpreview_requested || (down && !unpreview_down_);
+            unpreview_down_ = down;
         }
     }
 }

@@ -718,6 +718,19 @@ namespace meccha
             return row_top;
         };
 
+        auto field_checkbox = [&](const char* label, const char* id, bool& value, bool enabled, bool& changed) {
+            ImGui::PushID(label);
+            const float row_top = ImGui::GetCursorScreenPos().y;
+            set_form_x();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("%s", label);
+            ImGui::SameLine(form_control_x());
+            ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, row_top + 4.0f));
+            if (checkbox_box(id, value, enabled))
+                changed = true;
+            ImGui::PopID();
+        };
+
         auto readonly_input_box = [&](const char* id, const char* text, float width) {
             ImGui::PushID(id);
             std::array<char, 96> buffer{};
@@ -961,19 +974,6 @@ namespace meccha
         {
             if (ImGui::BeginChild("ControlsColumn", ImVec2(left_width, 0.0f), false))
             {
-                const bool can_stop = runtime.paint_running;
-                const bool can_start = runtime.service_state != "Starting" &&
-                                       runtime.service_state != "Stopping" &&
-                                       !runtime.paint_running;
-                const float service_gap = style.ItemSpacing.x;
-                const float button_width = std::max(1.0f, (ImGui::GetContentRegionAvail().x - service_gap) * 0.5f);
-                if (action_button("Start / Hotkey", can_start, can_start, ImVec2(button_width, 30.0f)))
-                    actions.start_service_clicked = true;
-                ImGui::SameLine();
-                if (action_button("Stop / Hotkey", can_stop, false, ImVec2(button_width, 30.0f)))
-                    actions.stop_service_clicked = true;
-                ImGui::Dummy(ImVec2(0.0f, 2.0f));
-
                 const float settings_height = std::max(1.0f, ImGui::GetContentRegionAvail().y);
                 constexpr ImGuiChildFlags SettingsPanelFlags = ImGuiChildFlags_Borders;
                 constexpr ImGuiWindowFlags SettingsPanelWindowFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
@@ -990,10 +990,11 @@ namespace meccha
                     bool paint_value_changed = false;
                     field_double("Brush size (texels)", tuning.stroke_size_texels, 1.0, 12.0, "%.1f", runtime.paint_editing, paint_value_changed);
                     field_double("Coverage step (texels)", tuning.coverage_step_texels, 1.0, 12.0, "%.1f", runtime.paint_editing, paint_value_changed);
-                    field_int("Batch limit", tuning.server_batch_limit, 1, 1000000, runtime.paint_editing, paint_value_changed);
-                    field_int("Batch delay (ms)", tuning.server_batch_delay_ms, 0, 1000, runtime.paint_editing, paint_value_changed);
-                    field_double("Metallic", tuning.metallic, 0.0, 1.0, "%.6f", runtime.paint_editing, paint_value_changed);
-                    field_double("Roughness", tuning.roughness, 0.0, 1.0, "%.6f", runtime.paint_editing, paint_value_changed);
+                    tuning.server_batch_limit = 1;
+                    field_int("Stroke delay (ms)", tuning.server_batch_delay_ms, 1, 1000, runtime.paint_editing, paint_value_changed);
+                    field_checkbox("Material Properties", "MaterialPropertiesAuto", tuning.auto_material_properties, runtime.paint_editing, paint_value_changed);
+                    field_double("Metallic", tuning.metallic, 0.0, 1.0, "%.6f", runtime.paint_editing && !tuning.auto_material_properties, paint_value_changed);
+                    field_double("Roughness", tuning.roughness, 0.0, 1.0, "%.6f", runtime.paint_editing && !tuning.auto_material_properties, paint_value_changed);
                     region_checkboxes(tuning.enable_front_paint,
                                       tuning.enable_side_paint,
                                       tuning.enable_back_paint,
@@ -1038,6 +1039,28 @@ namespace meccha
                     ImGui::SameLine();
                     readonly_input_box("StopHotkeyReadonly",
                                        (runtime.app_editing ? draft.stop_hotkey : persisted.stop_hotkey).c_str(),
+                                       hotkey_input_width);
+
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 1.0f);
+                    app_row("Preview Hotkey");
+                    if (runtime.recording_preview_hotkey)
+                        app_frame_button("PreviewHotkeyRecordButton", "Press key...", runtime.app_editing, ImVec2(record_width, 0.0f));
+                    else if (app_frame_button("PreviewHotkeyRecordButton", "Record", runtime.app_editing, ImVec2(record_width, 0.0f)))
+                        actions.preview_hotkey_recording = true;
+                    ImGui::SameLine();
+                    readonly_input_box("PreviewHotkeyReadonly",
+                                       (runtime.app_editing ? draft.preview_hotkey : persisted.preview_hotkey).c_str(),
+                                       hotkey_input_width);
+
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 1.0f);
+                    app_row("UnPreview Hotkey");
+                    if (runtime.recording_unpreview_hotkey)
+                        app_frame_button("UnPreviewHotkeyRecordButton", "Press key...", runtime.app_editing, ImVec2(record_width, 0.0f));
+                    else if (app_frame_button("UnPreviewHotkeyRecordButton", "Record", runtime.app_editing, ImVec2(record_width, 0.0f)))
+                        actions.unpreview_hotkey_recording = true;
+                    ImGui::SameLine();
+                    readonly_input_box("UnPreviewHotkeyReadonly",
+                                       (runtime.app_editing ? draft.unpreview_hotkey : persisted.unpreview_hotkey).c_str(),
                                        hotkey_input_width);
 
                     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 1.0f);

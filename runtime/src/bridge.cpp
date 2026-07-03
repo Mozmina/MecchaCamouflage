@@ -40,12 +40,12 @@ namespace
     constexpr std::size_t MaxRequestBytes = 8 * 1024 * 1024;
     constexpr int ProcessEventVtableIndex = 0x4C;
     constexpr UINT PaintDispatchMessage = WM_APP + 0x4D43;
-    constexpr int ServerPaintBatchStrokeLimit = 1000000;
-    constexpr int ServerPaintBatchStrokeLimitMax = 1000000;
-    constexpr int ServerPaintBatchDelayMs = 0;
-    constexpr int MeshFirstServerBatchMinDelayMs = 0;
-    constexpr int MeshFirstFastApplyStrokesPerTick = 4096;
-    constexpr int MeshFirstFastApplyRenderTargetWritesPerFrame = 4096;
+    constexpr int ServerPaintBatchStrokeLimit = 1;
+    constexpr int ServerPaintBatchStrokeLimitMax = 1;
+    constexpr int ServerPaintBatchDelayMs = 1;
+    constexpr int MeshFirstServerBatchMinDelayMs = 1;
+    constexpr int MeshFirstFastApplyStrokesPerTick = 0;
+    constexpr int MeshFirstFastApplyRenderTargetWritesPerFrame = 0;
     constexpr int MeshFirstServerTextureSyncPollMs = 50;
     constexpr int MeshFirstServerTextureSyncMaxPolls = 40;
     constexpr int MeshFirstTextureSyncObserverPollMs = 50;
@@ -2505,6 +2505,7 @@ namespace
         std::uintptr_t relay_component{0};
         std::uintptr_t server_paint_batch_function{0};
         std::uintptr_t server_compact_paint_batch_function{0};
+        std::uintptr_t local_paint_at_uv_function{0};
     };
 
     struct SdkViewportInfo
@@ -3027,6 +3028,8 @@ namespace
                ",\"function_server_paint_batch\":\"" + hex_address(ctx.server_paint_batch_function) + "\"" +
                ",\"function_server_compact_paint_batch_available\":" + std::string(json_bool(ctx.server_compact_paint_batch_function != 0)) +
                ",\"function_server_compact_paint_batch\":\"" + hex_address(ctx.server_compact_paint_batch_function) + "\"" +
+               ",\"function_paint_at_uv_with_brush_available\":" + std::string(json_bool(ctx.local_paint_at_uv_function != 0)) +
+               ",\"function_paint_at_uv_with_brush\":\"" + hex_address(ctx.local_paint_at_uv_function) + "\"" +
                ",\"param_schema\":\"FPaintStroke{Uv@0,WorldPosition@16,bHasWorldPosition@40,BrushSettings@104,ChannelData@144,TargetChannel@176};ServerPaintBatch{Batch@0}\"" +
                std::string(",\"sdk_replication_api\":\"component_server_paint_batch\"") +
                ",\"multiplayer_replicated\":true";
@@ -3179,6 +3182,7 @@ namespace
         }
         ctx.server_paint_batch_function = ref.find_function(ctx.component, "ServerPaintBatch");
         ctx.server_compact_paint_batch_function = ref.find_function(ctx.component, "ServerCompactPaintBatch");
+        ctx.local_paint_at_uv_function = ref.find_function(ctx.component, "PaintAtUVWithBrush");
         ctx.ok = true;
         ctx.stage = "sdk_ready";
         ctx.message = "SDK context ready";
@@ -5055,6 +5059,194 @@ namespace
         std::string failure{"not_run"};
     };
 
+    struct MeshFirstPreviewSnapshot
+    {
+        bool available{false};
+        std::uintptr_t component{0};
+        int texture_size{0};
+        std::uint64_t hash{1469598103934665603ULL};
+        std::vector<std::uint8_t> albedo_bytes{};
+    };
+
+    struct MeshFirstPaintMaterialPattern
+    {
+        sdk::FLinearColor albedo_color{};
+        float metallic{0.0f};
+        float roughness{0.65f};
+        float coverage_ratio{0.0f};
+        std::int32_t sample_count{0};
+    };
+
+    static_assert(sizeof(MeshFirstPaintMaterialPattern) == 0x20, "PaintMaterialPattern layout mismatch");
+    static_assert(offsetof(MeshFirstPaintMaterialPattern, metallic) == 0x10, "PaintMaterialPattern Metallic offset mismatch");
+    static_assert(offsetof(MeshFirstPaintMaterialPattern, roughness) == 0x14, "PaintMaterialPattern Roughness offset mismatch");
+    static_assert(offsetof(MeshFirstPaintMaterialPattern, coverage_ratio) == 0x18, "PaintMaterialPattern CoverageRatio offset mismatch");
+    static_assert(offsetof(MeshFirstPaintMaterialPattern, sample_count) == 0x1C, "PaintMaterialPattern SampleCount offset mismatch");
+
+    struct MeshFirstMaterialProperties
+    {
+        bool ok{false};
+        double metallic{0.0};
+        double roughness{0.65};
+        double coverage_ratio{0.0};
+        int sample_count{0};
+        int patterns{0};
+        std::string failure{"not_run"};
+    };
+
+    std::mutex g_mesh_first_preview_mutex;
+    MeshFirstPreviewSnapshot g_mesh_first_preview_snapshot{};
+
+    auto mesh_first_store_preview_snapshot(std::uintptr_t component,
+                                           int texture_size,
+                                           const std::vector<std::uint8_t>& albedo_bytes) -> void
+    {
+        if (!component || albedo_bytes.empty())
+        {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(g_mesh_first_preview_mutex);
+        g_mesh_first_preview_snapshot.available = true;
+        g_mesh_first_preview_snapshot.component = component;
+        g_mesh_first_preview_snapshot.texture_size = texture_size;
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (const auto value : albedo_bytes)
+        {
+            hash ^= static_cast<std::uint64_t>(value);
+            hash *= 1099511628211ULL;
+        }
+        g_mesh_first_preview_snapshot.hash = hash;
+        g_mesh_first_preview_snapshot.albedo_bytes = albedo_bytes;
+    }
+
+    auto mesh_first_clear_preview_snapshot() -> void
+    {
+        std::lock_guard<std::mutex> lock(g_mesh_first_preview_mutex);
+        g_mesh_first_preview_snapshot = {};
+    }
+
+    auto mesh_first_preview_snapshot_copy() -> MeshFirstPreviewSnapshot
+    {
+        std::lock_guard<std::mutex> lock(g_mesh_first_preview_mutex);
+        return g_mesh_first_preview_snapshot;
+    }
+
+    auto mesh_first_get_dominant_material_properties(Reflection& ref, std::uintptr_t component) -> MeshFirstMaterialProperties
+    {
+        MeshFirstMaterialProperties out{};
+        if (!live_uobject(component))
+        {
+            out.failure = "paint_component_unavailable";
+            return out;
+        }
+        const auto function = ref.find_function(component, "GetDominantPaintMaterialPatterns");
+        if (!function)
+        {
+            out.failure = "GetDominantPaintMaterialPatterns_unavailable";
+            return out;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 512)
+        {
+            out.failure = "GetDominantPaintMaterialPatterns_params_size_invalid";
+            return out;
+        }
+
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            const auto offset = prop_offset(prop);
+            if (offset < 0 || offset >= params_size)
+            {
+                continue;
+            }
+            if (name == "maxpatterns" && offset + static_cast<int>(sizeof(std::int32_t)) <= params_size)
+            {
+                *reinterpret_cast<std::int32_t*>(params.data() + offset) = 4;
+            }
+            else if (name == "samplestep" && offset + static_cast<int>(sizeof(std::int32_t)) <= params_size)
+            {
+                *reinterpret_cast<std::int32_t*>(params.data() + offset) = 8;
+            }
+            else if (name == "alphathreshold" && offset + static_cast<int>(sizeof(float)) <= params_size)
+            {
+                *reinterpret_cast<float*>(params.data() + offset) = 0.01f;
+            }
+        }
+
+        std::string failure{};
+        if (!process_event(component, function, params.data(), failure))
+        {
+            out.failure = "GetDominantPaintMaterialPatterns_failed:" + failure;
+            return out;
+        }
+
+        bool return_value = true;
+        sdk::TArray<MeshFirstPaintMaterialPattern> patterns{};
+        bool found_patterns = false;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            const auto offset = prop_offset(prop);
+            if (offset < 0 || offset >= params_size)
+            {
+                continue;
+            }
+            if (name == "returnvalue")
+            {
+                return_value = params[static_cast<std::size_t>(offset)] != 0;
+            }
+            else if (name == "outpatterns" && offset + static_cast<int>(sizeof(sdk::TArray<MeshFirstPaintMaterialPattern>)) <= params_size)
+            {
+                patterns = *reinterpret_cast<sdk::TArray<MeshFirstPaintMaterialPattern>*>(params.data() + offset);
+                found_patterns = true;
+            }
+        }
+        if (!return_value)
+        {
+            out.failure = "GetDominantPaintMaterialPatterns_return_false";
+            return out;
+        }
+        if (!found_patterns || !patterns.Data || patterns.Num <= 0 || patterns.Max < patterns.Num || patterns.Num > 64)
+        {
+            out.failure = "GetDominantPaintMaterialPatterns_no_patterns";
+            return out;
+        }
+
+        std::vector<MeshFirstPaintMaterialPattern> copied(static_cast<std::size_t>(patterns.Num));
+        if (!safe_copy(copied.data(), patterns.Data, copied.size() * sizeof(MeshFirstPaintMaterialPattern)))
+        {
+            out.failure = "GetDominantPaintMaterialPatterns_copy_failed";
+            return out;
+        }
+
+        const MeshFirstPaintMaterialPattern* best = nullptr;
+        for (const auto& pattern : copied)
+        {
+            if (!best ||
+                pattern.sample_count > best->sample_count ||
+                (pattern.sample_count == best->sample_count && pattern.coverage_ratio > best->coverage_ratio))
+            {
+                best = &pattern;
+            }
+        }
+        if (!best)
+        {
+            out.failure = "GetDominantPaintMaterialPatterns_empty_after_copy";
+            return out;
+        }
+
+        out.ok = true;
+        out.metallic = clamp01(best->metallic);
+        out.roughness = clamp01(best->roughness);
+        out.coverage_ratio = clamp01(best->coverage_ratio);
+        out.sample_count = std::max(0, static_cast<int>(best->sample_count));
+        out.patterns = static_cast<int>(copied.size());
+        out.failure = "ok";
+        return out;
+    }
+
     auto mesh_first_hash_channel_bytes(const std::vector<std::uint8_t>& bytes) -> std::uint64_t
     {
         std::uint64_t hash = 1469598103934665603ULL;
@@ -5355,7 +5547,10 @@ namespace
         out.preview_hash = mesh_first_hash_channel_bytes(channel.bytes);
         if (out.pixels_changed <= 0 || out.preview_hash == out.before_hash)
         {
-            out.failure = "local_texture_preview_no_change";
+            out.import_ok = true;
+            out.ok = true;
+            out.failure.clear();
+            out.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             return out;
         }
 
@@ -7270,6 +7465,7 @@ namespace
         std::uintptr_t relay_component{0};
         std::uintptr_t server_paint_batch_function{0};
         std::uintptr_t server_compact_paint_batch_function{0};
+        std::uintptr_t local_paint_at_uv_function{0};
         bool server_compact_paint_batch_enabled{false};
         bool server_compact_paint_batch_available{false};
         std::string server_batch_rpc{"ServerPaintBatch"};
@@ -7499,34 +7695,98 @@ namespace
                 ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job->server_texture_sync_started_at).count()
                 : (job ? job->server_texture_sync_elapsed_ms : -1.0);
 
+        auto eta_from_observed_rate = [](double elapsed_ms,
+                                         int completed_units,
+                                         int total_units,
+                                         int remaining_delay_units,
+                                         int delay_ms) -> double {
+            if (total_units <= 0 || completed_units >= total_units)
+            {
+                return 0.0;
+            }
+            const double delay_floor_ms =
+                static_cast<double>(std::max(0, remaining_delay_units)) *
+                static_cast<double>(std::max(0, delay_ms));
+            if (completed_units <= 0 || elapsed_ms <= 0.0 || !std::isfinite(elapsed_ms))
+            {
+                return delay_floor_ms;
+            }
+            const int remaining_units = std::max(0, total_units - completed_units);
+            const double observed_ms_per_unit = elapsed_ms / static_cast<double>(std::max(1, completed_units));
+            return std::max(delay_floor_ms, observed_ms_per_unit * static_cast<double>(remaining_units));
+        };
+
+        const bool lockstep_local_sync = job && job->local_visual_sync_enabled;
+        const int remaining_server_strokes = std::max(0, total_strokes - server_strokes_sent);
+        const int remaining_local_strokes = std::max(0, total_strokes - local_strokes_synced);
+        const int remaining_server_batches = mesh_first_div_ceil(remaining_server_strokes, server_batch_limit);
+        const int remaining_local_batches = mesh_first_div_ceil(remaining_local_strokes, local_batch_limit);
+        const int paint_strokes_done = lockstep_local_sync ? std::min(server_strokes_sent, local_strokes_synced)
+                                                           : std::max(server_strokes_sent, local_strokes_synced);
+        const int paint_delay_ms = lockstep_local_sync ? std::max(server_batch_delay_ms, local_batch_delay_ms)
+                                                       : std::max(server_batch_delay_ms, local_batch_delay_ms);
+        const double server_observed_elapsed_ms = lockstep_local_sync ? paint_elapsed_ms : server_elapsed_ms;
+        const double server_observed_ms_per_stroke =
+            server_strokes_sent > 0 ? server_observed_elapsed_ms / static_cast<double>(server_strokes_sent) : -1.0;
+        const double paint_observed_ms_per_stroke =
+            paint_strokes_done > 0 ? paint_elapsed_ms / static_cast<double>(paint_strokes_done) : -1.0;
+
         double server_eta_ms = 0.0;
         double local_eta_ms = 0.0;
+        double paint_eta_ms = 0.0;
         if (phase == MeshFirstBatchPhase::Planning)
         {
             server_eta_ms = std::max(0, server_batches_total - 1) * static_cast<double>(server_batch_delay_ms);
-            local_eta_ms = std::max(0, local_batches_total - 1) * static_cast<double>(local_batch_delay_ms);
+            if (job && job->local_visual_sync_enabled)
+            {
+                local_eta_ms = lockstep_local_sync ? server_eta_ms
+                                                   : std::max(0, local_batches_total - 1) * static_cast<double>(local_batch_delay_ms);
+                paint_eta_ms = lockstep_local_sync ? server_eta_ms : server_eta_ms + local_eta_ms;
+            }
+            else
+            {
+                paint_eta_ms = server_eta_ms;
+            }
         }
         else if (phase == MeshFirstBatchPhase::ServerBatch)
         {
-            int remaining_server_batches = std::max(0, server_batches_total - server_batches_done);
-            if (server_batches_done == 0 && server_strokes_sent == 0 && remaining_server_batches > 0)
+            server_eta_ms = eta_from_observed_rate(server_observed_elapsed_ms,
+                                                   server_strokes_sent,
+                                                   total_strokes,
+                                                   remaining_server_batches,
+                                                   server_batch_delay_ms);
+            if (lockstep_local_sync)
             {
-                --remaining_server_batches;
+                local_eta_ms = server_eta_ms;
+                paint_eta_ms = eta_from_observed_rate(paint_elapsed_ms,
+                                                      paint_strokes_done,
+                                                      total_strokes,
+                                                      remaining_server_batches,
+                                                      paint_delay_ms);
             }
-            server_eta_ms = remaining_server_batches * static_cast<double>(server_batch_delay_ms);
-            local_eta_ms = std::max(0, local_batches_total - 1) * static_cast<double>(local_batch_delay_ms);
+            else
+            {
+                local_eta_ms = job && job->local_visual_sync_enabled
+                                   ? std::max(0, local_batches_total - 1) * static_cast<double>(local_batch_delay_ms)
+                                   : 0.0;
+                paint_eta_ms = server_eta_ms + local_eta_ms;
+            }
         }
         else if (phase == MeshFirstBatchPhase::LocalSync)
         {
-            int remaining_local_batches = std::max(0, local_batches_total - local_batches_done);
-            if (local_batches_done == 0 && local_strokes_synced == 0 && remaining_local_batches > 0)
-            {
-                --remaining_local_batches;
-            }
-            local_eta_ms = remaining_local_batches * static_cast<double>(local_batch_delay_ms);
+            local_eta_ms = eta_from_observed_rate(local_elapsed_ms,
+                                                  local_strokes_synced,
+                                                  total_strokes,
+                                                  remaining_local_batches,
+                                                  local_batch_delay_ms);
+            paint_eta_ms = local_eta_ms;
         }
-
-        const double paint_eta_ms = terminal ? 0.0 : std::max(0.0, server_eta_ms + local_eta_ms);
+        if (terminal)
+        {
+            server_eta_ms = 0.0;
+            local_eta_ms = 0.0;
+            paint_eta_ms = 0.0;
+        }
         std::string out = "\"progress_schema_version\":2";
         out += ",\"phase\":\"" + std::string(mesh_first_phase_name(phase)) + "\"";
         out += ",\"terminal\":" + std::string(json_bool(terminal));
@@ -7549,6 +7809,8 @@ namespace
         out += ",\"server_elapsed_ms\":" + std::to_string(server_elapsed_ms);
         out += ",\"server_batch_elapsed_ms\":" + std::to_string(server_elapsed_ms);
         out += ",\"server_eta_ms\":" + std::to_string(server_eta_ms);
+        out += ",\"server_eta_source\":\"observed_stroke_rate_with_delay_floor\"";
+        out += ",\"server_observed_ms_per_stroke\":" + std::to_string(server_observed_ms_per_stroke);
         out += ",\"local_batch_limit\":" + std::to_string(local_batch_limit);
         out += ",\"local_batch_delay_ms\":" + std::to_string(local_batch_delay_ms);
         out += ",\"local_batches_total\":" + std::to_string(local_batches_total);
@@ -7560,6 +7822,8 @@ namespace
         out += ",\"local_visual_sync_elapsed_ms\":" + std::to_string(local_elapsed_ms);
         out += ",\"local_elapsed_ms\":" + std::to_string(local_elapsed_ms);
         out += ",\"local_eta_ms\":" + std::to_string(local_eta_ms);
+        out += ",\"paint_eta_source\":\"observed_stroke_rate_with_delay_floor\"";
+        out += ",\"paint_observed_ms_per_stroke\":" + std::to_string(paint_observed_ms_per_stroke);
         out += ",\"server_texture_sync_started\":" + std::string(json_bool(job && job->server_texture_sync_started));
         out += ",\"server_texture_sync_polls\":" + std::to_string(job ? job->server_texture_sync_polls : 0);
         out += ",\"server_texture_sync_max_polls\":" + std::to_string(job ? job->server_texture_sync_max_polls : 0);
@@ -7614,24 +7878,33 @@ namespace
         constexpr bool enable_front = true;
         constexpr bool enable_side = true;
         constexpr bool enable_back = true;
+        const bool preview_only = json_bool_field(request, "preview_only", false);
+        const bool unpreview_only = json_bool_field(request, "unpreview_only", false);
         const bool research_artifacts = json_bool_field(request, "research_artifacts", false);
         const double tuning_stroke_size_texels = clamp_range(json_number_field(request, "stroke_size_texels", 9.0), 1.0, 12.0);
         const double tuning_coverage_step_texels = clamp_range(json_number_field(request, "coverage_step_texels", 9.0), 1.0, 12.0);
         const double tuning_side_source_max_uv = clamp_range(json_number_field(request, "side_source_max_uv", 0.08), 0.001, 0.50);
         const double tuning_front_back_source_max_uv = clamp_range(json_number_field(request, "front_back_source_max_uv", 0.45), 0.001, 2.00);
+        const bool tuning_auto_material_properties = json_bool_field(request, "auto_material_properties", true);
         const double tuning_metallic = clamp_range(json_number_field(request, "metallic", 0.0), 0.0, 1.0);
         const double tuning_roughness = clamp_range(json_number_field(request, "roughness", 1.0), 0.0, 1.0);
         const int tuning_server_batch_limit = json_int_field(request, "server_batch_limit", ServerPaintBatchStrokeLimit, 1, ServerPaintBatchStrokeLimitMax);
         const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", ServerPaintBatchDelayMs, 0, 1000);
 
         std::string metadata = "\"route\":\"mesh_first_paint\"";
-        metadata += ",\"mesh_first_pipeline\":\"profile_v2_pose_uv_atlas_server_batch\"";
+        const std::string mesh_first_pipeline =
+            unpreview_only ? "local_preview_restore"
+                           : (preview_only ? "profile_v2_pose_uv_atlas_local_preview"
+                                           : "profile_v2_pose_uv_atlas_single_server_strokes");
+        metadata += ",\"mesh_first_pipeline\":\"" + mesh_first_pipeline + "\"";
+        metadata += ",\"preview_only\":" + std::string(json_bool(preview_only));
+        metadata += ",\"unpreview_only\":" + std::string(json_bool(unpreview_only));
         metadata += ",\"mesh_region_model\":\"mesh_local_normal\"";
         metadata += ",\"mesh_source_model\":\"projected_visible_zbuffer\"";
         metadata += ",\"mesh_back_color_source\":\"shared_camera_facing_source\"";
         metadata += ",\"old_dense_hittest_fallback_used\":false";
         metadata += ",\"runtime_hit_test_used\":false";
-        metadata += ",\"server_paint_batch_required\":true";
+        metadata += ",\"server_paint_batch_required\":" + std::string(json_bool(!preview_only && !unpreview_only));
         metadata += ",\"research_artifacts_requested\":" + std::string(json_bool(research_artifacts));
         metadata += ",\"enable_front_paint\":" + std::string(json_bool(enable_front));
         metadata += ",\"enable_side_paint\":" + std::string(json_bool(enable_side));
@@ -7640,6 +7913,8 @@ namespace
         metadata += ",\"coverage_step_texels\":" + std::to_string(tuning_coverage_step_texels);
         metadata += ",\"side_source_max_uv\":" + std::to_string(tuning_side_source_max_uv);
         metadata += ",\"front_back_source_max_uv\":" + std::to_string(tuning_front_back_source_max_uv);
+        metadata += ",\"auto_material_properties\":" + std::string(json_bool(tuning_auto_material_properties));
+        metadata += ",\"material_properties_mode\":\"" + std::string(tuning_auto_material_properties ? "auto" : "manual") + "\"";
         metadata += ",\"metallic\":" + std::to_string(tuning_metallic);
         metadata += ",\"roughness\":" + std::to_string(tuning_roughness);
         metadata += ",\"server_batch_limit\":" + std::to_string(tuning_server_batch_limit);
@@ -7713,13 +7988,78 @@ namespace
         {
             return response_json(false, ctx.stage.c_str(), 0, 1, ctx.message, metadata);
         }
-        if (!ctx.server_paint_batch_function)
+        if (!preview_only && !unpreview_only && !ctx.server_paint_batch_function)
         {
             return response_json(false,
                                  "mesh_server_batch_unavailable",
                                  0,
                                  1,
                                  "ServerPaintBatch is unavailable; mesh-first paint cannot replay",
+                                 metadata);
+        }
+        if (unpreview_only)
+        {
+            const auto snapshot = mesh_first_preview_snapshot_copy();
+            metadata += ",\"unpreview_snapshot_available\":" + std::string(json_bool(snapshot.available));
+            metadata += ",\"unpreview_snapshot_component\":\"" + hex_address(snapshot.component) + "\"";
+            metadata += ",\"unpreview_snapshot_bytes\":" + std::to_string(snapshot.albedo_bytes.size());
+            metadata += ",\"unpreview_snapshot_texture_size\":" + std::to_string(snapshot.texture_size);
+            metadata += ",\"unpreview_snapshot_hash\":\"" + std::to_string(snapshot.hash) + "\"";
+            if (!snapshot.available || snapshot.albedo_bytes.empty())
+            {
+                return response_json(false,
+                                     "mesh_unpreview_snapshot_unavailable",
+                                     0,
+                                     1,
+                                     "No local preview snapshot is available to restore.",
+                                     metadata);
+            }
+            if (snapshot.component != ctx.component)
+            {
+                return response_json(false,
+                                     "mesh_unpreview_component_mismatch",
+                                     0,
+                                     1,
+                                     "The local preview snapshot belongs to a different paint component.",
+                                     metadata + ",\"current_component\":\"" + hex_address(ctx.component) + "\"");
+            }
+
+            write_bridge_progress("mesh_unpreview_restore",
+                                  "Restoring local preview texture",
+                                  0,
+                                  1,
+                                  0.0,
+                                  "\"phase\":\"local_unpreview\",\"terminal\":false,\"result\":\"running\"");
+            const auto started = std::chrono::steady_clock::now();
+            std::string import_failure{};
+            auto restore_bytes = snapshot.albedo_bytes;
+            const bool restored = mesh_first_import_channel_bytes(ref,
+                                                                  ctx.component,
+                                                                  sdk::EPaintChannel::Albedo,
+                                                                  restore_bytes,
+                                                                  import_failure);
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            if (restored)
+            {
+                mesh_first_clear_preview_snapshot();
+            }
+            metadata += ",\"unpreview_import_ok\":" + std::string(json_bool(restored));
+            metadata += ",\"unpreview_import_failure\":\"" + json_escape(import_failure) + "\"";
+            metadata += ",\"paint_elapsed_ms\":" + std::to_string(elapsed_ms);
+            metadata += ",\"server_eta_ms\":0,\"local_eta_ms\":0,\"paint_eta_ms\":0";
+            write_bridge_progress(restored ? "mesh_unpreview_done" : "mesh_unpreview_failed",
+                                  restored ? "local preview texture restored" : "local preview restore failed",
+                                  restored ? 1 : 0,
+                                  1,
+                                  elapsed_ms,
+                                  "\"phase\":\"local_unpreview\",\"terminal\":true,\"result\":\"" +
+                                      std::string(restored ? "done" : "failed") + "\"");
+            return response_json(restored,
+                                 restored ? "mesh_unpreview_done" : "mesh_unpreview_failed",
+                                 restored ? 1 : 0,
+                                 restored ? 0 : 1,
+                                 restored ? "local preview texture restored" : "local preview restore failed: " + import_failure,
                                  metadata);
         }
 
@@ -8288,64 +8628,111 @@ namespace
         constexpr auto paint_target_channel = sdk::EPaintChannel::All;
         metadata += ",\"paint_target_channel\":\"all\"";
         metadata += ",\"paint_target_channel_value\":" + std::to_string(static_cast<int>(paint_target_channel));
-        for (const auto& sample : plan_samples)
+        MeshFirstMaterialProperties material_properties{};
+        if (tuning_auto_material_properties)
         {
-            const bool enabled = (sample.region == MeshFirstRegion::Front && enable_front) ||
-                                 (sample.region == MeshFirstRegion::Side && enable_side) ||
-                                 (sample.region == MeshFirstRegion::Back && enable_back);
-            if (!enabled)
+            material_properties = mesh_first_get_dominant_material_properties(ref, ctx.component);
+        }
+        metadata += ",\"material_properties_source\":\"" +
+                    std::string(!tuning_auto_material_properties
+                                    ? "manual_tuning"
+                                    : (material_properties.ok ? "dominant_paint_material_patterns" : "source_samples_fallback")) +
+                    "\"";
+        metadata += ",\"material_properties_auto_ok\":" + std::string(json_bool(material_properties.ok));
+        metadata += ",\"material_properties_failure\":\"" + json_escape(material_properties.failure) + "\"";
+        metadata += ",\"material_properties_patterns\":" + std::to_string(material_properties.patterns);
+        metadata += ",\"material_properties_sample_count\":" + std::to_string(material_properties.sample_count);
+        metadata += ",\"material_properties_coverage_ratio\":" + std::to_string(material_properties.coverage_ratio);
+        metadata += ",\"material_properties_metallic\":" + std::to_string(material_properties.metallic);
+        metadata += ",\"material_properties_roughness\":" + std::to_string(material_properties.roughness);
+        int material_properties_auto_samples = 0;
+        int material_properties_source_sample_fallbacks = 0;
+        const MeshFirstRegion replay_region_order[]{MeshFirstRegion::Front, MeshFirstRegion::Side, MeshFirstRegion::Back};
+        metadata += ",\"replay_region_order\":\"front,side,back\"";
+        for (const auto target_region : replay_region_order)
+        {
+            const bool region_enabled = (target_region == MeshFirstRegion::Front && enable_front) ||
+                                        (target_region == MeshFirstRegion::Side && enable_side) ||
+                                        (target_region == MeshFirstRegion::Back && enable_back);
+            if (!region_enabled)
             {
                 continue;
             }
-            const auto channel = sdk_make_channel(sdk_srgb_to_linear_unit(sample.r),
-                                                  sdk_srgb_to_linear_unit(sample.g),
-                                                  sdk_srgb_to_linear_unit(sample.b),
-                                                  tuning_metallic,
-                                                  tuning_roughness,
-                                                  sdk::EPaintChannelApplyMode::Override);
-            auto stroke = use_mesh_anchors
-                              ? sdk_make_mesh_anchor_stroke(sample.u,
-                                                            sample.v,
-                                                            channel,
-                                                            brush,
-                                                            paint_target_channel,
-                                                            sample.world_position,
-                                                            sample.local_position,
-                                                            sample.triangle_index,
-                                                            sample.barycentric_a,
-                                                            sample.barycentric_b,
-                                                            sample.barycentric_c)
-                              : sdk_make_uv_stroke(sample.u,
-                                                   sample.v,
-                                                   channel,
-                                                   brush,
-                                                   paint_target_channel);
-            if (stroke.bHasWorldPosition)
+            for (const auto& sample : plan_samples)
             {
-                ++replay_world_anchors;
-            }
-            if (stroke.bHasLocalPosition)
-            {
-                ++replay_local_anchors;
-            }
-            if (stroke.bHasSkeletalTriangleAnchor)
-            {
-                ++replay_triangle_anchors;
-            }
-            strokes.push_back(stroke);
-            if (sample.region == MeshFirstRegion::Front)
-            {
-                ++replay_front;
-            }
-            else if (sample.region == MeshFirstRegion::Side)
-            {
-                ++replay_side;
-            }
-            else
-            {
-                ++replay_back;
+                if (sample.region != target_region)
+                {
+                    continue;
+                }
+                double stroke_metallic = tuning_metallic;
+                double stroke_roughness = tuning_roughness;
+                if (tuning_auto_material_properties)
+                {
+                    if (material_properties.ok)
+                    {
+                        stroke_metallic = material_properties.metallic;
+                        stroke_roughness = material_properties.roughness;
+                        ++material_properties_auto_samples;
+                    }
+                    else
+                    {
+                        stroke_metallic = clamp01(sample.metallic);
+                        stroke_roughness = clamp01(sample.roughness);
+                        ++material_properties_source_sample_fallbacks;
+                    }
+                }
+                const auto channel = sdk_make_channel(sdk_srgb_to_linear_unit(sample.r),
+                                                      sdk_srgb_to_linear_unit(sample.g),
+                                                      sdk_srgb_to_linear_unit(sample.b),
+                                                      stroke_metallic,
+                                                      stroke_roughness,
+                                                      sdk::EPaintChannelApplyMode::Override);
+                auto stroke = use_mesh_anchors
+                                  ? sdk_make_mesh_anchor_stroke(sample.u,
+                                                                sample.v,
+                                                                channel,
+                                                                brush,
+                                                                paint_target_channel,
+                                                                sample.world_position,
+                                                                sample.local_position,
+                                                                sample.triangle_index,
+                                                                sample.barycentric_a,
+                                                                sample.barycentric_b,
+                                                                sample.barycentric_c)
+                                  : sdk_make_uv_stroke(sample.u,
+                                                       sample.v,
+                                                       channel,
+                                                       brush,
+                                                       paint_target_channel);
+                if (stroke.bHasWorldPosition)
+                {
+                    ++replay_world_anchors;
+                }
+                if (stroke.bHasLocalPosition)
+                {
+                    ++replay_local_anchors;
+                }
+                if (stroke.bHasSkeletalTriangleAnchor)
+                {
+                    ++replay_triangle_anchors;
+                }
+                strokes.push_back(stroke);
+                if (sample.region == MeshFirstRegion::Front)
+                {
+                    ++replay_front;
+                }
+                else if (sample.region == MeshFirstRegion::Side)
+                {
+                    ++replay_side;
+                }
+                else
+                {
+                    ++replay_back;
+                }
             }
         }
+        metadata += ",\"material_properties_auto_samples\":" + std::to_string(material_properties_auto_samples);
+        metadata += ",\"material_properties_source_sample_fallbacks\":" + std::to_string(material_properties_source_sample_fallbacks);
         if (strokes.empty())
         {
             return response_json(false,
@@ -8396,35 +8783,55 @@ namespace
         metadata += ",\"replay_world_anchors\":" + std::to_string(replay_world_anchors);
         metadata += ",\"replay_local_anchors\":" + std::to_string(replay_local_anchors);
         metadata += ",\"replay_triangle_anchors\":" + std::to_string(replay_triangle_anchors);
-        const bool use_compact_server_batch = ctx.server_compact_paint_batch_function != 0;
+        const bool use_compact_server_batch = false;
         metadata += ",\"server_batch_rpc\":\"" + std::string(use_compact_server_batch ? "ServerCompactPaintBatch" : "ServerPaintBatch") + "\"";
-        metadata += ",\"server_paint_batch_used\":" + std::string(json_bool(!use_compact_server_batch));
+        metadata += ",\"server_paint_batch_used\":" + std::string(json_bool(!preview_only));
+        metadata += ",\"server_paint_batch_single_stroke_mode\":" + std::string(json_bool(!preview_only));
         metadata += ",\"server_compact_paint_batch_available\":" + std::string(json_bool(ctx.server_compact_paint_batch_function != 0));
-        metadata += ",\"server_compact_paint_batch_used\":" + std::string(json_bool(use_compact_server_batch));
-        metadata += ",\"server_compact_paint_batch_layout\":\"CompactPaintStroke{Triangle@0,Bary16@4,Radius@12,ColorBGRA8@16,MR8@20,Target@22,Effective@24,Guid@40}\"";
-        metadata += ",\"server_compact_paint_batch_color_encoding\":\"linear_unit_to_bgra8_direct\"";
-        metadata += ",\"server_compact_paint_batch_barycentric_encoding\":\"unit_to_uint16_high_low\"";
+        metadata += ",\"server_compact_paint_batch_used\":false";
+        metadata += ",\"server_compact_paint_batch_ignored\":true";
         const auto replication_manager = ref.find_first_instance("RuntimePaintReplicationManager");
-        const bool fast_apply_component_strokes =
-            sdk_write_number_property_by_name(ref, ctx.component, "MaxReplicatedPaintStrokesPerTick", MeshFirstFastApplyStrokesPerTick);
-        const bool fast_apply_manager_strokes =
-            live_uobject(replication_manager) &&
-            sdk_write_number_property_by_name(ref, replication_manager, "MaxReplicatedPaintStrokesPerTick", MeshFirstFastApplyStrokesPerTick);
-        const bool fast_apply_manager_writes =
-            live_uobject(replication_manager) &&
-            sdk_write_number_property_by_name(ref, replication_manager, "MaxReplicatedPaintRenderTargetWritesPerFrame", MeshFirstFastApplyRenderTargetWritesPerFrame);
-        metadata += ",\"local_paint_rpc\":\"ImportChannelFromBytes\"";
-        metadata += ",\"local_visual_sync_mode\":\"local_albedo_channel_import_after_server_batch\"";
-        metadata += ",\"local_batch_strategy\":\"single_channel_import_preview\"";
+        const bool fast_apply_component_strokes = false;
+        const bool fast_apply_manager_strokes = false;
+        const bool fast_apply_manager_writes = false;
         metadata += ",\"server_paint_target_channel\":\"all\"";
-        metadata += ",\"local_paint_target_channel\":\"albedo\"";
-        metadata += ",\"local_texture_import_byte_order\":\"rgba\"";
-        metadata += ",\"local_visual_sync_required\":false";
-        metadata += ",\"local_visual_sync_after_server_success\":false";
-        metadata += ",\"local_visual_sync_lockstep_with_server_batch\":false";
-        metadata += ",\"local_texture_import_required\":true";
-        metadata += ",\"authoritative_replay\":\"server_paint_batch_with_local_channel_import_preview\"";
-        metadata += ",\"server_texture_sync_mode\":\"request_full_texture_sync_after_server_batch\"";
+        if (preview_only)
+        {
+            metadata += ",\"local_paint_rpc\":\"ImportChannelFromBytes\"";
+            metadata += ",\"local_visual_sync_mode\":\"local_albedo_channel_import_preview\"";
+            metadata += ",\"local_batch_strategy\":\"single_channel_import_preview\"";
+            metadata += ",\"local_paint_target_channel\":\"albedo\"";
+            metadata += ",\"local_texture_import_byte_order\":\"rgba\"";
+            metadata += ",\"local_visual_sync_required\":false";
+            metadata += ",\"local_visual_sync_after_server_success\":false";
+            metadata += ",\"local_visual_sync_lockstep_with_server_batch\":false";
+            metadata += ",\"local_texture_import_required\":true";
+            metadata += ",\"authoritative_replay\":\"local_texture_preview_only\"";
+        }
+        else
+        {
+            metadata += ",\"local_paint_rpc\":\"PaintAtUVWithBrush\"";
+            metadata += ",\"local_paint_available\":" + std::string(json_bool(ctx.local_paint_at_uv_function != 0));
+            metadata += ",\"local_visual_sync_mode\":\"paint_at_uv_with_brush_lockstep\"";
+            metadata += ",\"local_batch_strategy\":\"single_stroke_lockstep\"";
+            metadata += ",\"local_paint_target_channel\":\"all\"";
+            metadata += ",\"local_visual_sync_required\":true";
+            metadata += ",\"local_visual_sync_after_server_success\":true";
+            metadata += ",\"local_visual_sync_after_each_server_stroke\":true";
+            metadata += ",\"local_visual_sync_lockstep_with_server_batch\":true";
+            metadata += ",\"local_texture_import_required\":false";
+            metadata += ",\"authoritative_replay\":\"single_stroke_server_replay_with_local_lockstep\"";
+            if (!ctx.local_paint_at_uv_function)
+            {
+                return response_json(false,
+                                     "mesh_local_visual_sync_unavailable",
+                                     0,
+                                     1,
+                                     "PaintAtUVWithBrush is unavailable; local stroke sync cannot run",
+                                     metadata + ",\"replay_blocked\":true");
+            }
+        }
+        metadata += ",\"server_texture_sync_mode\":\"disabled\"";
         metadata += ",\"post_import_texture_sync_enabled\":" + std::string(json_bool(MeshFirstPostImportTextureSyncEnabled));
         metadata += ",\"server_texture_sync_poll_ms\":" + std::to_string(MeshFirstServerTextureSyncPollMs);
         metadata += ",\"server_texture_sync_max_polls\":" + std::to_string(MeshFirstServerTextureSyncMaxPolls);
@@ -8434,6 +8841,7 @@ namespace
         metadata += ",\"fast_apply_component_strokes_written\":" + std::string(json_bool(fast_apply_component_strokes));
         metadata += ",\"fast_apply_manager_strokes_written\":" + std::string(json_bool(fast_apply_manager_strokes));
         metadata += ",\"fast_apply_manager_writes_written\":" + std::string(json_bool(fast_apply_manager_writes));
+        metadata += ",\"fast_apply_property_writes_disabled\":true";
         const auto sync_channel_function = ref.find_function(ctx.component, "MulticastSyncChannelData");
         const auto sync_compressed_channel_function = ref.find_function(ctx.component, "MulticastSyncCompressedChannelData");
         reset_texture_sync_observer(sync_channel_function, sync_compressed_channel_function);
@@ -8497,9 +8905,13 @@ namespace
                                                               paint_replication_property_candidates);
         metadata += texture_sync_observer_metadata("texture_sync_observer_before", texture_sync_observer_snapshot());
 
-        auto albedo_before_bytes = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo);
+        MeshFirstChannelBytes albedo_before_bytes{};
         MeshFirstChannelChecksum albedo_before{};
-        if (albedo_before_bytes.ok)
+        if (preview_only)
+        {
+            albedo_before_bytes = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo);
+        }
+        if (preview_only && albedo_before_bytes.ok)
         {
             albedo_before.ok = true;
             albedo_before.bytes = static_cast<int>(albedo_before_bytes.bytes.size());
@@ -8508,7 +8920,7 @@ namespace
         }
         else
         {
-            albedo_before.failure = albedo_before_bytes.failure;
+            albedo_before.failure = preview_only ? albedo_before_bytes.failure : "skipped_for_server_stroke_stream";
         }
         metadata += ",\"albedo_export_before_ok\":" + std::string(json_bool(albedo_before.ok));
         metadata += ",\"albedo_export_before_bytes\":" + std::to_string(albedo_before.bytes);
@@ -8520,6 +8932,64 @@ namespace
 
         const auto replication_before = mesh_first_capture_replication_snapshot(ref, ctx.component);
 
+        if (preview_only)
+        {
+            const auto preview_started = std::chrono::steady_clock::now();
+            write_bridge_progress("mesh_local_texture_import",
+                                  "Importing local preview texture",
+                                  0,
+                                  static_cast<int>(strokes.size()),
+                                  0.0,
+                                  "\"phase\":\"local_texture_import\",\"preview_only\":true,\"terminal\":false,\"result\":\"running\"");
+            const auto* base_bytes = albedo_before_bytes.ok ? &albedo_before_bytes.bytes : nullptr;
+            const auto result = mesh_first_apply_local_albedo_import_preview(ref,
+                                                                             ctx.component,
+                                                                             strokes,
+                                                                             active_texture_size,
+                                                                             base_bytes);
+            if (result.ok && albedo_before_bytes.ok)
+            {
+                mesh_first_store_preview_snapshot(ctx.component,
+                                                  active_texture_size,
+                                                  albedo_before_bytes.bytes);
+            }
+            const double preview_elapsed_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - preview_started).count();
+            metadata += ",\"server_batch_calls\":0";
+            metadata += ",\"server_strokes_sent\":0";
+            metadata += ",\"local_texture_import_started\":true";
+            metadata += ",\"local_texture_import_ok\":" + std::string(json_bool(result.ok));
+            metadata += ",\"local_texture_import_export_ok\":" + std::string(json_bool(result.export_ok));
+            metadata += ",\"local_texture_import_import_ok\":" + std::string(json_bool(result.import_ok));
+            metadata += ",\"local_texture_import_texture_size\":" + std::to_string(result.texture_size);
+            metadata += ",\"local_texture_import_source_bytes\":" + std::to_string(result.source_bytes);
+            metadata += ",\"local_texture_import_strokes_considered\":" + std::to_string(result.strokes_considered);
+            metadata += ",\"local_texture_import_strokes_painted\":" + std::to_string(result.strokes_painted);
+            metadata += ",\"local_texture_import_pixels_touched\":" + std::to_string(result.pixels_touched);
+            metadata += ",\"local_texture_import_pixels_changed\":" + std::to_string(result.pixels_changed);
+            metadata += ",\"local_texture_import_before_hash\":\"" + std::to_string(result.before_hash) + "\"";
+            metadata += ",\"local_texture_import_preview_hash\":\"" + std::to_string(result.preview_hash) + "\"";
+            metadata += ",\"local_texture_import_elapsed_ms\":" + std::to_string(result.elapsed_ms);
+            metadata += ",\"local_texture_import_failure\":\"" + json_escape(result.failure) + "\"";
+            metadata += ",\"unpreview_snapshot_stored\":" + std::string(json_bool(result.ok && albedo_before_bytes.ok));
+            metadata += ",\"total_replay_elapsed_ms\":" + std::to_string(preview_elapsed_ms);
+            metadata += ",\"paint_elapsed_ms\":" + std::to_string(preview_elapsed_ms);
+            metadata += mesh_first_replication_snapshot_metadata("mesh_rep_before", replication_before);
+            write_bridge_progress(result.ok ? "mesh_preview_done" : "mesh_preview_failed",
+                                  result.ok ? "local preview texture imported" : "local preview texture import failed",
+                                  result.ok ? static_cast<int>(strokes.size()) : result.strokes_painted,
+                                  static_cast<int>(strokes.size()),
+                                  preview_elapsed_ms,
+                                  "\"phase\":\"local_texture_import\",\"preview_only\":true,\"terminal\":true,\"result\":\"" +
+                                      std::string(result.ok ? "done" : "failed") + "\"");
+            return response_json(result.ok,
+                                 result.ok ? "mesh_preview_done" : "mesh_preview_failed",
+                                 result.ok ? static_cast<int>(strokes.size()) : result.strokes_painted,
+                                 result.ok ? 0 : 1,
+                                 result.ok ? "local preview texture imported" : "local preview texture import failed: " + result.failure,
+                                 metadata);
+        }
+
         if (queued_job)
         {
             auto async_job = std::make_shared<MeshFirstServerBatchAsyncJob>();
@@ -8528,19 +8998,19 @@ namespace
             async_job->relay_component = ctx.relay_component;
             async_job->server_paint_batch_function = ctx.server_paint_batch_function;
             async_job->server_compact_paint_batch_function = ctx.server_compact_paint_batch_function;
+            async_job->local_paint_at_uv_function = ctx.local_paint_at_uv_function;
             async_job->server_compact_paint_batch_available = ctx.server_compact_paint_batch_function != 0;
-            async_job->server_compact_paint_batch_enabled = ctx.server_compact_paint_batch_function != 0;
-            async_job->server_batch_rpc = async_job->server_compact_paint_batch_enabled ? "ServerCompactPaintBatch" : "ServerPaintBatch";
-            async_job->local_visual_sync_enabled = false;
+            async_job->server_compact_paint_batch_enabled = false;
+            async_job->server_batch_rpc = "ServerPaintBatch";
+            async_job->local_visual_sync_enabled = true;
             async_job->strokes = std::move(strokes);
-            async_job->metadata = metadata + ",\"server_batch_schedule\":\"timer_drained\"";
+            async_job->metadata = metadata + ",\"server_batch_schedule\":\"single_stroke_timer_drained\"";
             async_job->albedo_before = albedo_before;
-            async_job->albedo_before_bytes = std::move(albedo_before_bytes.bytes);
             async_job->replication_before = replication_before;
-            async_job->server_batch_limit = std::max(1, tuning_server_batch_limit);
+            async_job->server_batch_limit = ServerPaintBatchStrokeLimit;
             async_job->server_batch_delay_ms = effective_server_batch_delay_ms;
-            async_job->local_visual_sync_batch_limit = std::max(1, tuning_server_batch_limit);
-            async_job->local_visual_sync_delay_ms = 0;
+            async_job->local_visual_sync_batch_limit = ServerPaintBatchStrokeLimit;
+            async_job->local_visual_sync_delay_ms = effective_server_batch_delay_ms;
             async_job->server_texture_sync_poll_ms = MeshFirstServerTextureSyncPollMs;
             async_job->server_texture_sync_max_polls = MeshFirstServerTextureSyncMaxPolls;
             async_job->texture_size = active_texture_size;
@@ -8554,7 +9024,7 @@ namespace
                 g_mesh_first_batch_job = async_job;
             }
             write_bridge_progress("mesh_server_batch_begin",
-                                  "mesh-first ServerPaintBatch stream prepared",
+                                  "mesh-first single-stroke ServerPaintBatch stream prepared",
                                   0,
                                   static_cast<int>(async_job->strokes.size()),
                                   0.0,
@@ -8926,8 +9396,18 @@ namespace
                 job->local_texture_import_started &&
                 job->local_texture_import_ok &&
                 job->local_texture_import_failure.empty();
-            const bool visual_sync_ok = local_texture_import_ok || server_texture_sync_ok;
+            const bool server_only_replay_ok =
+                !job->local_visual_sync_enabled &&
+                !job->local_texture_import_started &&
+                !job->server_texture_sync_started &&
+                job->server_batch_failures == 0 &&
+                job->server_strokes_sent == static_cast<int>(job->strokes.size());
+            const bool visual_sync_ok =
+                server_only_replay_ok ||
+                (job->local_visual_sync_enabled ? local_visual_sync_ok : (local_texture_import_ok || server_texture_sync_ok));
+            const bool paint_ok = local_visual_sync_ok && visual_sync_ok;
             std::string metadata = job->metadata;
+            metadata += ",\"server_only_replay_ok\":" + std::string(json_bool(server_only_replay_ok));
             metadata += ",\"server_batch_calls\":" + std::to_string(job->server_batch_calls);
             metadata += ",\"server_batch_success\":" + std::to_string(job->server_batch_success);
             metadata += ",\"server_batch_failures\":" + std::to_string(job->server_batch_failures);
@@ -9004,7 +9484,7 @@ namespace
             metadata += ",\"first_failure\":\"" + json_escape(job->first_failure) + "\"";
             Reflection ref{};
             std::string init_failure{};
-            if (ref.init(init_failure))
+            if (job->albedo_before.ok && ref.init(init_failure))
             {
                 const auto albedo_after = mesh_first_export_channel_checksum(ref, job->component, sdk::EPaintChannel::Albedo);
                 metadata += ",\"albedo_export_after_ok\":" + std::string(json_bool(albedo_after.ok));
@@ -9022,7 +9502,8 @@ namespace
             else
             {
                 metadata += ",\"albedo_export_after_ok\":false";
-                metadata += ",\"albedo_export_after_failure\":\"reflection_unavailable:" + json_escape(init_failure) + "\"";
+                metadata += ",\"albedo_export_after_failure\":\"" +
+                            json_escape(job->albedo_before.ok ? "reflection_unavailable:" + init_failure : "skipped_no_before_export") + "\"";
                 metadata += ",\"albedo_export_changed\":false";
             }
             metadata += mesh_first_replication_snapshot_metadata("mesh_rep_before", job->replication_before);
@@ -9037,13 +9518,13 @@ namespace
                                     ",\"side_strokes\":" + std::to_string(job->replay_side) +
                                     ",\"back_strokes\":" + std::to_string(job->replay_back));
             complete_mesh_first_batch_job(job,
-                                          response_json(local_visual_sync_ok && visual_sync_ok,
-                                                        local_visual_sync_ok && visual_sync_ok ? "mesh_first_paint_done" : "mesh_local_texture_import_failed",
+                                          response_json(paint_ok,
+                                                        paint_ok ? "mesh_first_paint_done" : "mesh_local_visual_sync_failed",
                                                         job->server_strokes_sent,
-                                                        local_visual_sync_ok && visual_sync_ok ? 0 : 1,
-                                                        local_visual_sync_ok && visual_sync_ok
-                                                            ? "mesh-first paint sent through " + job->server_batch_rpc + " with local channel import preview"
-                                                            : job->server_batch_rpc + " succeeded but local texture import did not update local texture",
+                                                        paint_ok ? 0 : 1,
+                                                        paint_ok
+                                                            ? "mesh-first paint sent through " + job->server_batch_rpc + " one stroke at a time"
+                                                            : job->server_batch_rpc + " succeeded but local visual sync did not complete",
                                                         metadata));
         };
 
@@ -9113,7 +9594,7 @@ namespace
             {
                 job->server_batch_elapsed_ms = elapsed_ms();
             }
-            begin_local_texture_import();
+            finish_done();
             return;
         }
 
@@ -9343,8 +9824,46 @@ namespace
         job->offset += count;
         job->server_batch_elapsed_ms = elapsed_ms();
 
+        if (job->local_visual_sync_enabled)
+        {
+            if (!job->local_paint_at_uv_function)
+            {
+                job->local_visual_sync_failure = "PaintAtUVWithBrush_unavailable";
+                finish_failed("mesh_local_visual_sync_failed",
+                              "PaintAtUVWithBrush is unavailable",
+                              job->local_visual_sync_failure);
+                return;
+            }
+            if (!job->local_sync_started)
+            {
+                job->local_sync_started = true;
+                job->local_sync_started_at = std::chrono::steady_clock::now();
+            }
+            for (std::size_t index = 0; index < count; ++index)
+            {
+                std::string local_failure{};
+                ++job->local_stroke_calls;
+                if (!sdk_call_paint_at_uv_with_brush(job->component,
+                                                     job->local_paint_at_uv_function,
+                                                     job->strokes[chunk_offset + index],
+                                                     local_failure))
+                {
+                    ++job->local_stroke_failures;
+                    job->local_visual_sync_failure = local_failure.empty() ? "PaintAtUVWithBrush_failed" : local_failure;
+                    finish_failed("mesh_local_visual_sync_failed",
+                                  job->server_batch_rpc + " succeeded but local visual sync failed: " + job->local_visual_sync_failure,
+                                  job->local_visual_sync_failure);
+                    return;
+                }
+                ++job->local_stroke_success;
+                ++job->local_offset;
+            }
+            ++job->local_batch_calls;
+            job->local_visual_sync_elapsed_ms = mesh_first_local_elapsed_ms(job);
+        }
+
         write_mesh_progress("mesh_server_batch",
-                            "mesh-first " + job->server_batch_rpc + " fast apply queue",
+                            "mesh-first " + job->server_batch_rpc + " single-stroke stream",
                             job->server_strokes_sent,
                             static_cast<int>(job->strokes.size()),
                             MeshFirstBatchPhase::ServerBatch,
@@ -9357,7 +9876,12 @@ namespace
             post_next_after(job->server_batch_delay_ms);
             return;
         }
-        begin_local_texture_import();
+        if (job->local_visual_sync_enabled)
+        {
+            finish_done();
+            return;
+        }
+        finish_done();
     }
 
     auto sdk_find_front_mesh(Reflection& ref, const SdkContext& ctx) -> std::uintptr_t

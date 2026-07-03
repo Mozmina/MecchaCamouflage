@@ -98,6 +98,8 @@ namespace
         double status_interval_seconds{2.0};
         double frame_delay_ms{16.0};
         std::string native_apply_mode{"mesh_first_paint"};
+        bool preview_only{false};
+        bool unpreview_only{false};
         DWORD parent_pid{0};
         PaintTuning tuning{};
     };
@@ -910,6 +912,8 @@ namespace
         None,
         Start,
         Stop,
+        Preview,
+        UnPreview,
     };
 
     auto service_state_text(ControllerServiceState state) -> const char*
@@ -960,6 +964,8 @@ namespace
         bool not_ready_hotkey_logged{false};
         bool duplicate_paint_hotkey_logged{false};
         bool paint_after_ready_requested{false};
+        bool paint_after_ready_preview{false};
+        bool paint_after_ready_unpreview{false};
         double last_bridge_check{0.0};
         double paint_settle_until{0.0};
     };
@@ -1399,6 +1405,10 @@ namespace
         append_metric_double(out, "step_tx", extract_json_number(raw, "coverage_step_texels", -1.0), 1);
         append_metric_double(out, "metallic", extract_json_number(raw, "metallic", -1.0), 6);
         append_metric_double(out, "roughness", extract_json_number(raw, "roughness", -1.0), 6);
+        const auto material_source = extract_json_string(raw, "material_properties_source");
+        if (!material_source.empty())
+            out << ", material=" << material_source;
+        append_metric(out, "mat_samples", metric_count(raw, "material_properties_auto_samples"));
         return out.str();
     }
 
@@ -1411,6 +1421,14 @@ namespace
                ",\"elapsed_ms\":" + std::to_string(elapsed_ms) +
                ",\"stroke_size_texels\":" + std::to_string(extract_json_number(raw, "stroke_size_texels", -1.0)) +
                ",\"coverage_step_texels\":" + std::to_string(extract_json_number(raw, "coverage_step_texels", -1.0)) +
+               ",\"auto_material_properties\":" + json_bool_text(extract_json_bool(raw, "auto_material_properties", false)) +
+               ",\"material_properties_source\":" + json_string(extract_json_string(raw, "material_properties_source")) +
+               ",\"material_properties_auto_ok\":" + json_bool_text(extract_json_bool(raw, "material_properties_auto_ok", false)) +
+               ",\"material_properties_failure\":" + json_string(extract_json_string(raw, "material_properties_failure")) +
+               ",\"material_properties_auto_samples\":" + std::to_string(metric_count(raw, "material_properties_auto_samples")) +
+               ",\"material_properties_source_sample_fallbacks\":" + std::to_string(metric_count(raw, "material_properties_source_sample_fallbacks")) +
+               ",\"material_properties_metallic\":" + std::to_string(extract_json_number(raw, "material_properties_metallic", -1.0)) +
+               ",\"material_properties_roughness\":" + std::to_string(extract_json_number(raw, "material_properties_roughness", -1.0)) +
                ",\"metallic\":" + std::to_string(extract_json_number(raw, "metallic", -1.0)) +
                ",\"roughness\":" + std::to_string(extract_json_number(raw, "roughness", -1.0)) +
                ",\"server_batch_limit\":" + std::to_string(metric_count(raw, "server_batch_limit")) +
@@ -1533,6 +1551,8 @@ namespace
         const bool research_artifacts = std::getenv("MECCHA_RESEARCH_ARTIFACTS") != nullptr;
         auto payload = std::string("{\"native_apply_mode\":") + json_string(config.native_apply_mode) +
                        ",\"route\":" + json_string(mode_to_route(config.native_apply_mode)) +
+                       ",\"preview_only\":" + (config.preview_only ? "true" : "false") +
+                       ",\"unpreview_only\":" + (config.unpreview_only ? "true" : "false") +
                        ",\"research_artifacts\":" + (research_artifacts ? "true" : "false") +
                        ",\"process\":{\"pid\":" + std::to_string(process.pid) +
                        ",\"name\":" + json_string(wide_to_utf8(process.name)) + "}" +
@@ -1542,6 +1562,7 @@ namespace
                        ",\"front_back_source_max_uv\":" + std::to_string(config.tuning.front_back_source_max_uv) +
                        ",\"server_batch_limit\":" + std::to_string(config.tuning.server_batch_limit) +
                        ",\"server_batch_delay_ms\":" + std::to_string(config.tuning.server_batch_delay_ms) +
+                       ",\"auto_material_properties\":" + (config.tuning.auto_material_properties ? "true" : "false") +
                        ",\"metallic\":" + std::to_string(config.tuning.metallic) +
                        ",\"roughness\":" + std::to_string(config.tuning.roughness) + "}";
         payload += "}";
@@ -1655,11 +1676,13 @@ namespace
             return false;
         }
         diagnostics.event("plan_generated", "info", "plan", "native paint payload generated",
-                          std::string("{\"native_apply_mode\":") + json_string(config.native_apply_mode) + "}", run_id);
+                          std::string("{\"native_apply_mode\":") + json_string(config.native_apply_mode) +
+                              ",\"preview_only\":" + (config.preview_only ? "true" : "false") + "}", run_id);
         diagnostics.set_last_run(std::string("{\"run_id\":") + json_string(run_id) +
                                  ",\"stage\":\"paint_started\",\"success\":false,\"process\":" + process_json(process, config.game_process_name) + "}");
         diagnostics.event("paint_started", "info", "paint", "paint_full_route started",
-                          std::string("{\"adapter\":\"bridge\",\"native_apply_mode\":") + json_string(config.native_apply_mode) + "}", run_id);
+                          std::string("{\"adapter\":\"bridge\",\"native_apply_mode\":") + json_string(config.native_apply_mode) +
+                              ",\"preview_only\":" + (config.preview_only ? "true" : "false") + "}", run_id);
         const std::string payload = paint_payload(config, process);
         const auto progress_path = bridge_progress_file(bridge_path);
         {
@@ -1886,12 +1909,18 @@ namespace
         OverlayServiceState service{};
         OverlayHotkeyState hotkey_state{};
         OverlayHotkeys hotkeys{meccha::parse_hotkey_binding(settings.start_hotkey, VK_F10),
-                               meccha::parse_hotkey_binding(settings.stop_hotkey, VK_F9)};
+                               meccha::parse_hotkey_binding(settings.stop_hotkey, VK_F9),
+                               meccha::parse_hotkey_binding(settings.preview_hotkey, VK_F8),
+                               meccha::parse_hotkey_binding(settings.unpreview_hotkey, VK_F7)};
         diagnostics.set_hotkey(std::string("{\"start\":") + json_string(meccha::hotkey_to_string(hotkeys.start_binding())) +
                                ",\"stop\":" + json_string(meccha::hotkey_to_string(hotkeys.stop_binding())) +
+                               ",\"preview\":" + json_string(meccha::hotkey_to_string(hotkeys.preview_binding())) +
+                               ",\"unpreview\":" + json_string(meccha::hotkey_to_string(hotkeys.unpreview_binding())) +
                                ",\"backend\":" + hotkeys.backend_json() + "}");
         trace_buffer.push("hotkey", "register", std::string("{\"start\":") + json_string(meccha::hotkey_to_string(hotkeys.start_binding())) +
                                                ",\"stop\":" + json_string(meccha::hotkey_to_string(hotkeys.stop_binding())) +
+                                               ",\"preview\":" + json_string(meccha::hotkey_to_string(hotkeys.preview_binding())) +
+                                               ",\"unpreview\":" + json_string(meccha::hotkey_to_string(hotkeys.unpreview_binding())) +
                                                ",\"backend\":" + hotkeys.backend_json() + "}");
         diagnostics.event("runtime_start", "info", "startup", "desktop app started",
                           std::string("{\"pid\":") + std::to_string(GetCurrentProcessId()) +
@@ -1906,7 +1935,7 @@ namespace
 
         bool done = false;
 
-        auto start_paint = [&](const char* trigger) {
+        auto start_paint = [&](const char* trigger, bool preview_only = false, bool unpreview_only = false) {
             if (service.paint_future_active || !service.process.pid || !service.bridge_ready)
                 return;
             if (paint_editing)
@@ -1929,17 +1958,24 @@ namespace
             }
             meccha::clamp_settings(persisted_settings);
             config.tuning = persisted_settings.tuning;
+            config.preview_only = preview_only;
+            config.unpreview_only = unpreview_only;
             diagnostics.event("paint_triggered", "info", "paint", std::string("paint trigger detected: ") + trigger);
             trace_buffer.push("paint.start",
                               "",
                               std::string("{\"trigger\":") + json_string(trigger) +
                               ",\"start_hotkey\":" + json_string(meccha::hotkey_to_string(hotkeys.start_binding())) +
+                              ",\"preview_hotkey\":" + json_string(meccha::hotkey_to_string(hotkeys.preview_binding())) +
+                              ",\"unpreview_hotkey\":" + json_string(meccha::hotkey_to_string(hotkeys.unpreview_binding())) +
+                              ",\"preview_only\":" + (preview_only ? "true" : "false") +
+                              ",\"unpreview_only\":" + (unpreview_only ? "true" : "false") +
                               ",\"stroke_size_texels\":" + std::to_string(persisted_settings.tuning.stroke_size_texels) +
                               ",\"coverage_step_texels\":" + std::to_string(persisted_settings.tuning.coverage_step_texels) +
                               ",\"side_source_max_uv\":" + std::to_string(persisted_settings.tuning.side_source_max_uv) +
                               ",\"front_back_source_max_uv\":" + std::to_string(persisted_settings.tuning.front_back_source_max_uv) +
                               ",\"server_batch_limit\":" + std::to_string(persisted_settings.tuning.server_batch_limit) +
                               ",\"server_batch_delay_ms\":" + std::to_string(persisted_settings.tuning.server_batch_delay_ms) +
+                              ",\"auto_material_properties\":" + (persisted_settings.tuning.auto_material_properties ? "true" : "false") +
                               ",\"metallic\":" + std::to_string(persisted_settings.tuning.metallic) +
                               ",\"roughness\":" + std::to_string(persisted_settings.tuning.roughness) + "}");
             service.paint_running = true;
@@ -1971,6 +2007,8 @@ namespace
             dst.opacity = src.opacity;
             dst.start_hotkey = src.start_hotkey;
             dst.stop_hotkey = src.stop_hotkey;
+            dst.preview_hotkey = src.preview_hotkey;
+            dst.unpreview_hotkey = src.unpreview_hotkey;
             dst.show_info = src.show_info;
             dst.show_warning = src.show_warning;
             dst.show_error = src.show_error;
@@ -1981,6 +2019,8 @@ namespace
             dst.opacity = src.opacity;
             dst.start_hotkey = src.start_hotkey;
             dst.stop_hotkey = src.stop_hotkey;
+            dst.preview_hotkey = src.preview_hotkey;
+            dst.unpreview_hotkey = src.unpreview_hotkey;
         };
 
         auto capture_window_layout = [&]() {
@@ -1994,13 +2034,15 @@ namespace
             }
         };
 
-        auto request_service_start = [&](const char* source, bool paint_after_ready = false) {
+        auto request_service_start = [&](const char* source, bool paint_after_ready = false, bool preview_after_ready = false, bool unpreview_after_ready = false) {
             if (service.state == ControllerServiceState::Running || service.state == ControllerServiceState::Starting)
                 return;
             service.state = ControllerServiceState::Starting;
             service.bridge_ready = false;
             service.bridge_state = service.injected_pid == service.process.pid && service.process.pid != 0 ? "Checking" : "Recovering";
             service.paint_after_ready_requested = paint_after_ready;
+            service.paint_after_ready_preview = preview_after_ready;
+            service.paint_after_ready_unpreview = unpreview_after_ready;
             service.waiting_for_hotkey_logged = false;
             service.waiting_for_process_logged = false;
             service.not_ready_hotkey_logged = false;
@@ -2024,6 +2066,8 @@ namespace
             service.waiting_for_hotkey_logged = false;
             service.not_ready_hotkey_logged = false;
             service.paint_after_ready_requested = false;
+            service.paint_after_ready_preview = false;
+            service.paint_after_ready_unpreview = false;
             diagnostics.event("service_stop_requested", "info", "service", "Stopping service.");
             if (!service.stop_future_active)
             {
@@ -2102,11 +2146,23 @@ namespace
                     {
                         if (recording_hotkey == HotkeyRecordTarget::Stop)
                             settings.stop_hotkey = meccha::hotkey_to_string(captured);
+                        else if (recording_hotkey == HotkeyRecordTarget::Preview)
+                            settings.preview_hotkey = meccha::hotkey_to_string(captured);
+                        else if (recording_hotkey == HotkeyRecordTarget::UnPreview)
+                            settings.unpreview_hotkey = meccha::hotkey_to_string(captured);
                         else
                             settings.start_hotkey = meccha::hotkey_to_string(captured);
                         hotkey_error.clear();
-                        const std::string recorded = recording_hotkey == HotkeyRecordTarget::Stop ? settings.stop_hotkey : settings.start_hotkey;
-                        const std::string label = recording_hotkey == HotkeyRecordTarget::Stop ? "Stop Hotkey" : "Start Hotkey";
+                        const std::string recorded = recording_hotkey == HotkeyRecordTarget::Stop
+                                                         ? settings.stop_hotkey
+                                                         : (recording_hotkey == HotkeyRecordTarget::Preview
+                                                                ? settings.preview_hotkey
+                                                                : (recording_hotkey == HotkeyRecordTarget::UnPreview ? settings.unpreview_hotkey : settings.start_hotkey));
+                        const std::string label = recording_hotkey == HotkeyRecordTarget::Stop
+                                                      ? "Stop Hotkey"
+                                                      : (recording_hotkey == HotkeyRecordTarget::Preview
+                                                             ? "Preview Hotkey"
+                                                             : (recording_hotkey == HotkeyRecordTarget::UnPreview ? "UnPreview Hotkey" : "Start Hotkey"));
                         recording_hotkey = HotkeyRecordTarget::None;
                         diagnostics.event("hotkey_recorded", "info", "settings", label + " draft recorded: " + recorded);
                         continue;
@@ -2230,7 +2286,11 @@ namespace
                         }
                         if (service.paint_after_ready_requested)
                         {
+                            const bool preview_after_ready = service.paint_after_ready_preview;
+                            const bool unpreview_after_ready = service.paint_after_ready_unpreview;
                             service.paint_after_ready_requested = false;
+                            service.paint_after_ready_preview = false;
+                            service.paint_after_ready_unpreview = false;
                             if (paint_editing)
                             {
                                 diagnostics.event("paint_start_rejected",
@@ -2240,7 +2300,9 @@ namespace
                             }
                             else if (!service.paint_future_active && !service.paint_running && service.process.pid && service.bridge_ready)
                             {
-                                start_paint("UI Hotkey");
+                                start_paint(unpreview_after_ready ? "UnPreview Hotkey" : (preview_after_ready ? "Preview Hotkey" : "UI Hotkey"),
+                                            preview_after_ready,
+                                            unpreview_after_ready);
                             }
                         }
                     }
@@ -2328,6 +2390,8 @@ namespace
                     service.last_bridge_check = 0.0;
                     service.waiting_for_hotkey_logged = false;
                     service.paint_after_ready_requested = true;
+                    service.paint_after_ready_preview = false;
+                    service.paint_after_ready_unpreview = false;
                     if (!service.bridge_check_future_active)
                         start_bridge_check(service.process, now);
                     if (!service.not_ready_hotkey_logged)
@@ -2348,6 +2412,104 @@ namespace
                     }
                 }
                 hotkey_state.start_requested = false;
+            }
+
+            if (hotkey_state.preview_requested)
+            {
+                if (paint_editing)
+                    diagnostics.event("paint_hotkey_ignored", "warning", "settings", "Paint settings are being edited; preview hotkey ignored.");
+                else if (service.state == ControllerServiceState::Stopped || service.state == ControllerServiceState::Error)
+                    request_service_start("hotkey", true, true, false);
+                else if (service.state == ControllerServiceState::Stopping)
+                    diagnostics.event("paint_hotkey_ignored", "warning", "service", "Service is stopping; preview hotkey ignored.");
+                else if (service.paint_running || service.paint_future_active)
+                {
+                    if (!service.duplicate_paint_hotkey_logged)
+                    {
+                        diagnostics.event("paint_hotkey_ignored", "warning", "paint", "Paint is already running; preview hotkey ignored.");
+                        service.duplicate_paint_hotkey_logged = true;
+                    }
+                }
+                else if (service.process.pid && service.bridge_ready)
+                    start_paint("Preview Hotkey", true);
+                else if (service.process.pid)
+                {
+                    service.bridge_ready = false;
+                    service.bridge_state = "Recovering";
+                    service.last_bridge_check = 0.0;
+                    service.waiting_for_hotkey_logged = false;
+                    service.paint_after_ready_requested = true;
+                    service.paint_after_ready_preview = true;
+                    service.paint_after_ready_unpreview = false;
+                    if (!service.bridge_check_future_active)
+                        start_bridge_check(service.process, now);
+                    if (!service.not_ready_hotkey_logged)
+                    {
+                        diagnostics.event("paint_hotkey_rejected",
+                                          "warning",
+                                          "not_ready",
+                                          "Bridge not ready; preview will start when ready.");
+                        service.not_ready_hotkey_logged = true;
+                    }
+                }
+                else
+                {
+                    if (!service.not_ready_hotkey_logged)
+                    {
+                        diagnostics.event("paint_hotkey_rejected", "error", "not_ready", "Not ready. Wait for process and hook.");
+                        service.not_ready_hotkey_logged = true;
+                    }
+                }
+                hotkey_state.preview_requested = false;
+            }
+
+            if (hotkey_state.unpreview_requested)
+            {
+                if (paint_editing)
+                    diagnostics.event("paint_hotkey_ignored", "warning", "settings", "Paint settings are being edited; unpreview hotkey ignored.");
+                else if (service.state == ControllerServiceState::Stopped || service.state == ControllerServiceState::Error)
+                    request_service_start("hotkey", true, false, true);
+                else if (service.state == ControllerServiceState::Stopping)
+                    diagnostics.event("paint_hotkey_ignored", "warning", "service", "Service is stopping; unpreview hotkey ignored.");
+                else if (service.paint_running || service.paint_future_active)
+                {
+                    if (!service.duplicate_paint_hotkey_logged)
+                    {
+                        diagnostics.event("paint_hotkey_ignored", "warning", "paint", "Paint is already running; unpreview hotkey ignored.");
+                        service.duplicate_paint_hotkey_logged = true;
+                    }
+                }
+                else if (service.process.pid && service.bridge_ready)
+                    start_paint("UnPreview Hotkey", false, true);
+                else if (service.process.pid)
+                {
+                    service.bridge_ready = false;
+                    service.bridge_state = "Recovering";
+                    service.last_bridge_check = 0.0;
+                    service.waiting_for_hotkey_logged = false;
+                    service.paint_after_ready_requested = true;
+                    service.paint_after_ready_preview = false;
+                    service.paint_after_ready_unpreview = true;
+                    if (!service.bridge_check_future_active)
+                        start_bridge_check(service.process, now);
+                    if (!service.not_ready_hotkey_logged)
+                    {
+                        diagnostics.event("paint_hotkey_rejected",
+                                          "warning",
+                                          "not_ready",
+                                          "Bridge not ready; unpreview will start when ready.");
+                        service.not_ready_hotkey_logged = true;
+                    }
+                }
+                else
+                {
+                    if (!service.not_ready_hotkey_logged)
+                    {
+                        diagnostics.event("paint_hotkey_rejected", "error", "not_ready", "Not ready. Wait for process and hook.");
+                        service.not_ready_hotkey_logged = true;
+                    }
+                }
+                hotkey_state.unpreview_requested = false;
             }
 
             ImGui_ImplDX11_NewFrame();
@@ -2415,7 +2577,11 @@ namespace
             {
                 ui_runtime.status_title = "Recovering bridge.";
                 ui_runtime.status_detail = service.paint_after_ready_requested
-                                               ? "Paint will start when bridge is ready."
+                                               ? (service.paint_after_ready_unpreview
+                                                      ? "UnPreview will start when bridge is ready."
+                                                      : (service.paint_after_ready_preview
+                                                             ? "Preview will start when bridge is ready."
+                                                             : "Paint will start when bridge is ready."))
                                                : "Press " + meccha::hotkey_to_string(hotkeys.start_binding()) + " again when ready.";
             }
             else if (paint_busy)
@@ -2439,12 +2605,16 @@ namespace
             {
                 ui_runtime.status_title = "Paint ready.";
                 ui_runtime.status_detail = "Start: " + meccha::hotkey_to_string(hotkeys.start_binding()) +
+                                           " / Preview: " + meccha::hotkey_to_string(hotkeys.preview_binding()) +
+                                           " / UnPreview: " + meccha::hotkey_to_string(hotkeys.unpreview_binding()) +
                                            " / Stop: " + meccha::hotkey_to_string(hotkeys.stop_binding());
             }
             ui_runtime.app_editing = app_editing;
             ui_runtime.paint_editing = paint_editing;
             ui_runtime.recording_start_hotkey = recording_hotkey == HotkeyRecordTarget::Start;
             ui_runtime.recording_stop_hotkey = recording_hotkey == HotkeyRecordTarget::Stop;
+            ui_runtime.recording_preview_hotkey = recording_hotkey == HotkeyRecordTarget::Preview;
+            ui_runtime.recording_unpreview_hotkey = recording_hotkey == HotkeyRecordTarget::UnPreview;
             ui_runtime.hotkey_error = hotkey_error;
             ui_runtime.log_dir = wide_to_utf8(diagnostics.log_dir().wstring());
 
@@ -2490,6 +2660,8 @@ namespace
                     service.bridge_state = "Recovering";
                     service.last_bridge_check = 0.0;
                     service.paint_after_ready_requested = true;
+                    service.paint_after_ready_preview = false;
+                    service.paint_after_ready_unpreview = false;
                     if (!service.bridge_check_future_active)
                         start_bridge_check(service.process, now);
                     diagnostics.event("paint_start_waiting", "warning", "not_ready", "Bridge not ready; paint will start when ready.");
@@ -2565,6 +2737,8 @@ namespace
                 settings.opacity = defaults.opacity;
                 settings.start_hotkey = defaults.start_hotkey;
                 settings.stop_hotkey = defaults.stop_hotkey;
+                settings.preview_hotkey = defaults.preview_hotkey;
+                settings.unpreview_hotkey = defaults.unpreview_hotkey;
                 diagnostics.event("app_settings_reset", "info", "settings", "App Settings reset to defaults.");
             }
             if (actions.reset_paint_clicked && paint_editing)
@@ -2585,6 +2759,18 @@ namespace
                 hotkey_error.clear();
                 diagnostics.event("hotkey_record_started", "info", "settings", "Recording Stop Hotkey.");
             }
+            if (actions.preview_hotkey_recording && app_editing)
+            {
+                recording_hotkey = HotkeyRecordTarget::Preview;
+                hotkey_error.clear();
+                diagnostics.event("hotkey_record_started", "info", "settings", "Recording Preview Hotkey.");
+            }
+            if (actions.unpreview_hotkey_recording && app_editing)
+            {
+                recording_hotkey = HotkeyRecordTarget::UnPreview;
+                hotkey_error.clear();
+                diagnostics.event("hotkey_record_started", "info", "settings", "Recording UnPreview Hotkey.");
+            }
             if (actions.settings_changed)
             {
                 meccha::clamp_settings(settings);
@@ -2599,9 +2785,13 @@ namespace
 
                 const HotkeyBinding previous_start_hotkey = hotkeys.start_binding();
                 const HotkeyBinding previous_stop_hotkey = hotkeys.stop_binding();
+                const HotkeyBinding previous_preview_hotkey = hotkeys.preview_binding();
+                const HotkeyBinding previous_unpreview_hotkey = hotkeys.unpreview_binding();
                 std::string register_error;
                 const bool hotkey_registered = hotkeys.set_hotkeys(meccha::parse_hotkey_binding(next.start_hotkey, VK_F10),
                                                                    meccha::parse_hotkey_binding(next.stop_hotkey, VK_F9),
+                                                                   meccha::parse_hotkey_binding(next.preview_hotkey, VK_F8),
+                                                                   meccha::parse_hotkey_binding(next.unpreview_hotkey, VK_F7),
                                                                    &register_error);
                 if (!hotkey_registered)
                 {
@@ -2610,6 +2800,8 @@ namespace
                                                        json_string(register_error.empty() ? "RegisterHotKey failed." : register_error) + "}");
                     settings.start_hotkey = persisted_settings.start_hotkey;
                     settings.stop_hotkey = persisted_settings.stop_hotkey;
+                    settings.preview_hotkey = persisted_settings.preview_hotkey;
+                    settings.unpreview_hotkey = persisted_settings.unpreview_hotkey;
                 }
                 else if (meccha::save_settings(next))
                 {
@@ -2634,9 +2826,13 @@ namespace
                         trace_buffer.push("window", "topmost", std::string("{\"always_on_top\":") + (persisted_settings.always_on_top ? "true" : "false") + "}");
                     diagnostics.set_hotkey(std::string("{\"start\":") + json_string(persisted_settings.start_hotkey) +
                                            ",\"stop\":" + json_string(persisted_settings.stop_hotkey) +
+                                           ",\"preview\":" + json_string(persisted_settings.preview_hotkey) +
+                                           ",\"unpreview\":" + json_string(persisted_settings.unpreview_hotkey) +
                                            ",\"backend\":" + hotkeys.backend_json() + "}");
                     trace_buffer.push("hotkey", "register", std::string("{\"start\":") + json_string(persisted_settings.start_hotkey) +
                                                        ",\"stop\":" + json_string(persisted_settings.stop_hotkey) +
+                                                       ",\"preview\":" + json_string(persisted_settings.preview_hotkey) +
+                                                       ",\"unpreview\":" + json_string(persisted_settings.unpreview_hotkey) +
                                                        ",\"backend\":" + hotkeys.backend_json() + "}");
                     trace_buffer.push("config", "save", std::string("{\"path\":") + json_string(wide_to_utf8(meccha::config_path().wstring())) +
                                                      ",\"scope\":\"app\"}");
@@ -2645,9 +2841,11 @@ namespace
                 else
                 {
                     std::string revert_error;
-                    hotkeys.set_hotkeys(previous_start_hotkey, previous_stop_hotkey, &revert_error);
+                    hotkeys.set_hotkeys(previous_start_hotkey, previous_stop_hotkey, previous_preview_hotkey, previous_unpreview_hotkey, &revert_error);
                     settings.start_hotkey = persisted_settings.start_hotkey;
                     settings.stop_hotkey = persisted_settings.stop_hotkey;
+                    settings.preview_hotkey = persisted_settings.preview_hotkey;
+                    settings.unpreview_hotkey = persisted_settings.unpreview_hotkey;
                     trace_buffer.push("config", "save", std::string("{\"success\":false,\"path\":") + json_string(wide_to_utf8(meccha::config_path().wstring())) +
                                                      ",\"scope\":\"app\"}");
                     diagnostics.event("app_settings_save_failed", "error", "settings", "Failed to save App Settings.");

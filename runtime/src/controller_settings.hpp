@@ -16,15 +16,16 @@ namespace meccha
         bool enable_front_paint{true};
         bool enable_side_paint{true};
         bool enable_back_paint{true};
-        int server_batch_limit{1000000};
-        int server_batch_delay_ms{0};
+        int server_batch_limit{1};
+        int server_batch_delay_ms{1};
+        bool auto_material_properties{true};
         double metallic{0.0};
         double roughness{1.0};
     };
 
     struct AppSettings
     {
-        int layout_version{21};
+        int layout_version{22};
         float panel_x{-1.0f};
         float panel_y{-1.0f};
         float panel_width{1040.0f};
@@ -35,6 +36,8 @@ namespace meccha
         float opacity{1.0f};
         std::string start_hotkey{"F10"};
         std::string stop_hotkey{"F9"};
+        std::string preview_hotkey{"F8"};
+        std::string unpreview_hotkey{"F7"};
         PaintTuning tuning{};
         bool show_info{true};
         bool show_warning{true};

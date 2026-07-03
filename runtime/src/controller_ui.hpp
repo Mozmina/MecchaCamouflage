@@ -32,6 +32,8 @@ namespace meccha
         bool paint_editing{false};
         bool recording_start_hotkey{false};
         bool recording_stop_hotkey{false};
+        bool recording_preview_hotkey{false};
+        bool recording_unpreview_hotkey{false};
         std::string hotkey_error{};
         std::string log_dir{};
     };
@@ -56,6 +58,8 @@ namespace meccha
         bool copy_log_clicked{false};
         bool start_hotkey_recording{false};
         bool stop_hotkey_recording{false};
+        bool preview_hotkey_recording{false};
+        bool unpreview_hotkey_recording{false};
         bool settings_changed{false};
     };
 
