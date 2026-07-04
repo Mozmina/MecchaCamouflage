@@ -91,7 +91,7 @@ public sealed class MainForm : Form
     private async Task InitializeWebViewAsync()
     {
         await webView.EnsureCoreWebView2Async();
-        var webRoot = Path.Combine(AppContext.BaseDirectory, "web");
+        var webRoot = Path.Combine(PackagedAssets.ResolveAssetRoot(session.Paths, "web"), "web");
         if (!Directory.Exists(webRoot))
             throw new DirectoryNotFoundException("Packaged web assets are missing: " + webRoot);
 

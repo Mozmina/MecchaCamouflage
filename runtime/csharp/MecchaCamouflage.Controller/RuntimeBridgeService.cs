@@ -116,7 +116,7 @@ public sealed class RuntimeBridgeService
     private void PrepareNativeRuntime()
     {
         paths.EnsureBaseDirectories();
-        var appDir = AppContext.BaseDirectory;
+        var appDir = PackagedAssets.ResolveAssetRoot(paths, "native");
         var packagedNativeDir = Path.Combine(appDir, "native");
         var packagedBridge = Path.Combine(packagedNativeDir, "runtime-bridge.dll");
         var packagedInjector = Path.Combine(packagedNativeDir, "runtime-injector.exe");
@@ -139,7 +139,8 @@ public sealed class RuntimeBridgeService
         progressPath = Path.Combine(paths.ProgressDirectory, $"bridge-{hash}-{BridgePort}.progress.json");
         File.WriteAllText(bridgePath + ".progress.path", progressPath + Environment.NewLine);
 
-        var sourceProfiles = Path.Combine(appDir, "mesh-profiles");
+        var profileRoot = PackagedAssets.ResolveAssetRoot(paths, "mesh-profiles");
+        var sourceProfiles = Path.Combine(profileRoot, "mesh-profiles");
         var targetProfiles = Path.Combine(runtimeDir, "mesh-profiles");
         if (Directory.Exists(sourceProfiles))
         {

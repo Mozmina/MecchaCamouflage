@@ -2,8 +2,7 @@ param(
     [string]$Version = "",
     [string]$OutDir = "",
     [string]$ExePath = "",
-    [string]$RuntimeRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-    [switch]$IncludeRuntimeSource = $false
+    [string]$RuntimeRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,16 +28,6 @@ function Resolve-ProjectVersion {
     return "unversioned"
 }
 
-function Copy-IfExists {
-    param(
-        [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Destination
-    )
-    if (Test-Path $Source -PathType Leaf) {
-        Copy-Item -Force $Source $Destination
-    }
-}
-
 $Version = Resolve-ProjectVersion -Requested $Version -Root $RuntimeRoot
 Write-Host "Package version: $Version"
 
@@ -47,63 +36,10 @@ $ArtifactName = "meccha-camouflage-$Version"
 if (-not $ExePath) { $ExePath = Join-Path $RuntimeRoot ".build\bin\meccha-camouflage.exe" }
 if (-not (Test-Path $ExePath -PathType Leaf)) { throw "Executable not found: $ExePath. Run scripts/build.ps1 first." }
 
-$ExeDir = Split-Path -Parent (Resolve-Path $ExePath).Path
-$NativeDir = Join-Path $ExeDir "native"
-$MeshProfilesDir = Join-Path $ExeDir "mesh-profiles"
-foreach ($required in @(
-    (Join-Path $NativeDir "runtime-bridge.dll"),
-    (Join-Path $NativeDir "runtime-injector.exe"),
-    (Join-Path $MeshProfilesDir "paintman.mesh-profile-v2.json")
-)) {
-    if (-not (Test-Path $required -PathType Leaf)) {
-        throw "Required packaged runtime file is missing: $required"
-    }
-}
-
-$TmpRoot = Join-Path $OutDir "tmp-release"
-Remove-Item -Recurse -Force $TmpRoot -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $TmpRoot | Out-Null
-
-Copy-Item -Recurse -Force -Path (Join-Path $ExeDir "*") -Destination $TmpRoot
-Copy-IfExists -Source (Join-Path $RuntimeRoot "README.md") -Destination (Join-Path $TmpRoot "README.md")
-Copy-IfExists -Source (Join-Path $RuntimeRoot "LICENSE.txt") -Destination (Join-Path $TmpRoot "LICENSE.txt")
-Copy-IfExists -Source (Join-Path $RuntimeRoot "BRANDING.md") -Destination (Join-Path $TmpRoot "BRANDING.md")
-$AssetOutDir = Join-Path $TmpRoot "assets"
-New-Item -ItemType Directory -Force -Path $AssetOutDir | Out-Null
-Copy-IfExists -Source (Join-Path $RuntimeRoot "assets\icon.png") -Destination (Join-Path $AssetOutDir "icon.png")
-
-Set-Content -Encoding ASCII -Path (Join-Path $TmpRoot "runtime-config.json") -Value @'
-{
-  "version": "%VERSION%",
-  "runtime": "webview2",
-  "mode": "service",
-  "game_process_name": "PenguinHotel-Win64-Shipping.exe",
-  "config_dir": "%LOCALAPPDATA%\\MecchaCamouflage\\versions\\%VERSION%\\config",
-  "log_dir": "%LOCALAPPDATA%\\MecchaCamouflage\\versions\\%VERSION%\\logs"
-}
-'@.Replace("%VERSION%", $Version)
-
-if ($IncludeRuntimeSource) {
-    Copy-Item -Recurse -Force (Join-Path $RuntimeRoot "runtime") (Join-Path $TmpRoot "runtime")
-    Copy-Item -Recurse -Force (Join-Path $RuntimeRoot "scripts") (Join-Path $TmpRoot "scripts")
-}
-
-Add-Type -AssemblyName System.IO.Compression
-Add-Type -AssemblyName System.IO.Compression.FileSystem
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$ZipPath = Join-Path $OutDir "$ArtifactName.zip"
-if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
-$Zip = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create)
-try {
-    $Root = (Resolve-Path $TmpRoot).Path.TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar
-    Get-ChildItem $TmpRoot -Recurse -File | ForEach-Object {
-        $FullPath = (Resolve-Path $_.FullName).Path
-        $RelativePath = $FullPath.Substring($Root.Length).Replace("\", "/")
-        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Zip, $_.FullName, $RelativePath, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
-    }
-} finally {
-    $Zip.Dispose()
-}
-
-Remove-Item -Recurse -Force $TmpRoot
-Write-Host "Wrote $ZipPath"
+$ArtifactPath = Join-Path $OutDir "$ArtifactName.exe"
+if (Test-Path $ArtifactPath) { Remove-Item -Force $ArtifactPath }
+$LegacyZipPath = Join-Path $OutDir "$ArtifactName.zip"
+if (Test-Path $LegacyZipPath) { Remove-Item -Force $LegacyZipPath }
+Copy-Item -Force -Path $ExePath -Destination $ArtifactPath
+Write-Host "Wrote $ArtifactPath"

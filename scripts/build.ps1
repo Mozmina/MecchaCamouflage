@@ -100,8 +100,7 @@ if (-not $OutDir) {
 }
 $OutDir = [System.IO.Path]::GetFullPath($OutDir)
 $ObjDir = Join-Path $RuntimeRoot ".build\obj"
-$NativeOutDir = Join-Path $OutDir "native"
-$MeshProfilesOutDir = Join-Path $OutDir "mesh-profiles"
+$NativePackageDir = Join-Path $ObjDir "package-native"
 
 $BridgeSource = Join-Path $RuntimeRoot "runtime\src\bridge.cpp"
 $InjectorSource = Join-Path $RuntimeRoot "runtime\src\injector.cpp"
@@ -120,29 +119,14 @@ if (-not (Test-Path $MeshProfilesSourceDir -PathType Container)) {
 
 Clear-DirectoryContents -Path $OutDir
 New-Item -ItemType Directory -Force -Path $ObjDir | Out-Null
-New-Item -ItemType Directory -Force -Path $NativeOutDir | Out-Null
+Clear-DirectoryContents -Path $NativePackageDir
 
 Push-Location $RuntimeRoot
 try {
     Invoke-DotNet -Arguments @("run", "--project", $TestsProject, "-c", "Release")
-    Invoke-DotNet -Arguments @(
-        "publish", $WebHostProject,
-        "-c", "Release",
-        "-r", "win-x64",
-        "--self-contained", "true",
-        "-o", $OutDir,
-        "/p:PublishSingleFile=false",
-        "/p:MecchaAppVersion=$Version"
-    )
 
-    $DefaultControllerOutput = Join-Path $OutDir "meccha-camouflage.exe"
-    $ControllerOutput = Join-Path $OutDir "$ExeName.exe"
-    if ($DefaultControllerOutput -ne $ControllerOutput -and (Test-Path $DefaultControllerOutput -PathType Leaf)) {
-        Move-Item -Force $DefaultControllerOutput $ControllerOutput
-    }
-
-    $BridgeOutput = Join-Path $NativeOutDir "runtime-bridge.dll"
-    $InjectorOutput = Join-Path $NativeOutDir "runtime-injector.exe"
+    $BridgeOutput = Join-Path $NativePackageDir "runtime-bridge.dll"
+    $InjectorOutput = Join-Path $NativePackageDir "runtime-injector.exe"
     Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs @(
         "/nologo", "/std:c++17", "/EHsc", "/O2", "/LD", $BridgeSource,
         "/Fo:$(Join-Path $ObjDir 'bridge.obj')",
@@ -156,9 +140,6 @@ try {
         "/Fe:$InjectorOutput"
     )
 
-    if (-not (Test-Path $ControllerOutput -PathType Leaf)) {
-        throw "WebView2 controller EXE was not produced: $ControllerOutput"
-    }
     if (-not (Test-Path $BridgeOutput -PathType Leaf)) {
         throw "Bridge DLL was not produced: $BridgeOutput"
     }
@@ -166,12 +147,35 @@ try {
         throw "Injector EXE was not produced: $InjectorOutput"
     }
 
-    New-Item -ItemType Directory -Force -Path $MeshProfilesOutDir | Out-Null
     $MeshProfiles = @(Get-ChildItem -Path $MeshProfilesSourceDir -Filter "*.json" -File)
     if ($MeshProfiles.Count -le 0) {
         throw "No mesh profile JSON assets found in: $MeshProfilesSourceDir"
     }
-    Copy-Item -Force -Path (Join-Path $MeshProfilesSourceDir "*.json") -Destination $MeshProfilesOutDir
+
+    Invoke-DotNet -Arguments @(
+        "publish", $WebHostProject,
+        "-c", "Release",
+        "-r", "win-x64",
+        "--self-contained", "true",
+        "-o", $OutDir,
+        "/p:PublishSingleFile=true",
+        "/p:IncludeAllContentForSelfExtract=true",
+        "/p:IncludeNativeLibrariesForSelfExtract=true",
+        "/p:EnableCompressionInSingleFile=true",
+        "/p:MecchaAppVersion=$Version",
+        "/p:MecchaNativeRuntimeDir=$NativePackageDir",
+        "/p:MecchaMeshProfilesDir=$MeshProfilesSourceDir"
+    )
+
+    $DefaultControllerOutput = Join-Path $OutDir "meccha-camouflage.exe"
+    $ControllerOutput = Join-Path $OutDir "$ExeName.exe"
+    if ($DefaultControllerOutput -ne $ControllerOutput -and (Test-Path $DefaultControllerOutput -PathType Leaf)) {
+        Move-Item -Force $DefaultControllerOutput $ControllerOutput
+    }
+
+    if (-not (Test-Path $ControllerOutput -PathType Leaf)) {
+        throw "WebView2 controller EXE was not produced: $ControllerOutput"
+    }
 }
 finally {
     Pop-Location
@@ -179,5 +183,4 @@ finally {
 
 Write-Host "Built runtime artifacts:"
 Write-Host "  $(Join-Path $OutDir "$ExeName.exe")"
-Write-Host "  $(Join-Path $NativeOutDir 'runtime-bridge.dll')"
-Write-Host "  $(Join-Path $NativeOutDir 'runtime-injector.exe')"
+Write-Host "  native runtime embedded from $NativePackageDir"

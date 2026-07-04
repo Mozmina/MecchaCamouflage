@@ -33,26 +33,12 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path ".build/bin/meccha-camouflage.exe")) { throw "runtime exe missing" }
-          if (-not (Test-Path ".build/bin/native/runtime-bridge.dll")) { throw "bridge dll missing" }
-          if (-not (Test-Path ".build/bin/native/runtime-injector.exe")) { throw "injector exe missing" }
-          if (-not (Test-Path ".build/bin/mesh-profiles/paintman.mesh-profile-v2.json")) { throw "mesh profile missing" }
 
       - name: Package dry run
         shell: pwsh
         run: |
           $version = "ci-$env:GITHUB_RUN_NUMBER"
           .\scripts\release.ps1 -Version $version
-          $zipPath = ".build/package/meccha-camouflage-$version.zip"
-          if (-not (Test-Path $zipPath)) { throw "package zip missing" }
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath))
-          try {
-            $profile = $zip.Entries | Where-Object { $_.FullName -eq "mesh-profiles/paintman.mesh-profile-v2.json" } | Select-Object -First 1
-            if (-not $profile) { throw "mesh profile missing from package" }
-            $bridge = $zip.Entries | Where-Object { $_.FullName -eq "native/runtime-bridge.dll" } | Select-Object -First 1
-            if (-not $bridge) { throw "bridge missing from package" }
-            $injector = $zip.Entries | Where-Object { $_.FullName -eq "native/runtime-injector.exe" } | Select-Object -First 1
-            if (-not $injector) { throw "injector missing from package" }
-          } finally {
-            $zip.Dispose()
-          }
+          $exePath = ".build/package/meccha-camouflage-$version.exe"
+          if (-not (Test-Path $exePath)) { throw "package exe missing" }
+          if ((Get-Item $exePath).Length -le 10000000) { throw "package exe is unexpectedly small" }
