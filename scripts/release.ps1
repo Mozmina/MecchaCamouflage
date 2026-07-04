@@ -29,6 +29,16 @@ function Resolve-ProjectVersion {
     return "unversioned"
 }
 
+function Copy-IfExists {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    if (Test-Path $Source -PathType Leaf) {
+        Copy-Item -Force $Source $Destination
+    }
+}
+
 $Version = Resolve-ProjectVersion -Requested $Version -Root $RuntimeRoot
 Write-Host "Package version: $Version"
 
@@ -37,30 +47,39 @@ $ArtifactName = "meccha-camouflage-$Version"
 if (-not $ExePath) { $ExePath = Join-Path $RuntimeRoot ".build\bin\meccha-camouflage.exe" }
 if (-not (Test-Path $ExePath -PathType Leaf)) { throw "Executable not found: $ExePath. Run scripts/build.ps1 first." }
 
+$ExeDir = Split-Path -Parent (Resolve-Path $ExePath).Path
+$NativeDir = Join-Path $ExeDir "native"
+$MeshProfilesDir = Join-Path $ExeDir "mesh-profiles"
+foreach ($required in @(
+    (Join-Path $NativeDir "runtime-bridge.dll"),
+    (Join-Path $NativeDir "runtime-injector.exe"),
+    (Join-Path $MeshProfilesDir "paintman.mesh-profile-v2.json")
+)) {
+    if (-not (Test-Path $required -PathType Leaf)) {
+        throw "Required packaged runtime file is missing: $required"
+    }
+}
+
 $TmpRoot = Join-Path $OutDir "tmp-release"
 Remove-Item -Recurse -Force $TmpRoot -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $TmpRoot | Out-Null
 
-Copy-Item -Force $ExePath (Join-Path $TmpRoot $([System.IO.Path]::GetFileName($ExePath)))
-$MeshProfileDir = Join-Path (Split-Path -Parent $ExePath) "mesh-profiles"
-if (Test-Path $MeshProfileDir -PathType Container) {
-    Copy-Item -Recurse -Force $MeshProfileDir (Join-Path $TmpRoot "mesh-profiles")
-}
-Copy-Item -Force (Join-Path $RuntimeRoot "README.md") (Join-Path $TmpRoot "README.md")
-Copy-Item -Force (Join-Path $RuntimeRoot "LICENSE.txt") (Join-Path $TmpRoot "LICENSE.txt")
-Copy-Item -Force (Join-Path $RuntimeRoot "BRANDING.md") (Join-Path $TmpRoot "BRANDING.md")
+Copy-Item -Recurse -Force -Path (Join-Path $ExeDir "*") -Destination $TmpRoot
+Copy-IfExists -Source (Join-Path $RuntimeRoot "README.md") -Destination (Join-Path $TmpRoot "README.md")
+Copy-IfExists -Source (Join-Path $RuntimeRoot "LICENSE.txt") -Destination (Join-Path $TmpRoot "LICENSE.txt")
+Copy-IfExists -Source (Join-Path $RuntimeRoot "BRANDING.md") -Destination (Join-Path $TmpRoot "BRANDING.md")
 $AssetOutDir = Join-Path $TmpRoot "assets"
 New-Item -ItemType Directory -Force -Path $AssetOutDir | Out-Null
-Copy-Item -Force (Join-Path $RuntimeRoot "assets\icon.png") (Join-Path $AssetOutDir "icon.png")
+Copy-IfExists -Source (Join-Path $RuntimeRoot "assets\icon.png") -Destination (Join-Path $AssetOutDir "icon.png")
 
 Set-Content -Encoding ASCII -Path (Join-Path $TmpRoot "runtime-config.json") -Value @'
 {
   "version": "%VERSION%",
-  "runtime": "cpp",
+  "runtime": "wpf",
   "mode": "service",
   "game_process_name": "PenguinHotel-Win64-Shipping.exe",
-  "config_dir": "%LOCALAPPDATA%\\MecchaCamouflage\\versions\\%VERSION%",
-  "log_dir": "%LOCALAPPDATA%\\MecchaCamouflage\\runtime"
+  "config_dir": "%LOCALAPPDATA%\\MecchaCamouflage\\versions\\%VERSION%\\config",
+  "log_dir": "%LOCALAPPDATA%\\MecchaCamouflage\\versions\\%VERSION%\\logs"
 }
 '@.Replace("%VERSION%", $Version)
 
@@ -71,6 +90,7 @@ if ($IncludeRuntimeSource) {
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $ZipPath = Join-Path $OutDir "$ArtifactName.zip"
 if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
 $Zip = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create)

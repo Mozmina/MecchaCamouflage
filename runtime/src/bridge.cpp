@@ -457,6 +457,85 @@ namespace
         return {};
     }
 
+    auto read_small_text_file_w(const std::wstring& path, std::size_t max_bytes, std::string& text) -> bool
+    {
+        text.clear();
+        if (path.empty() || max_bytes == 0)
+        {
+            return false;
+        }
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || static_cast<std::uint64_t>(size.QuadPart) > max_bytes)
+        {
+            CloseHandle(file);
+            return false;
+        }
+        text.resize(static_cast<std::size_t>(size.QuadPart));
+        DWORD read = 0;
+        const auto ok = ReadFile(file, text.data(), static_cast<DWORD>(text.size()), &read, nullptr);
+        CloseHandle(file);
+        if (!ok || read != text.size())
+        {
+            text.clear();
+            return false;
+        }
+        return true;
+    }
+
+    auto trim_ascii_whitespace(std::string text) -> std::string
+    {
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
+        {
+            text.pop_back();
+        }
+        std::size_t first = 0;
+        while (first < text.size() && std::isspace(static_cast<unsigned char>(text[first])))
+        {
+            ++first;
+        }
+        return first == 0 ? text : text.substr(first);
+    }
+
+    auto utf8_to_wstring(const std::string& text) -> std::wstring
+    {
+        if (text.empty())
+        {
+            return {};
+        }
+        const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0);
+        if (size <= 0)
+        {
+            return {};
+        }
+        std::wstring wide(static_cast<std::size_t>(size), L'\0');
+        const int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), wide.data(), size);
+        if (written != size)
+        {
+            return {};
+        }
+        return wide;
+    }
+
+    auto bridge_progress_path() -> std::wstring
+    {
+        const auto configured_sidecar = bridge_sidecar_path(L".progress.path");
+        std::string configured{};
+        if (!configured_sidecar.empty() && read_small_text_file_w(configured_sidecar, 4096, configured))
+        {
+            const auto wide = utf8_to_wstring(trim_ascii_whitespace(configured));
+            if (!wide.empty())
+            {
+                return wide;
+            }
+        }
+        return bridge_sidecar_path(L".progress.json");
+    }
+
     auto write_bridge_progress(const std::string& stage,
                                const std::string& message,
                                int step,
@@ -464,7 +543,7 @@ namespace
                                double elapsed_ms,
                                const std::string& extra = "") -> void
     {
-        const auto path = bridge_sidecar_path(L".progress.json");
+        const auto path = bridge_progress_path();
         if (path.empty())
         {
             return;
@@ -494,7 +573,7 @@ namespace
 
     auto clear_bridge_progress() -> void
     {
-        const auto path = bridge_sidecar_path(L".progress.json");
+        const auto path = bridge_progress_path();
         if (!path.empty())
         {
             DeleteFileW(path.c_str());
@@ -5066,6 +5145,8 @@ namespace
         int texture_size{0};
         std::uint64_t hash{1469598103934665603ULL};
         std::vector<std::uint8_t> albedo_bytes{};
+        std::vector<std::uint8_t> metallic_bytes{};
+        std::vector<std::uint8_t> roughness_bytes{};
     };
 
     struct MeshFirstPaintMaterialPattern
@@ -5099,9 +5180,11 @@ namespace
 
     auto mesh_first_store_preview_snapshot(std::uintptr_t component,
                                            int texture_size,
-                                           const std::vector<std::uint8_t>& albedo_bytes) -> void
+                                           const std::vector<std::uint8_t>& albedo_bytes,
+                                           const std::vector<std::uint8_t>& metallic_bytes,
+                                           const std::vector<std::uint8_t>& roughness_bytes) -> void
     {
-        if (!component || albedo_bytes.empty())
+        if (!component || albedo_bytes.empty() || metallic_bytes.empty() || roughness_bytes.empty())
         {
             return;
         }
@@ -5115,8 +5198,20 @@ namespace
             hash ^= static_cast<std::uint64_t>(value);
             hash *= 1099511628211ULL;
         }
+        for (const auto value : metallic_bytes)
+        {
+            hash ^= static_cast<std::uint64_t>(value);
+            hash *= 1099511628211ULL;
+        }
+        for (const auto value : roughness_bytes)
+        {
+            hash ^= static_cast<std::uint64_t>(value);
+            hash *= 1099511628211ULL;
+        }
         g_mesh_first_preview_snapshot.hash = hash;
         g_mesh_first_preview_snapshot.albedo_bytes = albedo_bytes;
+        g_mesh_first_preview_snapshot.metallic_bytes = metallic_bytes;
+        g_mesh_first_preview_snapshot.roughness_bytes = roughness_bytes;
     }
 
     auto mesh_first_clear_preview_snapshot() -> void
@@ -5452,45 +5547,73 @@ namespace
         std::string failure{"not_run"};
     };
 
-    auto mesh_first_apply_local_albedo_import_preview(Reflection& ref,
-                                                      std::uintptr_t component,
-                                                      const std::vector<sdk::FPaintStroke>& strokes,
-                                                      int texture_size,
-                                                      const std::vector<std::uint8_t>* base_bytes = nullptr) -> MeshFirstLocalTextureImportResult
+    auto mesh_first_apply_local_material_import_preview(Reflection& ref,
+                                                        std::uintptr_t component,
+                                                        const std::vector<sdk::FPaintStroke>& strokes,
+                                                        int texture_size,
+                                                        const std::vector<std::uint8_t>* base_albedo_bytes = nullptr,
+                                                        const std::vector<std::uint8_t>* base_metallic_bytes = nullptr,
+                                                        const std::vector<std::uint8_t>* base_roughness_bytes = nullptr) -> MeshFirstLocalTextureImportResult
     {
         const auto started = std::chrono::steady_clock::now();
         MeshFirstLocalTextureImportResult out{};
         out.texture_size = texture_size;
         const int size = std::max(1, texture_size);
         const std::size_t expected_bytes = static_cast<std::size_t>(size) * static_cast<std::size_t>(size) * 4U;
-        MeshFirstChannelBytes channel{};
-        if (base_bytes && !base_bytes->empty())
+        MeshFirstChannelBytes albedo{};
+        MeshFirstChannelBytes metallic{};
+        MeshFirstChannelBytes roughness{};
+        auto prepare_channel = [&](sdk::EPaintChannel paint_channel,
+                                   const std::vector<std::uint8_t>* base_bytes,
+                                   const char* label,
+                                   MeshFirstChannelBytes& channel) -> bool {
+            if (base_bytes && !base_bytes->empty())
+            {
+                channel.ok = true;
+                channel.bytes = *base_bytes;
+                channel.failure = "ok";
+            }
+            else
+            {
+                channel = mesh_first_export_channel_bytes(ref, component, paint_channel);
+            }
+            if (!channel.ok)
+            {
+                out.failure = std::string(label) + "_export_failed:" + channel.failure;
+                return false;
+            }
+            if (channel.bytes.size() != expected_bytes)
+            {
+                out.failure = std::string(label) + "_export_size_mismatch";
+                return false;
+            }
+            out.source_bytes += static_cast<int>(channel.bytes.size());
+            return true;
+        };
+
+        out.export_ok =
+            prepare_channel(sdk::EPaintChannel::Albedo, base_albedo_bytes, "albedo", albedo) &&
+            prepare_channel(sdk::EPaintChannel::Metallic, base_metallic_bytes, "metallic", metallic) &&
+            prepare_channel(sdk::EPaintChannel::Roughness, base_roughness_bytes, "roughness", roughness);
+        if (!out.export_ok)
         {
-            channel.ok = true;
-            channel.bytes = *base_bytes;
-            channel.failure = "ok";
-        }
-        else
-        {
-            channel = mesh_first_export_channel_bytes(ref, component, sdk::EPaintChannel::Albedo);
-        }
-        out.export_ok = channel.ok;
-        if (!channel.ok)
-        {
-            out.failure = channel.failure;
             return out;
         }
-        out.source_bytes = static_cast<int>(channel.bytes.size());
-        out.before_hash = mesh_first_hash_channel_bytes(channel.bytes);
-        if (channel.bytes.size() != expected_bytes)
-        {
-            out.failure = "albedo_export_size_mismatch";
-            return out;
-        }
+        out.before_hash = mesh_first_hash_channel_bytes(albedo.bytes);
+        out.before_hash ^= mesh_first_hash_channel_bytes(metallic.bytes);
+        out.before_hash *= 1099511628211ULL;
+        out.before_hash ^= mesh_first_hash_channel_bytes(roughness.bytes);
+        out.before_hash *= 1099511628211ULL;
 
         for (const auto& stroke : strokes)
         {
-            if (stroke.TargetChannel != sdk::EPaintChannel::Albedo && stroke.TargetChannel != sdk::EPaintChannel::All)
+            const bool paint_albedo = stroke.TargetChannel == sdk::EPaintChannel::Albedo ||
+                                      stroke.TargetChannel == sdk::EPaintChannel::All;
+            const bool paint_metallic = stroke.TargetChannel == sdk::EPaintChannel::Metallic ||
+                                        stroke.TargetChannel == sdk::EPaintChannel::All;
+            const bool paint_roughness = stroke.TargetChannel == sdk::EPaintChannel::Roughness ||
+                                         stroke.TargetChannel == sdk::EPaintChannel::All;
+            if (!paint_albedo && !paint_metallic && !paint_roughness)
             {
                 continue;
             }
@@ -5504,6 +5627,8 @@ namespace
             const auto r = static_cast<std::uint8_t>(std::lround(clamp01(stroke.ChannelData.AlbedoColor.R) * 255.0));
             const auto g = static_cast<std::uint8_t>(std::lround(clamp01(stroke.ChannelData.AlbedoColor.G) * 255.0));
             const auto b = static_cast<std::uint8_t>(std::lround(clamp01(stroke.ChannelData.AlbedoColor.B) * 255.0));
+            const auto m = static_cast<std::uint8_t>(std::lround(clamp01(stroke.ChannelData.Metallic) * 255.0));
+            const auto ro = static_cast<std::uint8_t>(std::lround(clamp01(stroke.ChannelData.Roughness) * 255.0));
             bool painted = false;
             const int min_y = std::max(0, cy - radius);
             const int max_y = std::min(size - 1, cy + radius);
@@ -5521,15 +5646,43 @@ namespace
                     }
                     const auto offset = (static_cast<std::size_t>(y) * static_cast<std::size_t>(size) +
                                          static_cast<std::size_t>(x)) * 4U;
-                    const bool changed =
-                        channel.bytes[offset + 0] != r ||
-                        channel.bytes[offset + 1] != g ||
-                        channel.bytes[offset + 2] != b ||
-                        channel.bytes[offset + 3] != 255;
-                    channel.bytes[offset + 0] = r;
-                    channel.bytes[offset + 1] = g;
-                    channel.bytes[offset + 2] = b;
-                    channel.bytes[offset + 3] = 255;
+                    bool changed = false;
+                    if (paint_albedo)
+                    {
+                        changed = changed ||
+                                  albedo.bytes[offset + 0] != r ||
+                                  albedo.bytes[offset + 1] != g ||
+                                  albedo.bytes[offset + 2] != b ||
+                                  albedo.bytes[offset + 3] != 255;
+                        albedo.bytes[offset + 0] = r;
+                        albedo.bytes[offset + 1] = g;
+                        albedo.bytes[offset + 2] = b;
+                        albedo.bytes[offset + 3] = 255;
+                    }
+                    if (paint_metallic)
+                    {
+                        changed = changed ||
+                                  metallic.bytes[offset + 0] != m ||
+                                  metallic.bytes[offset + 1] != m ||
+                                  metallic.bytes[offset + 2] != m ||
+                                  metallic.bytes[offset + 3] != 255;
+                        metallic.bytes[offset + 0] = m;
+                        metallic.bytes[offset + 1] = m;
+                        metallic.bytes[offset + 2] = m;
+                        metallic.bytes[offset + 3] = 255;
+                    }
+                    if (paint_roughness)
+                    {
+                        changed = changed ||
+                                  roughness.bytes[offset + 0] != ro ||
+                                  roughness.bytes[offset + 1] != ro ||
+                                  roughness.bytes[offset + 2] != ro ||
+                                  roughness.bytes[offset + 3] != 255;
+                        roughness.bytes[offset + 0] = ro;
+                        roughness.bytes[offset + 1] = ro;
+                        roughness.bytes[offset + 2] = ro;
+                        roughness.bytes[offset + 3] = 255;
+                    }
                     ++out.pixels_touched;
                     if (changed)
                     {
@@ -5544,7 +5697,11 @@ namespace
             }
         }
 
-        out.preview_hash = mesh_first_hash_channel_bytes(channel.bytes);
+        out.preview_hash = mesh_first_hash_channel_bytes(albedo.bytes);
+        out.preview_hash ^= mesh_first_hash_channel_bytes(metallic.bytes);
+        out.preview_hash *= 1099511628211ULL;
+        out.preview_hash ^= mesh_first_hash_channel_bytes(roughness.bytes);
+        out.preview_hash *= 1099511628211ULL;
         if (out.pixels_changed <= 0 || out.preview_hash == out.before_hash)
         {
             out.import_ok = true;
@@ -5555,7 +5712,21 @@ namespace
         }
 
         std::string import_failure{};
-        out.import_ok = mesh_first_import_channel_bytes(ref, component, sdk::EPaintChannel::Albedo, channel.bytes, import_failure);
+        auto import_channel = [&](sdk::EPaintChannel paint_channel,
+                                  std::vector<std::uint8_t>& bytes,
+                                  const char* label) -> bool {
+            std::string channel_failure{};
+            if (!mesh_first_import_channel_bytes(ref, component, paint_channel, bytes, channel_failure))
+            {
+                import_failure = std::string(label) + "_import_failed:" + channel_failure;
+                return false;
+            }
+            return true;
+        };
+        out.import_ok =
+            import_channel(sdk::EPaintChannel::Albedo, albedo.bytes, "albedo") &&
+            import_channel(sdk::EPaintChannel::Metallic, metallic.bytes, "metallic") &&
+            import_channel(sdk::EPaintChannel::Roughness, roughness.bytes, "roughness");
         if (!out.import_ok)
         {
             out.failure = import_failure;
@@ -5581,6 +5752,48 @@ namespace
         if (region == MeshFirstRegion::Back)
             return 2;
         return 0;
+    }
+
+    enum class MeshFirstRegionMode
+    {
+        Paint,
+        Fill,
+        Skip,
+    };
+
+    auto mesh_first_region_mode_name(MeshFirstRegionMode mode) -> const char*
+    {
+        if (mode == MeshFirstRegionMode::Fill)
+            return "fill";
+        if (mode == MeshFirstRegionMode::Skip)
+            return "skip";
+        return "paint";
+    }
+
+    auto mesh_first_parse_region_mode(const std::string& request,
+                                      const char* mode_key,
+                                      const char* legacy_enable_key) -> MeshFirstRegionMode
+    {
+        const auto mode = lower_copy(json_string_field(request, mode_key, ""));
+        if (mode == "fill")
+            return MeshFirstRegionMode::Fill;
+        if (mode == "skip")
+            return MeshFirstRegionMode::Skip;
+        if (mode == "paint")
+            return MeshFirstRegionMode::Paint;
+        return json_bool_field(request, legacy_enable_key, true) ? MeshFirstRegionMode::Paint : MeshFirstRegionMode::Fill;
+    }
+
+    auto mesh_first_region_mode_for_sample(MeshFirstRegion region,
+                                           MeshFirstRegionMode front,
+                                           MeshFirstRegionMode side,
+                                           MeshFirstRegionMode back) -> MeshFirstRegionMode
+    {
+        if (region == MeshFirstRegion::Side)
+            return side;
+        if (region == MeshFirstRegion::Back)
+            return back;
+        return front;
     }
 
     auto mesh_first_axis_component(const sdk::FVector& value, char axis) -> double
@@ -7875,9 +8088,16 @@ namespace
     auto paint_mesh_first_on_game_thread(const std::string& request,
                                          const std::shared_ptr<QueuedPaintJob>& queued_job) -> std::string
     {
-        const bool enable_front = json_bool_field(request, "enable_front_paint", true);
-        const bool enable_side = json_bool_field(request, "enable_side_paint", true);
-        const bool enable_back = json_bool_field(request, "enable_back_paint", true);
+        const auto front_region_mode = mesh_first_parse_region_mode(request, "front_region_mode", "enable_front_paint");
+        const auto side_region_mode = mesh_first_parse_region_mode(request, "side_region_mode", "enable_side_paint");
+        const auto back_region_mode = mesh_first_parse_region_mode(request, "back_region_mode", "enable_back_paint");
+        const bool enable_front = front_region_mode == MeshFirstRegionMode::Paint;
+        const bool enable_side = side_region_mode == MeshFirstRegionMode::Paint;
+        const bool enable_back = back_region_mode == MeshFirstRegionMode::Paint;
+        const bool replay_front_enabled = front_region_mode != MeshFirstRegionMode::Skip;
+        const bool replay_side_enabled = side_region_mode != MeshFirstRegionMode::Skip;
+        const bool replay_back_enabled = back_region_mode != MeshFirstRegionMode::Skip;
+        const bool any_paint_region = enable_front || enable_side || enable_back;
         const bool preview_only = json_bool_field(request, "preview_only", false);
         const bool unpreview_only = json_bool_field(request, "unpreview_only", false);
         const bool research_artifacts = json_bool_field(request, "research_artifacts", false);
@@ -7888,6 +8108,11 @@ namespace
         const bool tuning_auto_material_properties = json_bool_field(request, "auto_material_properties", true);
         const double tuning_metallic = clamp_range(json_number_field(request, "metallic", 0.0), 0.0, 1.0);
         const double tuning_roughness = clamp_range(json_number_field(request, "roughness", 1.0), 0.0, 1.0);
+        const double fill_color_r = clamp_range(json_number_field(request, "fill_color_r", 1.0), 0.0, 1.0);
+        const double fill_color_g = clamp_range(json_number_field(request, "fill_color_g", 1.0), 0.0, 1.0);
+        const double fill_color_b = clamp_range(json_number_field(request, "fill_color_b", 1.0), 0.0, 1.0);
+        const double fill_metallic = clamp_range(json_number_field(request, "fill_metallic", 1.0), 0.0, 1.0);
+        const double fill_roughness = clamp_range(json_number_field(request, "fill_roughness", 0.0), 0.0, 1.0);
         const int tuning_server_batch_limit = json_int_field(request, "server_batch_limit", ServerPaintBatchStrokeLimit, 1, ServerPaintBatchStrokeLimitMax);
         const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", ServerPaintBatchDelayMs, 0, 1000);
 
@@ -7909,6 +8134,19 @@ namespace
         metadata += ",\"enable_front_paint\":" + std::string(json_bool(enable_front));
         metadata += ",\"enable_side_paint\":" + std::string(json_bool(enable_side));
         metadata += ",\"enable_back_paint\":" + std::string(json_bool(enable_back));
+        metadata += ",\"front_region_mode\":\"" + std::string(mesh_first_region_mode_name(front_region_mode)) + "\"";
+        metadata += ",\"side_region_mode\":\"" + std::string(mesh_first_region_mode_name(side_region_mode)) + "\"";
+        metadata += ",\"back_region_mode\":\"" + std::string(mesh_first_region_mode_name(back_region_mode)) + "\"";
+        metadata += ",\"front_region_active\":" + std::string(json_bool(replay_front_enabled));
+        metadata += ",\"side_region_active\":" + std::string(json_bool(replay_side_enabled));
+        metadata += ",\"back_region_active\":" + std::string(json_bool(replay_back_enabled));
+        metadata += ",\"paint_region_count\":" + std::to_string((enable_front ? 1 : 0) + (enable_side ? 1 : 0) + (enable_back ? 1 : 0));
+        metadata += ",\"fill_region_count\":" + std::to_string((front_region_mode == MeshFirstRegionMode::Fill ? 1 : 0) +
+                                                               (side_region_mode == MeshFirstRegionMode::Fill ? 1 : 0) +
+                                                               (back_region_mode == MeshFirstRegionMode::Fill ? 1 : 0));
+        metadata += ",\"skip_region_count\":" + std::to_string((front_region_mode == MeshFirstRegionMode::Skip ? 1 : 0) +
+                                                               (side_region_mode == MeshFirstRegionMode::Skip ? 1 : 0) +
+                                                               (back_region_mode == MeshFirstRegionMode::Skip ? 1 : 0));
         metadata += ",\"stroke_size_texels\":" + std::to_string(tuning_stroke_size_texels);
         metadata += ",\"coverage_step_texels\":" + std::to_string(tuning_coverage_step_texels);
         metadata += ",\"side_source_max_uv\":" + std::to_string(tuning_side_source_max_uv);
@@ -7917,6 +8155,12 @@ namespace
         metadata += ",\"material_properties_mode\":\"" + std::string(tuning_auto_material_properties ? "auto" : "manual") + "\"";
         metadata += ",\"metallic\":" + std::to_string(tuning_metallic);
         metadata += ",\"roughness\":" + std::to_string(tuning_roughness);
+        metadata += ",\"fill_color_space\":\"srgb\"";
+        metadata += ",\"fill_color_r\":" + std::to_string(fill_color_r);
+        metadata += ",\"fill_color_g\":" + std::to_string(fill_color_g);
+        metadata += ",\"fill_color_b\":" + std::to_string(fill_color_b);
+        metadata += ",\"fill_metallic\":" + std::to_string(fill_metallic);
+        metadata += ",\"fill_roughness\":" + std::to_string(fill_roughness);
         metadata += ",\"server_batch_limit\":" + std::to_string(tuning_server_batch_limit);
         metadata += ",\"server_batch_delay_ms\":" + std::to_string(tuning_server_batch_delay_ms);
         metadata += ",\"bridge_events\":[\"mesh_profile_load\",\"pose_resolve\",\"planner_build\",\"bridge.paint_batch.request\",\"bridge.paint_batch.response\"]";
@@ -7944,13 +8188,13 @@ namespace
                                  metadata + ",\"replay_blocked\":true");
         }
 
-        if (!enable_front && !enable_side && !enable_back)
+        if (!replay_front_enabled && !replay_side_enabled && !replay_back_enabled)
         {
             return response_json(false,
-                                 "mesh_regions_disabled",
+                                 "mesh_regions_skipped",
                                  0,
                                  1,
-                                 "all mesh-first paint regions are disabled",
+                                 "all mesh-first paint regions are skipped",
                                  metadata);
         }
 
@@ -8002,10 +8246,12 @@ namespace
             const auto snapshot = mesh_first_preview_snapshot_copy();
             metadata += ",\"unpreview_snapshot_available\":" + std::string(json_bool(snapshot.available));
             metadata += ",\"unpreview_snapshot_component\":\"" + hex_address(snapshot.component) + "\"";
-            metadata += ",\"unpreview_snapshot_bytes\":" + std::to_string(snapshot.albedo_bytes.size());
+            metadata += ",\"unpreview_snapshot_albedo_bytes\":" + std::to_string(snapshot.albedo_bytes.size());
+            metadata += ",\"unpreview_snapshot_metallic_bytes\":" + std::to_string(snapshot.metallic_bytes.size());
+            metadata += ",\"unpreview_snapshot_roughness_bytes\":" + std::to_string(snapshot.roughness_bytes.size());
             metadata += ",\"unpreview_snapshot_texture_size\":" + std::to_string(snapshot.texture_size);
             metadata += ",\"unpreview_snapshot_hash\":\"" + std::to_string(snapshot.hash) + "\"";
-            if (!snapshot.available || snapshot.albedo_bytes.empty())
+            if (!snapshot.available || snapshot.albedo_bytes.empty() || snapshot.metallic_bytes.empty() || snapshot.roughness_bytes.empty())
             {
                 return response_json(false,
                                      "mesh_unpreview_snapshot_unavailable",
@@ -8032,12 +8278,24 @@ namespace
                                   "\"phase\":\"local_unpreview\",\"terminal\":false,\"result\":\"running\"");
             const auto started = std::chrono::steady_clock::now();
             std::string import_failure{};
-            auto restore_bytes = snapshot.albedo_bytes;
-            const bool restored = mesh_first_import_channel_bytes(ref,
-                                                                  ctx.component,
-                                                                  sdk::EPaintChannel::Albedo,
-                                                                  restore_bytes,
-                                                                  import_failure);
+            auto restore_albedo_bytes = snapshot.albedo_bytes;
+            auto restore_metallic_bytes = snapshot.metallic_bytes;
+            auto restore_roughness_bytes = snapshot.roughness_bytes;
+            auto restore_channel = [&](sdk::EPaintChannel channel,
+                                       std::vector<std::uint8_t>& bytes,
+                                       const char* label) -> bool {
+                std::string channel_failure{};
+                if (!mesh_first_import_channel_bytes(ref, ctx.component, channel, bytes, channel_failure))
+                {
+                    import_failure = std::string(label) + "_restore_failed:" + channel_failure;
+                    return false;
+                }
+                return true;
+            };
+            const bool restored =
+                restore_channel(sdk::EPaintChannel::Albedo, restore_albedo_bytes, "albedo") &&
+                restore_channel(sdk::EPaintChannel::Metallic, restore_metallic_bytes, "metallic") &&
+                restore_channel(sdk::EPaintChannel::Roughness, restore_roughness_bytes, "roughness");
             const double elapsed_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             if (restored)
@@ -8049,7 +8307,7 @@ namespace
             metadata += ",\"paint_elapsed_ms\":" + std::to_string(elapsed_ms);
             metadata += ",\"server_eta_ms\":0,\"local_eta_ms\":0,\"paint_eta_ms\":0";
             write_bridge_progress(restored ? "mesh_unpreview_done" : "mesh_unpreview_failed",
-                                  restored ? "local preview texture restored" : "local preview restore failed",
+                                  restored ? "local preview material texture restored" : "local preview material restore failed",
                                   restored ? 1 : 0,
                                   1,
                                   elapsed_ms,
@@ -8059,7 +8317,7 @@ namespace
                                  restored ? "mesh_unpreview_done" : "mesh_unpreview_failed",
                                  restored ? 1 : 0,
                                  restored ? 0 : 1,
-                                 restored ? "local preview texture restored" : "local preview restore failed: " + import_failure,
+                                 restored ? "local preview material texture restored" : "local preview material restore failed: " + import_failure,
                                  metadata);
         }
 
@@ -8505,7 +8763,7 @@ namespace
             front.component_position = sample.local_position;
             native_front.samples.push_back(front);
         }
-        if (native_front.samples.empty())
+        if (any_paint_region && native_front.samples.empty())
         {
             metadata += ",";
             metadata += mesh_first_plan_stats_metadata(plan_stats);
@@ -8528,39 +8786,54 @@ namespace
             capture_request_height = std::max(1, static_cast<int>(std::round(static_cast<double>(capture_request_height) * scale)));
         }
 
-        write_bridge_progress("mesh_basecolor_capture",
-                              "Capturing mesh-first source BaseColor",
-                              3,
-                              4,
-                              0.0,
-                              "\"source_samples\":" + std::to_string(native_front.samples.size()));
-        const auto capture_started = std::chrono::steady_clock::now();
-        const auto capture = sdk_capture_front_colors(ref, ctx, native_front, capture_request_width, capture_request_height);
-        const auto capture_elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - capture_started).count();
-        metadata += sdk_capture_metadata(capture);
-        metadata += ",\"mesh_capture_elapsed_ms\":" + std::to_string(capture_elapsed_ms);
-        metadata += ",\"mesh_capture_request_width\":" + std::to_string(capture_request_width);
-        metadata += ",\"mesh_capture_request_height\":" + std::to_string(capture_request_height);
-        if (!capture.bulk_readback_used || !capture.image_bulk_calibration_ok || capture.samples.empty())
+        SdkFrontCaptureResult capture{};
+        metadata += ",\"mesh_capture_required\":" + std::string(json_bool(any_paint_region));
+        if (any_paint_region)
         {
-            metadata += ",";
-            metadata += mesh_first_plan_stats_metadata(plan_stats);
-            return response_json(false,
-                                 "mesh_source_capture_failed",
-                                 0,
-                                 1,
-                                 "SceneCapture BaseColor bulk capture failed: " + capture.failure,
-                                 metadata + ",\"replay_blocked\":true");
+            write_bridge_progress("mesh_basecolor_capture",
+                                  "Capturing mesh-first source BaseColor",
+                                  3,
+                                  4,
+                                  0.0,
+                                  "\"source_samples\":" + std::to_string(native_front.samples.size()));
+            const auto capture_started = std::chrono::steady_clock::now();
+            capture = sdk_capture_front_colors(ref, ctx, native_front, capture_request_width, capture_request_height);
+            const auto capture_elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - capture_started).count();
+            metadata += sdk_capture_metadata(capture);
+            metadata += ",\"mesh_capture_elapsed_ms\":" + std::to_string(capture_elapsed_ms);
+            metadata += ",\"mesh_capture_request_width\":" + std::to_string(capture_request_width);
+            metadata += ",\"mesh_capture_request_height\":" + std::to_string(capture_request_height);
+            if (!capture.bulk_readback_used || !capture.image_bulk_calibration_ok || capture.samples.empty())
+            {
+                metadata += ",";
+                metadata += mesh_first_plan_stats_metadata(plan_stats);
+                return response_json(false,
+                                     "mesh_source_capture_failed",
+                                     0,
+                                     1,
+                                     "SceneCapture BaseColor bulk capture failed: " + capture.failure,
+                                     metadata + ",\"replay_blocked\":true");
+            }
+
+            mesh_first_assign_colors(profile_available ? &profile : nullptr,
+                                     plan_samples,
+                                     capture,
+                                     enable_front,
+                                     enable_side,
+                                     enable_back,
+                                     tuning_side_source_max_uv,
+                                     plan_stats);
+        }
+        else
+        {
+            capture.failure = "skipped_no_paint_regions";
+            metadata += ",\"mesh_capture_skipped\":true";
+            metadata += ",\"mesh_capture_skip_reason\":\"no_paint_regions\"";
+            metadata += ",\"mesh_capture_elapsed_ms\":0";
+            metadata += ",\"mesh_capture_request_width\":" + std::to_string(capture_request_width);
+            metadata += ",\"mesh_capture_request_height\":" + std::to_string(capture_request_height);
         }
 
-        mesh_first_assign_colors(profile_available ? &profile : nullptr,
-                                 plan_samples,
-                                 capture,
-                                 enable_front,
-                                 enable_side,
-                                 enable_back,
-                                 tuning_side_source_max_uv,
-                                 plan_stats);
         metadata += ",";
         metadata += mesh_first_plan_stats_metadata(plan_stats);
         metadata += ",\"planner_coverage_step_texels\":" + std::to_string(tuning_coverage_step_texels);
@@ -8583,15 +8856,15 @@ namespace
         {
             mesh_first_write_uv_debug_artifacts(plan_samples,
                                                 active_texture_size,
-                                                enable_front,
-                                                enable_side,
-                                                enable_back,
+                                                replay_front_enabled,
+                                                replay_side_enabled,
+                                                replay_back_enabled,
                                                 metadata);
             mesh_first_write_projection_debug_artifact(plan_samples,
                                                        capture,
-                                                       enable_front,
-                                                       enable_side,
-                                                       enable_back,
+                                                       replay_front_enabled,
+                                                       replay_side_enabled,
+                                                       replay_back_enabled,
                                                        metadata);
         }
 
@@ -8612,7 +8885,7 @@ namespace
         metadata += ",\"stroke_radius_uv\":" + std::to_string(stroke_radius_uv);
 
         std::vector<sdk::FPaintStroke> strokes{};
-        strokes.reserve(static_cast<std::size_t>(plan_stats.enabled_samples));
+        strokes.reserve(plan_samples.size());
         const bool use_mesh_anchors = runtime_triangle_cache.ok && runtime_uses_profile_component_world;
         const std::string replay_anchor_policy =
             use_mesh_anchors
@@ -8622,6 +8895,14 @@ namespace
         int replay_front = 0;
         int replay_side = 0;
         int replay_back = 0;
+        int replay_paint = 0;
+        int replay_fill = 0;
+        int replay_front_paint = 0;
+        int replay_side_paint = 0;
+        int replay_back_paint = 0;
+        int replay_front_fill = 0;
+        int replay_side_fill = 0;
+        int replay_back_fill = 0;
         int replay_world_anchors = 0;
         int replay_local_anchors = 0;
         int replay_triangle_anchors = 0;
@@ -8629,14 +8910,16 @@ namespace
         metadata += ",\"paint_target_channel\":\"all\"";
         metadata += ",\"paint_target_channel_value\":" + std::to_string(static_cast<int>(paint_target_channel));
         MeshFirstMaterialProperties material_properties{};
-        if (tuning_auto_material_properties)
+        if (any_paint_region && tuning_auto_material_properties)
         {
             material_properties = mesh_first_get_dominant_material_properties(ref, ctx.component);
         }
         metadata += ",\"material_properties_source\":\"" +
-                    std::string(!tuning_auto_material_properties
+                    std::string(!any_paint_region
+                                    ? "fill_material_only"
+                                    : (!tuning_auto_material_properties
                                     ? "manual_tuning"
-                                    : (material_properties.ok ? "dominant_paint_material_patterns" : "source_samples_fallback")) +
+                                    : (material_properties.ok ? "dominant_paint_material_patterns" : "source_samples_fallback"))) +
                     "\"";
         metadata += ",\"material_properties_auto_ok\":" + std::string(json_bool(material_properties.ok));
         metadata += ",\"material_properties_failure\":\"" + json_escape(material_properties.failure) + "\"";
@@ -8651,10 +8934,11 @@ namespace
         metadata += ",\"replay_region_order\":\"front,side,back\"";
         for (const auto target_region : replay_region_order)
         {
-            const bool region_enabled = (target_region == MeshFirstRegion::Front && enable_front) ||
-                                        (target_region == MeshFirstRegion::Side && enable_side) ||
-                                        (target_region == MeshFirstRegion::Back && enable_back);
-            if (!region_enabled)
+            const auto region_mode = mesh_first_region_mode_for_sample(target_region,
+                                                                       front_region_mode,
+                                                                       side_region_mode,
+                                                                       back_region_mode);
+            if (region_mode == MeshFirstRegionMode::Skip)
             {
                 continue;
             }
@@ -8664,29 +8948,43 @@ namespace
                 {
                     continue;
                 }
-                double stroke_metallic = tuning_metallic;
-                double stroke_roughness = tuning_roughness;
-                if (tuning_auto_material_properties)
+                sdk::FPaintChannelData channel{};
+                const bool fill_mode = region_mode == MeshFirstRegionMode::Fill;
+                if (fill_mode)
                 {
-                    if (material_properties.ok)
-                    {
-                        stroke_metallic = material_properties.metallic;
-                        stroke_roughness = material_properties.roughness;
-                        ++material_properties_auto_samples;
-                    }
-                    else
-                    {
-                        stroke_metallic = clamp01(sample.metallic);
-                        stroke_roughness = clamp01(sample.roughness);
-                        ++material_properties_source_sample_fallbacks;
-                    }
+                    channel = sdk_make_channel(sdk_srgb_to_linear_unit(fill_color_r),
+                                               sdk_srgb_to_linear_unit(fill_color_g),
+                                               sdk_srgb_to_linear_unit(fill_color_b),
+                                               fill_metallic,
+                                               fill_roughness,
+                                               sdk::EPaintChannelApplyMode::Override);
                 }
-                const auto channel = sdk_make_channel(sdk_srgb_to_linear_unit(sample.r),
-                                                      sdk_srgb_to_linear_unit(sample.g),
-                                                      sdk_srgb_to_linear_unit(sample.b),
-                                                      stroke_metallic,
-                                                      stroke_roughness,
-                                                      sdk::EPaintChannelApplyMode::Override);
+                else
+                {
+                    double stroke_metallic = tuning_metallic;
+                    double stroke_roughness = tuning_roughness;
+                    if (tuning_auto_material_properties)
+                    {
+                        if (material_properties.ok)
+                        {
+                            stroke_metallic = material_properties.metallic;
+                            stroke_roughness = material_properties.roughness;
+                            ++material_properties_auto_samples;
+                        }
+                        else
+                        {
+                            stroke_metallic = clamp01(sample.metallic);
+                            stroke_roughness = clamp01(sample.roughness);
+                            ++material_properties_source_sample_fallbacks;
+                        }
+                    }
+                    channel = sdk_make_channel(sdk_srgb_to_linear_unit(sample.r),
+                                               sdk_srgb_to_linear_unit(sample.g),
+                                               sdk_srgb_to_linear_unit(sample.b),
+                                               stroke_metallic,
+                                               stroke_roughness,
+                                               sdk::EPaintChannelApplyMode::Override);
+                }
                 auto stroke = use_mesh_anchors
                                   ? sdk_make_mesh_anchor_stroke(sample.u,
                                                                 sample.v,
@@ -8717,29 +9015,71 @@ namespace
                     ++replay_triangle_anchors;
                 }
                 strokes.push_back(stroke);
+                if (fill_mode)
+                {
+                    ++replay_fill;
+                }
+                else
+                {
+                    ++replay_paint;
+                }
                 if (sample.region == MeshFirstRegion::Front)
                 {
                     ++replay_front;
+                    if (fill_mode)
+                    {
+                        ++replay_front_fill;
+                    }
+                    else
+                    {
+                        ++replay_front_paint;
+                    }
                 }
                 else if (sample.region == MeshFirstRegion::Side)
                 {
                     ++replay_side;
+                    if (fill_mode)
+                    {
+                        ++replay_side_fill;
+                    }
+                    else
+                    {
+                        ++replay_side_paint;
+                    }
                 }
                 else
                 {
                     ++replay_back;
+                    if (fill_mode)
+                    {
+                        ++replay_back_fill;
+                    }
+                    else
+                    {
+                        ++replay_back_paint;
+                    }
                 }
             }
         }
         metadata += ",\"material_properties_auto_samples\":" + std::to_string(material_properties_auto_samples);
         metadata += ",\"material_properties_source_sample_fallbacks\":" + std::to_string(material_properties_source_sample_fallbacks);
+        metadata += ",\"replay_strokes_paint\":" + std::to_string(replay_paint);
+        metadata += ",\"replay_strokes_fill\":" + std::to_string(replay_fill);
+        metadata += ",\"replay_strokes_front_paint\":" + std::to_string(replay_front_paint);
+        metadata += ",\"replay_strokes_side_paint\":" + std::to_string(replay_side_paint);
+        metadata += ",\"replay_strokes_back_paint\":" + std::to_string(replay_back_paint);
+        metadata += ",\"replay_strokes_front_fill\":" + std::to_string(replay_front_fill);
+        metadata += ",\"replay_strokes_side_fill\":" + std::to_string(replay_side_fill);
+        metadata += ",\"replay_strokes_back_fill\":" + std::to_string(replay_back_fill);
+        metadata += ",\"planner_strokes_paint\":" + std::to_string(replay_paint);
+        metadata += ",\"planner_strokes_fill\":" + std::to_string(replay_fill);
         if (strokes.empty())
         {
             return response_json(false,
                                  "mesh_replay_empty",
                                  0,
                                  1,
-                                 "mesh-first planner produced no strokes for enabled regions",
+                                 "mesh-first planner produced no strokes for active regions",
                                  metadata + ",\"replay_blocked\":true");
         }
         const auto& first_stroke = strokes.front();
@@ -8906,6 +9246,8 @@ namespace
         metadata += texture_sync_observer_metadata("texture_sync_observer_before", texture_sync_observer_snapshot());
 
         MeshFirstChannelBytes albedo_before_bytes{};
+        MeshFirstChannelBytes metallic_before_bytes{};
+        MeshFirstChannelBytes roughness_before_bytes{};
         MeshFirstChannelChecksum albedo_before{};
         MeshFirstPreviewSnapshot existing_preview_snapshot{};
         bool preview_snapshot_reused = false;
@@ -8914,11 +9256,19 @@ namespace
         {
             existing_preview_snapshot = mesh_first_preview_snapshot_copy();
             if (existing_preview_snapshot.available && !existing_preview_snapshot.albedo_bytes.empty() &&
+                !existing_preview_snapshot.metallic_bytes.empty() &&
+                !existing_preview_snapshot.roughness_bytes.empty() &&
                 existing_preview_snapshot.component == ctx.component)
             {
                 albedo_before_bytes.ok = true;
                 albedo_before_bytes.bytes = existing_preview_snapshot.albedo_bytes;
                 albedo_before_bytes.failure = "ok";
+                metallic_before_bytes.ok = true;
+                metallic_before_bytes.bytes = existing_preview_snapshot.metallic_bytes;
+                metallic_before_bytes.failure = "ok";
+                roughness_before_bytes.ok = true;
+                roughness_before_bytes.bytes = existing_preview_snapshot.roughness_bytes;
+                roughness_before_bytes.failure = "ok";
                 preview_snapshot_reused = true;
             }
             else
@@ -8926,22 +9276,36 @@ namespace
                 preview_snapshot_component_mismatch =
                     existing_preview_snapshot.available && existing_preview_snapshot.component != ctx.component;
                 albedo_before_bytes = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo);
+                metallic_before_bytes = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Metallic);
+                roughness_before_bytes = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Roughness);
             }
         }
-        if (preview_only && albedo_before_bytes.ok)
+        if (preview_only && albedo_before_bytes.ok && metallic_before_bytes.ok && roughness_before_bytes.ok)
         {
             albedo_before.ok = true;
             albedo_before.bytes = static_cast<int>(albedo_before_bytes.bytes.size());
             albedo_before.hash = mesh_first_hash_channel_bytes(albedo_before_bytes.bytes);
+            albedo_before.hash ^= mesh_first_hash_channel_bytes(metallic_before_bytes.bytes);
+            albedo_before.hash *= 1099511628211ULL;
+            albedo_before.hash ^= mesh_first_hash_channel_bytes(roughness_before_bytes.bytes);
+            albedo_before.hash *= 1099511628211ULL;
             albedo_before.failure.clear();
         }
         else
         {
-            albedo_before.failure = preview_only ? albedo_before_bytes.failure : "skipped_for_server_stroke_stream";
+            albedo_before.failure = preview_only
+                                        ? ("albedo:" + albedo_before_bytes.failure +
+                                           ";metallic:" + metallic_before_bytes.failure +
+                                           ";roughness:" + roughness_before_bytes.failure)
+                                        : "skipped_for_server_stroke_stream";
         }
         metadata += ",\"albedo_export_before_ok\":" + std::string(json_bool(albedo_before.ok));
         metadata += ",\"albedo_export_before_bytes\":" + std::to_string(albedo_before.bytes);
         metadata += ",\"albedo_export_before_hash\":\"" + std::to_string(albedo_before.hash) + "\"";
+        metadata += ",\"metallic_export_before_ok\":" + std::string(json_bool(metallic_before_bytes.ok));
+        metadata += ",\"metallic_export_before_bytes\":" + std::to_string(metallic_before_bytes.bytes.size());
+        metadata += ",\"roughness_export_before_ok\":" + std::string(json_bool(roughness_before_bytes.ok));
+        metadata += ",\"roughness_export_before_bytes\":" + std::to_string(roughness_before_bytes.bytes.size());
         metadata += ",\"preview_snapshot_available_before\":" + std::string(json_bool(existing_preview_snapshot.available));
         metadata += ",\"preview_snapshot_reused\":" + std::string(json_bool(preview_snapshot_reused));
         metadata += ",\"preview_snapshot_component_mismatch_before\":" + std::string(json_bool(preview_snapshot_component_mismatch));
@@ -8958,22 +9322,28 @@ namespace
         {
             const auto preview_started = std::chrono::steady_clock::now();
             write_bridge_progress("mesh_local_texture_import",
-                                  "Importing local preview texture",
+                                  "Importing local preview material texture",
                                   0,
                                   static_cast<int>(strokes.size()),
                                   0.0,
                                   "\"phase\":\"local_texture_import\",\"preview_only\":true,\"terminal\":false,\"result\":\"running\"");
             const auto* base_bytes = albedo_before_bytes.ok ? &albedo_before_bytes.bytes : nullptr;
-            const auto result = mesh_first_apply_local_albedo_import_preview(ref,
-                                                                             ctx.component,
-                                                                             strokes,
-                                                                             active_texture_size,
-                                                                             base_bytes);
-            if (result.ok && albedo_before_bytes.ok)
+            const auto* base_metallic_bytes = metallic_before_bytes.ok ? &metallic_before_bytes.bytes : nullptr;
+            const auto* base_roughness_bytes = roughness_before_bytes.ok ? &roughness_before_bytes.bytes : nullptr;
+            const auto result = mesh_first_apply_local_material_import_preview(ref,
+                                                                               ctx.component,
+                                                                               strokes,
+                                                                               active_texture_size,
+                                                                               base_bytes,
+                                                                               base_metallic_bytes,
+                                                                               base_roughness_bytes);
+            if (result.ok && albedo_before_bytes.ok && metallic_before_bytes.ok && roughness_before_bytes.ok)
             {
                 mesh_first_store_preview_snapshot(ctx.component,
                                                   active_texture_size,
-                                                  albedo_before_bytes.bytes);
+                                                  albedo_before_bytes.bytes,
+                                                  metallic_before_bytes.bytes,
+                                                  roughness_before_bytes.bytes);
             }
             const double preview_elapsed_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - preview_started).count();
@@ -8993,12 +9363,15 @@ namespace
             metadata += ",\"local_texture_import_preview_hash\":\"" + std::to_string(result.preview_hash) + "\"";
             metadata += ",\"local_texture_import_elapsed_ms\":" + std::to_string(result.elapsed_ms);
             metadata += ",\"local_texture_import_failure\":\"" + json_escape(result.failure) + "\"";
-            metadata += ",\"unpreview_snapshot_stored\":" + std::string(json_bool(result.ok && albedo_before_bytes.ok));
+            metadata += ",\"unpreview_snapshot_stored\":" + std::string(json_bool(result.ok &&
+                                                                                  albedo_before_bytes.ok &&
+                                                                                  metallic_before_bytes.ok &&
+                                                                                  roughness_before_bytes.ok));
             metadata += ",\"total_replay_elapsed_ms\":" + std::to_string(preview_elapsed_ms);
             metadata += ",\"paint_elapsed_ms\":" + std::to_string(preview_elapsed_ms);
             metadata += mesh_first_replication_snapshot_metadata("mesh_rep_before", replication_before);
             write_bridge_progress(result.ok ? "mesh_preview_done" : "mesh_preview_failed",
-                                  result.ok ? "local preview texture imported" : "local preview texture import failed",
+                                  result.ok ? "local preview material texture imported" : "local preview material texture import failed",
                                   result.ok ? static_cast<int>(strokes.size()) : result.strokes_painted,
                                   static_cast<int>(strokes.size()),
                                   preview_elapsed_ms,
@@ -9008,7 +9381,7 @@ namespace
                                  result.ok ? "mesh_preview_done" : "mesh_preview_failed",
                                  result.ok ? static_cast<int>(strokes.size()) : result.strokes_painted,
                                  result.ok ? 0 : 1,
-                                 result.ok ? "local preview texture imported" : "local preview texture import failed: " + result.failure,
+                                 result.ok ? "local preview material texture imported" : "local preview material texture import failed: " + result.failure,
                                  metadata);
         }
 
@@ -9629,7 +10002,7 @@ namespace
             }
             job->local_texture_import_started = true;
             write_mesh_progress("mesh_local_texture_import",
-                                "Importing local albedo preview texture",
+                                "Importing local material preview texture",
                                 job->server_strokes_sent,
                                 static_cast<int>(job->strokes.size()),
                                 MeshFirstBatchPhase::LocalTextureImport,
@@ -9643,11 +10016,11 @@ namespace
                 begin_server_texture_sync();
                 return;
             }
-            const auto result = mesh_first_apply_local_albedo_import_preview(ref,
-                                                                             job->component,
-                                                                             job->strokes,
-                                                                             job->texture_size,
-                                                                             &job->albedo_before_bytes);
+            const auto result = mesh_first_apply_local_material_import_preview(ref,
+                                                                               job->component,
+                                                                               job->strokes,
+                                                                               job->texture_size,
+                                                                               &job->albedo_before_bytes);
             job->albedo_before_bytes.clear();
             job->albedo_before_bytes.shrink_to_fit();
             job->local_texture_import_ok = result.ok;

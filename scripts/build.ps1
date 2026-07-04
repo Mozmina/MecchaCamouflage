@@ -28,66 +28,6 @@ function Resolve-ProjectVersion {
     return "unversioned"
 }
 
-$Version = Resolve-ProjectVersion -Requested $Version -Root $RuntimeRoot
-Write-Host "Build version: $Version"
-
-if (-not $OutDir) {
-    $OutDir = Join-Path $RuntimeRoot ".build\bin"
-}
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$ObjDir = Join-Path $RuntimeRoot ".build\obj"
-New-Item -ItemType Directory -Force -Path $ObjDir | Out-Null
-
-$BridgeSource = Join-Path $RuntimeRoot "runtime\src\bridge.cpp"
-$InjectorSource = Join-Path $RuntimeRoot "runtime\src\injector.cpp"
-$ControllerSources = @(
-    (Join-Path $RuntimeRoot "runtime\src\controller.cpp"),
-    (Join-Path $RuntimeRoot "runtime\src\controller_settings.cpp"),
-    (Join-Path $RuntimeRoot "runtime\src\controller_events.cpp"),
-    (Join-Path $RuntimeRoot "runtime\src\controller_hotkeys.cpp"),
-    (Join-Path $RuntimeRoot "runtime\src\controller_ui.cpp")
-)
-$ImguiRoot = Join-Path $RuntimeRoot "third_party\imgui"
-$ImguiBackendRoot = Join-Path $ImguiRoot "backends"
-$IconSource = Join-Path $RuntimeRoot "assets\icon.ico"
-$IconPngSource = Join-Path $RuntimeRoot "assets\icon.png"
-$MeshProfilesSourceDir = Join-Path $RuntimeRoot "assets\mesh-profiles"
-$MeshProfileResourceSource = Join-Path $MeshProfilesSourceDir "paintman.mesh-profile-v2.json"
-$PrimaryFontArchive = Join-Path $RuntimeRoot "assets\fonts\arial.zip"
-$FallbackFontArchive = Join-Path $RuntimeRoot "assets\fonts\helvetica-255.zip"
-$FontExtractDir = Join-Path $ObjDir "fonts"
-$FontRegularPath = Join-Path $FontExtractDir "App-Regular.ttf"
-$FontSemiBoldPath = Join-Path $FontExtractDir "App-SemiBold.ttf"
-$FontBoldPath = Join-Path $FontExtractDir "App-Bold.ttf"
-$ImguiSources = @(
-    (Join-Path $ImguiRoot "imgui.cpp"),
-    (Join-Path $ImguiRoot "imgui_draw.cpp"),
-    (Join-Path $ImguiRoot "imgui_tables.cpp"),
-    (Join-Path $ImguiRoot "imgui_widgets.cpp"),
-    (Join-Path $ImguiBackendRoot "imgui_impl_win32.cpp"),
-    (Join-Path $ImguiBackendRoot "imgui_impl_dx11.cpp")
-)
-foreach ($source in @($BridgeSource, $InjectorSource) + $ControllerSources + $ImguiSources) {
-    if (-not (Test-Path $source)) {
-        throw "Source not found: $source"
-    }
-}
-if (-not (Test-Path $IconSource)) {
-    throw "Application icon not found: $IconSource"
-}
-if (-not (Test-Path $IconPngSource)) {
-    throw "Application icon PNG not found: $IconPngSource"
-}
-if (-not (Test-Path $MeshProfilesSourceDir -PathType Container)) {
-    throw "Mesh profile asset directory not found: $MeshProfilesSourceDir"
-}
-if (-not (Test-Path $MeshProfileResourceSource -PathType Leaf)) {
-    throw "Required mesh profile asset not found: $MeshProfileResourceSource"
-}
-if (-not (Test-Path $PrimaryFontArchive) -and -not (Test-Path $FallbackFontArchive)) {
-    throw "Application font archive not found. Expected $PrimaryFontArchive or $FallbackFontArchive"
-}
-
 function Quote-CmdArg([string]$Value) {
     if ($Value -match '^[A-Za-z0-9_./:=+\-\\]+$') {
         return $Value
@@ -132,63 +72,77 @@ function Get-ExeBaseName {
     return $candidate
 }
 
-function Convert-ToCStringDefineValue {
-    param([string]$Value)
-    return (($Value -replace '\\', '\\') -replace '"', '\"')
-}
-
-function Extract-ZipEntry {
-    param(
-        [Parameter(Mandatory = $true)]$Zip,
-        [Parameter(Mandatory = $true)][string]$EntryName,
-        [Parameter(Mandatory = $true)][string]$OutPath
-    )
-    $Entry = $Zip.Entries | Where-Object { $_.FullName -ieq $EntryName } | Select-Object -First 1
-    if (-not $Entry) { throw "Font entry not found in archive: $EntryName" }
-    if (Test-Path $OutPath) { Remove-Item -Force $OutPath }
-    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($Entry, $OutPath)
-}
-
-function Test-ZipEntry {
-    param(
-        [Parameter(Mandatory = $true)]$Zip,
-        [Parameter(Mandatory = $true)][string]$EntryName
-    )
-    return [bool]($Zip.Entries | Where-Object { $_.FullName -ieq $EntryName } | Select-Object -First 1)
-}
-
-function Select-AppFont {
-    param([Parameter(Mandatory = $true)]$Candidates)
-    foreach ($Candidate in $Candidates) {
-        if (-not (Test-Path $Candidate.Archive)) { continue }
-        $Zip = [System.IO.Compression.ZipFile]::OpenRead($Candidate.Archive)
-        try {
-            if ((Test-ZipEntry -Zip $Zip -EntryName $Candidate.Regular) -and
-                (Test-ZipEntry -Zip $Zip -EntryName $Candidate.SemiBold) -and
-                (Test-ZipEntry -Zip $Zip -EntryName $Candidate.Bold)) {
-                return @{
-                    Name = $Candidate.Name
-                    Archive = $Candidate.Archive
-                    Regular = $Candidate.Regular
-                    SemiBold = $Candidate.SemiBold
-                    Bold = $Candidate.Bold
-                }
-            }
-        } finally {
-            $Zip.Dispose()
-        }
+function Invoke-DotNet {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    & dotnet @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
     }
-    throw "No usable application font archive found."
 }
 
+function Clear-DirectoryContents {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    $full = (Resolve-Path $Path).Path.TrimEnd("\", "/")
+    $root = [System.IO.Path]::GetPathRoot($full).TrimEnd("\", "/")
+    if ($full -eq $root) {
+        throw "Refusing to clear filesystem root: $full"
+    }
+    Get-ChildItem -Force -LiteralPath $full | Remove-Item -Recurse -Force
+}
+
+$Version = Resolve-ProjectVersion -Requested $Version -Root $RuntimeRoot
 $ExeName = Get-ExeBaseName -Name $ExeName
+Write-Host "Build version: $Version"
+
+if (-not $OutDir) {
+    $OutDir = Join-Path $RuntimeRoot ".build\bin"
+}
+$OutDir = [System.IO.Path]::GetFullPath($OutDir)
+$ObjDir = Join-Path $RuntimeRoot ".build\obj"
+$NativeOutDir = Join-Path $OutDir "native"
+$MeshProfilesOutDir = Join-Path $OutDir "mesh-profiles"
+
+$BridgeSource = Join-Path $RuntimeRoot "runtime\src\bridge.cpp"
+$InjectorSource = Join-Path $RuntimeRoot "runtime\src\injector.cpp"
+$WpfProject = Join-Path $RuntimeRoot "runtime\csharp\MecchaCamouflage.Wpf\MecchaCamouflage.Wpf.csproj"
+$TestsProject = Join-Path $RuntimeRoot "runtime\csharp\MecchaCamouflage.Tests\MecchaCamouflage.Tests.csproj"
+$MeshProfilesSourceDir = Join-Path $RuntimeRoot "assets\mesh-profiles"
+
+foreach ($path in @($BridgeSource, $InjectorSource, $WpfProject, $TestsProject)) {
+    if (-not (Test-Path $path -PathType Leaf)) {
+        throw "Required source not found: $path"
+    }
+}
+if (-not (Test-Path $MeshProfilesSourceDir -PathType Container)) {
+    throw "Mesh profile asset directory not found: $MeshProfilesSourceDir"
+}
+
+Clear-DirectoryContents -Path $OutDir
+New-Item -ItemType Directory -Force -Path $ObjDir | Out-Null
+New-Item -ItemType Directory -Force -Path $NativeOutDir | Out-Null
 
 Push-Location $RuntimeRoot
 try {
-    $BridgeOutput = Join-Path $OutDir "runtime-bridge.dll"
-    $InjectorOutput = Join-Path $OutDir "runtime-injector.exe"
-    $ControllerOutput = Join-Path $OutDir "$ExeName.exe"
+    Invoke-DotNet -Arguments @("run", "--project", $TestsProject, "-c", "Release")
+    Invoke-DotNet -Arguments @(
+        "publish", $WpfProject,
+        "-c", "Release",
+        "-r", "win-x64",
+        "--self-contained", "true",
+        "-o", $OutDir,
+        "/p:PublishSingleFile=false",
+        "/p:MecchaAppVersion=$Version"
+    )
 
+    $DefaultControllerOutput = Join-Path $OutDir "meccha-camouflage.exe"
+    $ControllerOutput = Join-Path $OutDir "$ExeName.exe"
+    if ($DefaultControllerOutput -ne $ControllerOutput -and (Test-Path $DefaultControllerOutput -PathType Leaf)) {
+        Move-Item -Force $DefaultControllerOutput $ControllerOutput
+    }
+
+    $BridgeOutput = Join-Path $NativeOutDir "runtime-bridge.dll"
+    $InjectorOutput = Join-Path $NativeOutDir "runtime-injector.exe"
     Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs @(
         "/nologo", "/std:c++17", "/EHsc", "/O2", "/LD", $BridgeSource,
         "/Fo:$(Join-Path $ObjDir 'bridge.obj')",
@@ -202,75 +156,22 @@ try {
         "/Fe:$InjectorOutput"
     )
 
-    if (-not (Test-Path $BridgeOutput)) { throw "Bridge DLL was not produced: $BridgeOutput" }
-    $MeshProfilesOutputDir = Join-Path $OutDir "mesh-profiles"
-    Remove-Item -Recurse -Force $MeshProfilesOutputDir -ErrorAction SilentlyContinue
+    if (-not (Test-Path $ControllerOutput -PathType Leaf)) {
+        throw "WPF controller EXE was not produced: $ControllerOutput"
+    }
+    if (-not (Test-Path $BridgeOutput -PathType Leaf)) {
+        throw "Bridge DLL was not produced: $BridgeOutput"
+    }
+    if (-not (Test-Path $InjectorOutput -PathType Leaf)) {
+        throw "Injector EXE was not produced: $InjectorOutput"
+    }
+
+    New-Item -ItemType Directory -Force -Path $MeshProfilesOutDir | Out-Null
     $MeshProfiles = @(Get-ChildItem -Path $MeshProfilesSourceDir -Filter "*.json" -File)
     if ($MeshProfiles.Count -le 0) {
         throw "No mesh profile JSON assets found in: $MeshProfilesSourceDir"
     }
-    New-Item -ItemType Directory -Force -Path $MeshProfilesOutputDir | Out-Null
-    Copy-Item -Force -Path (Join-Path $MeshProfilesSourceDir "*.json") -Destination $MeshProfilesOutputDir
-
-    $ResourceRc = Join-Path $ObjDir "controller.rc"
-    $ResourceRes = Join-Path $ObjDir "controller.res"
-    $BridgeResourcePath = ((Resolve-Path $BridgeOutput).Path -replace '\\', '\\')
-    Add-Type -AssemblyName System.IO.Compression
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    New-Item -ItemType Directory -Force -Path $FontExtractDir | Out-Null
-    $FontChoice = Select-AppFont -Candidates @(
-        @{ Name = "Arial"; Archive = $PrimaryFontArchive; Regular = "ARIAL.TTF"; SemiBold = "ARIALBD.TTF"; Bold = "ARIALBD.TTF" },
-        @{ Name = "Helvetica-255"; Archive = $FallbackFontArchive; Regular = "Helvetica.ttf"; SemiBold = "Helvetica-Bold.ttf"; Bold = "Helvetica-Bold.ttf" }
-    )
-    Write-Host "Using application font: $($FontChoice.Name)"
-    $FontZip = [System.IO.Compression.ZipFile]::OpenRead($FontChoice.Archive)
-    try {
-        Extract-ZipEntry -Zip $FontZip -EntryName $FontChoice.Regular -OutPath $FontRegularPath
-        Extract-ZipEntry -Zip $FontZip -EntryName $FontChoice.SemiBold -OutPath $FontSemiBoldPath
-        Extract-ZipEntry -Zip $FontZip -EntryName $FontChoice.Bold -OutPath $FontBoldPath
-    } finally {
-        $FontZip.Dispose()
-    }
-$IconResourcePath = ((Resolve-Path $IconSource).Path -replace '\\', '\\')
-$IconPngResourcePath = ((Resolve-Path $IconPngSource).Path -replace '\\', '\\')
-$MeshProfileResourcePath = ((Resolve-Path $MeshProfileResourceSource).Path -replace '\\', '\\')
-$FontRegularResourcePath = ((Resolve-Path $FontRegularPath).Path -replace '\\', '\\')
-$FontSemiBoldResourcePath = ((Resolve-Path $FontSemiBoldPath).Path -replace '\\', '\\')
-$FontBoldResourcePath = ((Resolve-Path $FontBoldPath).Path -replace '\\', '\\')
-Set-Content -Encoding ASCII -Path $ResourceRc -Value @"
-101 RCDATA "$BridgeResourcePath"
-201 ICON "$IconResourcePath"
-202 RCDATA "$FontRegularResourcePath"
-203 RCDATA "$FontSemiBoldResourcePath"
-204 RCDATA "$FontBoldResourcePath"
-205 RCDATA "$IconPngResourcePath"
-301 RCDATA "$MeshProfileResourcePath"
-"@
-    Invoke-VsToolCommand -ToolName "rc.exe" -ToolArgs @("/nologo", "/fo", $ResourceRes, $ResourceRc)
-
-    $ControllerToolArgs = @(
-        "/nologo", "/std:c++17", "/EHsc", "/O2",
-        "/DMECCHA_APP_VERSION=`"$(Convert-ToCStringDefineValue $Version)`"",
-        "/I$ImguiRoot", "/I$ImguiBackendRoot",
-        $ResourceRes
-    ) + $ControllerSources + $ImguiSources + @(
-        "/Fo:$ObjDir\",
-        "/Fe:$ControllerOutput",
-        "Ws2_32.lib",
-        "User32.lib",
-        "Gdi32.lib",
-        "D3d11.lib",
-        "Shell32.lib",
-        "Dwmapi.lib",
-        "Windowscodecs.lib",
-        "Ole32.lib",
-        "/link",
-        "/SUBSYSTEM:WINDOWS"
-    )
-    Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs $ControllerToolArgs
-
-    if (-not (Test-Path $ControllerOutput)) { throw "Controller EXE was not produced: $ControllerOutput" }
-    if (-not (Test-Path $InjectorOutput)) { throw "Injector EXE was not produced: $InjectorOutput" }
+    Copy-Item -Force -Path (Join-Path $MeshProfilesSourceDir "*.json") -Destination $MeshProfilesOutDir
 }
 finally {
     Pop-Location
@@ -278,5 +179,5 @@ finally {
 
 Write-Host "Built runtime artifacts:"
 Write-Host "  $(Join-Path $OutDir "$ExeName.exe")"
-Write-Host "  $(Join-Path $OutDir 'runtime-bridge.dll')"
-Write-Host "  $(Join-Path $OutDir 'runtime-injector.exe')"
+Write-Host "  $(Join-Path $NativeOutDir 'runtime-bridge.dll')"
+Write-Host "  $(Join-Path $NativeOutDir 'runtime-injector.exe')"

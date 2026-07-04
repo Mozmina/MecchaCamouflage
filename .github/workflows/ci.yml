@@ -20,6 +20,11 @@ jobs:
         with:
           arch: x64
 
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
       - name: Build runtime
         shell: pwsh
         run: .\scripts\build.ps1
@@ -28,7 +33,9 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path ".build/bin/meccha-camouflage.exe")) { throw "runtime exe missing" }
-          if (-not (Test-Path ".build/bin/runtime-bridge.dll")) { throw "bridge dll missing" }
+          if (-not (Test-Path ".build/bin/native/runtime-bridge.dll")) { throw "bridge dll missing" }
+          if (-not (Test-Path ".build/bin/native/runtime-injector.exe")) { throw "injector exe missing" }
+          if (-not (Test-Path ".build/bin/mesh-profiles/paintman.mesh-profile-v2.json")) { throw "mesh profile missing" }
 
       - name: Package dry run
         shell: pwsh
@@ -42,6 +49,10 @@ jobs:
           try {
             $profile = $zip.Entries | Where-Object { $_.FullName -eq "mesh-profiles/paintman.mesh-profile-v2.json" } | Select-Object -First 1
             if (-not $profile) { throw "mesh profile missing from package" }
+            $bridge = $zip.Entries | Where-Object { $_.FullName -eq "native/runtime-bridge.dll" } | Select-Object -First 1
+            if (-not $bridge) { throw "bridge missing from package" }
+            $injector = $zip.Entries | Where-Object { $_.FullName -eq "native/runtime-injector.exe" } | Select-Object -First 1
+            if (-not $injector) { throw "injector missing from package" }
           } finally {
             $zip.Dispose()
           }

@@ -27,6 +27,8 @@
 *.usmap
 
 # Research tool artifacts
+/runtime/csharp/**/bin/
+/runtime/csharp/**/obj/
 /tools/**/bin/
 /tools/**/obj/
 /third_party/UnrealMappingsDumper/**/x64/

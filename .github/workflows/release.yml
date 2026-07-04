@@ -22,19 +22,28 @@ jobs:
         with:
           arch: x64
 
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
       - name: Build runtime
         shell: pwsh
         run: .\scripts\build.ps1
+
+      - name: Package runtime
+        shell: pwsh
+        run: .\scripts\release.ps1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: meccha-camouflage
-          path: .build/bin/meccha-camouflage.exe
+          path: .build/package/meccha-camouflage-*.zip
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: .build/bin/meccha-camouflage.exe
+          files: .build/package/meccha-camouflage-*.zip
