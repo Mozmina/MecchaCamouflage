@@ -29,6 +29,7 @@ public sealed record PaintSnapshot(
     double BrushSizeTexels,
     double CoverageStepTexels,
     int StrokeDelayMs,
+    int ServerBatchLimit,
     bool AutoMaterial,
     double Metallic,
     double Roughness,

@@ -104,8 +104,8 @@ public sealed class SettingsStore
         settings.Paint.CoverageStepTexels = settings.Paint.StrokeSizeTexels;
         settings.Paint.SideSourceMaxUv = Math.Clamp(settings.Paint.SideSourceMaxUv, 0.001, 0.50);
         settings.Paint.FrontBackSourceMaxUv = Math.Clamp(settings.Paint.FrontBackSourceMaxUv, 0.001, 2.00);
-        settings.Paint.ServerBatchLimit = 1;
-        settings.Paint.ServerBatchDelayMs = Math.Clamp(settings.Paint.ServerBatchDelayMs, 1, 1000);
+        settings.Paint.ServerBatchLimit = Math.Clamp(settings.Paint.ServerBatchLimit, 1, 100);
+        settings.Paint.ServerBatchDelayMs = Math.Clamp(settings.Paint.ServerBatchDelayMs, 1, 500);
         settings.Paint.Metallic = Math.Clamp(settings.Paint.Metallic, 0.0, 1.0);
         settings.Paint.Roughness = Math.Clamp(settings.Paint.Roughness, 0.0, 1.0);
         settings.Paint.FillMetallic = Math.Clamp(settings.Paint.FillMetallic, 0.0, 1.0);

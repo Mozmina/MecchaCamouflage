@@ -49,10 +49,7 @@ public sealed class MainForm : Form
 
         Shown += async (_, _) =>
         {
-            ApplyWindowSettings();
             await InitializeWebViewAsync();
-            ApplyWindowSettings();
-            BeginInvoke(new Action(ApplyWindowSettings));
         };
         FormClosing += (_, _) =>
         {
@@ -99,6 +96,7 @@ public sealed class MainForm : Form
             throw new DirectoryNotFoundException("Packaged web assets are missing: " + webRoot);
 
         webView.CoreWebView2.WebMessageReceived += async (_, args) => await HandleWebMessageAsync(args);
+        webView.CoreWebView2.NavigationCompleted += (_, _) => ApplyWindowSettings();
         webView.CoreWebView2.NavigationStarting += (_, args) => HandleNavigationStarting(args);
         webView.CoreWebView2.NewWindowRequested += (_, args) => HandleNewWindowRequested(args);
         webView.CoreWebView2.SetVirtualHostNameToFolderMapping(

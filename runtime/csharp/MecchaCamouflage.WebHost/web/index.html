@@ -23,13 +23,23 @@
               <label class="field">
                 <span data-i18n="brush.size">Brush size</span>
                 <div class="range-row">
-                  <input id="brush-size" class="setting-control" type="range" min="1" max="12" step="0.5">
-                  <input id="brush-size-number" class="setting-control range-number" type="number" min="1" max="12" step="0.5">
+                  <input id="brush-size" class="setting-control" disabled type="range" min="1" max="12" step="0.5">
+                  <input id="brush-size-number" class="setting-control range-number" disabled type="number" min="1" max="12" step="0.5">
                 </div>
               </label>
               <label class="field">
-                <span data-i18n="stroke.delay">Delay (ms)</span>
-                <input id="stroke-delay" class="setting-control mono-input" type="number" min="1" max="1000" step="1">
+                <span data-i18n="batch.delay">Batch delay (ms)</span>
+                <div class="range-row">
+                  <input id="stroke-delay" class="setting-control" disabled type="range" min="1" max="500" step="1">
+                  <input id="stroke-delay-number" class="setting-control range-number" disabled type="number" min="1" max="500" step="1">
+                </div>
+              </label>
+              <label class="field app-wide">
+                <span data-i18n="batch.size">Batch size</span>
+                <div class="range-row">
+                  <input id="batch-size" class="setting-control" disabled type="range" min="1" max="100" step="1">
+                  <input id="batch-size-number" class="setting-control range-number" disabled type="number" min="1" max="100" step="1">
+                </div>
               </label>
             </div>
           </div>
@@ -40,21 +50,21 @@
               <label class="field app-wide">
                 <span data-i18n="auto.material">Auto Detect</span>
                 <div class="checkbox-row">
-                  <input id="auto-material" class="setting-control" type="checkbox">
+                  <input id="auto-material" class="setting-control" disabled type="checkbox">
                 </div>
               </label>
               <label class="field">
                 <span data-i18n="metallic">Metallic</span>
                 <div class="range-row">
-                  <input id="metallic" class="setting-control" type="range" min="0" max="1" step="0.01">
-                  <input id="metallic-number" class="setting-control range-number" type="number" min="0" max="1" step="0.01">
+                  <input id="metallic" class="setting-control" disabled type="range" min="0" max="1" step="0.01">
+                  <input id="metallic-number" class="setting-control range-number" disabled type="number" min="0" max="1" step="0.01">
                 </div>
               </label>
               <label class="field">
                 <span data-i18n="roughness">Roughness</span>
                 <div class="range-row">
-                  <input id="roughness" class="setting-control" type="range" min="0" max="1" step="0.01">
-                  <input id="roughness-number" class="setting-control range-number" type="number" min="0" max="1" step="0.01">
+                  <input id="roughness" class="setting-control" disabled type="range" min="0" max="1" step="0.01">
+                  <input id="roughness-number" class="setting-control range-number" disabled type="number" min="0" max="1" step="0.01">
                 </div>
               </label>
             </div>
@@ -78,22 +88,22 @@
               <label class="field app-wide">
                 <span data-i18n="fill.color">Color</span>
                 <div class="color-row">
-                  <input id="fill-color-picker" class="setting-control color-picker" type="color">
-                  <input id="fill-color" class="setting-control mono-input" type="text" spellcheck="false" placeholder="#FFFFFF">
+                  <input id="fill-color-picker" class="setting-control color-picker" disabled type="color">
+                  <input id="fill-color" class="setting-control mono-input" disabled type="text" spellcheck="false" placeholder="#FFFFFF">
                 </div>
               </label>
               <label class="field">
                 <span data-i18n="metallic">Metallic</span>
                 <div class="range-row">
-                  <input id="fill-metallic" class="setting-control" type="range" min="0" max="1" step="0.01">
-                  <input id="fill-metallic-number" class="setting-control range-number" type="number" min="0" max="1" step="0.01">
+                  <input id="fill-metallic" class="setting-control" disabled type="range" min="0" max="1" step="0.01">
+                  <input id="fill-metallic-number" class="setting-control range-number" disabled type="number" min="0" max="1" step="0.01">
                 </div>
               </label>
               <label class="field">
                 <span data-i18n="roughness">Roughness</span>
                 <div class="range-row">
-                  <input id="fill-roughness" class="setting-control" type="range" min="0" max="1" step="0.01">
-                  <input id="fill-roughness-number" class="setting-control range-number" type="number" min="0" max="1" step="0.01">
+                  <input id="fill-roughness" class="setting-control" disabled type="range" min="0" max="1" step="0.01">
+                  <input id="fill-roughness-number" class="setting-control range-number" disabled type="number" min="0" max="1" step="0.01">
                 </div>
               </label>
             </div>
@@ -105,49 +115,49 @@
               <label class="field app-wide">
                 <span data-i18n="language">Language</span>
                 <div class="select-wrap">
-                  <select id="language" class="setting-control mono-input"></select>
+                  <select id="language" class="setting-control mono-input" disabled></select>
                 </div>
               </label>
               <label class="field app-wide">
                 <span data-i18n="theme.color">Theme color</span>
                 <div class="color-row">
-                  <input id="theme-color-picker" class="setting-control color-picker" type="color">
-                  <input id="theme-color" class="setting-control mono-input" type="text" spellcheck="false" placeholder="#FFFFFF">
+                  <input id="theme-color-picker" class="setting-control color-picker" disabled type="color">
+                  <input id="theme-color" class="setting-control mono-input" disabled type="text" spellcheck="false" placeholder="#FFFFFF">
                 </div>
               </label>
               <label class="field">
                 <span data-i18n="always.on.top">Always on top</span>
                 <div class="checkbox-row">
-                  <input id="always-on-top" class="setting-control" type="checkbox">
+                  <input id="always-on-top" class="setting-control" disabled type="checkbox">
                 </div>
               </label>
               <label class="field">
                 <span data-i18n="opacity">Opacity (%)</span>
                 <div class="range-row">
-                  <input id="opacity" class="setting-control" type="range" min="35" max="100" step="1">
-                  <input id="opacity-number" class="setting-control range-number" type="number" min="35" max="100" step="1">
+                  <input id="opacity" class="setting-control" disabled type="range" min="35" max="100" step="1">
+                  <input id="opacity-number" class="setting-control range-number" disabled type="number" min="35" max="100" step="1">
                 </div>
               </label>
               <div class="hotkey-list app-wide">
                 <div class="hotkey-row">
                   <span data-i18n="start.hotkey">Start hotkey</span>
-                  <input id="start-hotkey" class="setting-control mono-input" type="text" readonly>
-                  <button class="record-hotkey" type="button" data-hotkey-key="app.startHotkey" data-hotkey-input="start-hotkey" data-i18n="button.record">Record</button>
+                  <input id="start-hotkey" class="setting-control mono-input" disabled type="text" readonly>
+                  <button class="record-hotkey" type="button" disabled data-hotkey-key="app.startHotkey" data-hotkey-input="start-hotkey" data-i18n="button.record">Record</button>
                 </div>
                 <div class="hotkey-row">
                   <span data-i18n="preview.hotkey">Preview hotkey</span>
-                  <input id="preview-hotkey" class="setting-control mono-input" type="text" readonly>
-                  <button class="record-hotkey" type="button" data-hotkey-key="app.previewHotkey" data-hotkey-input="preview-hotkey" data-i18n="button.record">Record</button>
+                  <input id="preview-hotkey" class="setting-control mono-input" disabled type="text" readonly>
+                  <button class="record-hotkey" type="button" disabled data-hotkey-key="app.previewHotkey" data-hotkey-input="preview-hotkey" data-i18n="button.record">Record</button>
                 </div>
                 <div class="hotkey-row">
                   <span data-i18n="unpreview.hotkey">UnPreview hotkey</span>
-                  <input id="unpreview-hotkey" class="setting-control mono-input" type="text" readonly>
-                  <button class="record-hotkey" type="button" data-hotkey-key="app.unpreviewHotkey" data-hotkey-input="unpreview-hotkey" data-i18n="button.record">Record</button>
+                  <input id="unpreview-hotkey" class="setting-control mono-input" disabled type="text" readonly>
+                  <button class="record-hotkey" type="button" disabled data-hotkey-key="app.unpreviewHotkey" data-hotkey-input="unpreview-hotkey" data-i18n="button.record">Record</button>
                 </div>
                 <div class="hotkey-row">
                   <span data-i18n="stop.hotkey">Stop hotkey</span>
-                  <input id="stop-hotkey" class="setting-control mono-input" type="text" readonly>
-                  <button class="record-hotkey" type="button" data-hotkey-key="app.stopHotkey" data-hotkey-input="stop-hotkey" data-i18n="button.record">Record</button>
+                  <input id="stop-hotkey" class="setting-control mono-input" disabled type="text" readonly>
+                  <button class="record-hotkey" type="button" disabled data-hotkey-key="app.stopHotkey" data-hotkey-input="stop-hotkey" data-i18n="button.record">Record</button>
                 </div>
               </div>
             </div>
@@ -155,10 +165,10 @@
         </div>
 
         <div class="action-bar">
-          <button id="reset-settings" type="button" data-i18n="button.reset">Reset</button>
-          <button id="cancel-edit" type="button" data-i18n="button.cancel">Cancel</button>
+          <button id="reset-settings" type="button" disabled data-i18n="button.reset">Reset</button>
+          <button id="cancel-edit" type="button" disabled data-i18n="button.cancel">Cancel</button>
           <button id="edit-settings" type="button" data-i18n="button.edit">Edit</button>
-          <button id="save-settings" class="primary" type="button" data-i18n="button.save">Save</button>
+          <button id="save-settings" class="primary" type="button" disabled data-i18n="button.save">Save</button>
         </div>
       </section>
     </section>

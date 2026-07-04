@@ -10,6 +10,7 @@ public sealed class HostSession
     [
         "paint.brushSizeTexels",
         "paint.coverageStepTexels",
+        "paint.serverBatchLimit",
         "paint.strokeDelayMs",
         "paint.autoMaterial",
         "paint.metallic",
@@ -111,6 +112,7 @@ public sealed class HostSession
             case "geometry":
                 next.Paint.StrokeSizeTexels = defaults.Paint.StrokeSizeTexels;
                 next.Paint.CoverageStepTexels = defaults.Paint.StrokeSizeTexels;
+                next.Paint.ServerBatchLimit = defaults.Paint.ServerBatchLimit;
                 next.Paint.ServerBatchDelayMs = defaults.Paint.ServerBatchDelayMs;
                 break;
             case "paint.material":
@@ -259,7 +261,7 @@ public sealed class HostSession
             return "Paint is already running.";
         if (lower is "mesh_first_paint_done" ||
             lower.Contains("mesh-first paint completed") ||
-            lower.Contains("sent through serverpaintbatch one stroke at a time"))
+            lower.Contains("sent through serverpaintbatch"))
             return "Paint completed.";
         if (lower.Contains("mesh-first paint cancelled") || lower.Contains("mesh-first paint canceled"))
             return "Paint canceled.";
@@ -323,6 +325,7 @@ public sealed class HostSession
                 paint.StrokeSizeTexels,
                 paint.CoverageStepTexels,
                 paint.ServerBatchDelayMs,
+                paint.ServerBatchLimit,
                 paint.AutoMaterial,
                 paint.Metallic,
                 paint.Roughness,
@@ -349,7 +352,8 @@ public sealed class HostSession
         var map = ResetKeys.ToDictionary(key => key, key => !SettingEquals(settings, defaults, key), StringComparer.OrdinalIgnoreCase);
         var sections = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
         {
-            ["paint.geometry"] = map["paint.brushSizeTexels"] || map["paint.coverageStepTexels"] || map["paint.strokeDelayMs"],
+            ["paint.geometry"] = map["paint.brushSizeTexels"] || map["paint.coverageStepTexels"] ||
+                                  map["paint.serverBatchLimit"] || map["paint.strokeDelayMs"],
             ["paint.material"] = map["paint.autoMaterial"] || map["paint.metallic"] || map["paint.roughness"],
             ["regions"] = map["paint.frontRegionMode"] || map["paint.sideRegionMode"] || map["paint.backRegionMode"],
             ["fill.material"] = map["paint.fillColor"] || map["paint.fillMetallic"] || map["paint.fillRoughness"],
@@ -363,6 +367,7 @@ public sealed class HostSession
     {
         "paint.brushSizeTexels" => Nearly(left.Paint.StrokeSizeTexels, right.Paint.StrokeSizeTexels),
         "paint.coverageStepTexels" => Nearly(left.Paint.CoverageStepTexels, right.Paint.CoverageStepTexels),
+        "paint.serverBatchLimit" => left.Paint.ServerBatchLimit == right.Paint.ServerBatchLimit,
         "paint.strokeDelayMs" => left.Paint.ServerBatchDelayMs == right.Paint.ServerBatchDelayMs,
         "paint.autoMaterial" => left.Paint.AutoMaterial == right.Paint.AutoMaterial,
         "paint.metallic" => Nearly(left.Paint.Metallic, right.Paint.Metallic),
@@ -394,6 +399,7 @@ public sealed class HostSession
                 settings.Paint.CoverageStepTexels = defaults.Paint.StrokeSizeTexels;
                 break;
             case "paint.strokeDelayMs": settings.Paint.ServerBatchDelayMs = defaults.Paint.ServerBatchDelayMs; break;
+            case "paint.serverBatchLimit": settings.Paint.ServerBatchLimit = defaults.Paint.ServerBatchLimit; break;
             case "paint.autoMaterial": settings.Paint.AutoMaterial = defaults.Paint.AutoMaterial; break;
             case "paint.metallic": settings.Paint.Metallic = defaults.Paint.Metallic; break;
             case "paint.roughness": settings.Paint.Roughness = defaults.Paint.Roughness; break;
@@ -425,6 +431,7 @@ public sealed class HostSession
                 settings.Paint.CoverageStepTexels = settings.Paint.StrokeSizeTexels;
                 break;
             case "paint.strokeDelayMs": settings.Paint.ServerBatchDelayMs = value.GetInt32(); break;
+            case "paint.serverBatchLimit": settings.Paint.ServerBatchLimit = value.GetInt32(); break;
             case "paint.autoMaterial": settings.Paint.AutoMaterial = value.GetBoolean(); break;
             case "paint.metallic": settings.Paint.Metallic = value.GetDouble(); break;
             case "paint.roughness": settings.Paint.Roughness = value.GetDouble(); break;

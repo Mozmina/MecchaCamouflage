@@ -40,9 +40,9 @@ namespace
     constexpr std::size_t MaxRequestBytes = 8 * 1024 * 1024;
     constexpr int ProcessEventVtableIndex = 0x4C;
     constexpr UINT PaintDispatchMessage = WM_APP + 0x4D43;
-    constexpr int ServerPaintBatchStrokeLimit = 1;
-    constexpr int ServerPaintBatchStrokeLimitMax = 1;
-    constexpr int ServerPaintBatchDelayMs = 1;
+    constexpr int ServerPaintBatchStrokeLimit = 50;
+    constexpr int ServerPaintBatchStrokeLimitMax = 100;
+    constexpr int ServerPaintBatchDelayMs = 100;
     constexpr int MeshFirstServerBatchMinDelayMs = 1;
     constexpr int MeshFirstFastApplyStrokesPerTick = 0;
     constexpr int MeshFirstFastApplyRenderTargetWritesPerFrame = 0;
@@ -8233,8 +8233,8 @@ namespace
         const bool preview_only = json_bool_field(request, "preview_only", false);
         const bool unpreview_only = json_bool_field(request, "unpreview_only", false);
         const bool research_artifacts = json_bool_field(request, "research_artifacts", false);
-        const double tuning_stroke_size_texels = clamp_range(json_number_field(request, "stroke_size_texels", 9.0), 1.0, 12.0);
-        const double tuning_coverage_step_texels = clamp_range(json_number_field(request, "coverage_step_texels", 9.0), 1.0, 12.0);
+        const double tuning_stroke_size_texels = clamp_range(json_number_field(request, "stroke_size_texels", 6.0), 1.0, 12.0);
+        const double tuning_coverage_step_texels = clamp_range(json_number_field(request, "coverage_step_texels", 6.0), 1.0, 12.0);
         const double tuning_side_source_max_uv = clamp_range(json_number_field(request, "side_source_max_uv", 0.08), 0.001, 0.50);
         const double tuning_front_back_source_max_uv = clamp_range(json_number_field(request, "front_back_source_max_uv", 0.45), 0.001, 2.00);
         const bool tuning_auto_material_properties = json_bool_field(request, "auto_material_properties", true);
@@ -8246,7 +8246,7 @@ namespace
         const double fill_metallic = clamp_range(json_number_field(request, "fill_metallic", 1.0), 0.0, 1.0);
         const double fill_roughness = clamp_range(json_number_field(request, "fill_roughness", 0.0), 0.0, 1.0);
         const int tuning_server_batch_limit = json_int_field(request, "server_batch_limit", ServerPaintBatchStrokeLimit, 1, ServerPaintBatchStrokeLimitMax);
-        const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", ServerPaintBatchDelayMs, 0, 1000);
+        const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", ServerPaintBatchDelayMs, 0, 500);
 
         std::string metadata = "\"route\":\"mesh_first_paint\"";
         const std::string mesh_first_pipeline =
@@ -9092,139 +9092,144 @@ namespace
                    static_cast<std::uint64_t>(v_cell);
         };
         const MeshFirstRegion replay_region_order[]{MeshFirstRegion::Back, MeshFirstRegion::Side, MeshFirstRegion::Front};
+        const MeshFirstRegionMode replay_mode_order[]{MeshFirstRegionMode::Fill, MeshFirstRegionMode::Paint};
+        metadata += ",\"replay_pass_order\":\"fill_then_paint\"";
         metadata += ",\"replay_region_order\":\"back,side,front\"";
-        for (const auto target_region : replay_region_order)
+        for (const auto target_mode : replay_mode_order)
         {
-            const auto region_mode = mesh_first_region_mode_for_sample(target_region,
-                                                                       front_region_mode,
-                                                                       side_region_mode,
-                                                                       back_region_mode);
-            if (region_mode == MeshFirstRegionMode::Skip)
+            for (const auto target_region : replay_region_order)
             {
-                continue;
-            }
-            for (const auto& sample : plan_samples)
-            {
-                if (sample.region != target_region)
+                const auto region_mode = mesh_first_region_mode_for_sample(target_region,
+                                                                           front_region_mode,
+                                                                           side_region_mode,
+                                                                           back_region_mode);
+                if (region_mode == MeshFirstRegionMode::Skip || region_mode != target_mode)
                 {
                     continue;
                 }
-                sdk::FPaintChannelData channel{};
-                const bool fill_mode = region_mode == MeshFirstRegionMode::Fill;
-                if (fill_mode)
+                for (const auto& sample : plan_samples)
                 {
-                    ++replay_fill_candidates;
-                    if (!fill_cells.insert(fill_cell_key(sample)).second)
+                    if (sample.region != target_region)
                     {
-                        ++replay_fill_coarse_skipped;
                         continue;
                     }
-                    channel = sdk_make_channel(sdk_srgb_to_linear_unit(fill_color_r),
-                                               sdk_srgb_to_linear_unit(fill_color_g),
-                                               sdk_srgb_to_linear_unit(fill_color_b),
-                                               fill_metallic,
-                                               fill_roughness,
-                                               sdk::EPaintChannelApplyMode::Override);
-                }
-                else
-                {
-                    double stroke_metallic = tuning_metallic;
-                    double stroke_roughness = tuning_roughness;
-                    if (tuning_auto_material_properties)
+                    sdk::FPaintChannelData channel{};
+                    const bool fill_mode = target_mode == MeshFirstRegionMode::Fill;
+                    if (fill_mode)
                     {
-                        if (material_properties.ok)
+                        ++replay_fill_candidates;
+                        if (!fill_cells.insert(fill_cell_key(sample)).second)
                         {
-                            stroke_metallic = material_properties.metallic;
-                            stroke_roughness = material_properties.roughness;
-                            ++material_properties_auto_samples;
+                            ++replay_fill_coarse_skipped;
+                            continue;
+                        }
+                        channel = sdk_make_channel(sdk_srgb_to_linear_unit(fill_color_r),
+                                                   sdk_srgb_to_linear_unit(fill_color_g),
+                                                   sdk_srgb_to_linear_unit(fill_color_b),
+                                                   fill_metallic,
+                                                   fill_roughness,
+                                                   sdk::EPaintChannelApplyMode::Override);
+                    }
+                    else
+                    {
+                        double stroke_metallic = tuning_metallic;
+                        double stroke_roughness = tuning_roughness;
+                        if (tuning_auto_material_properties)
+                        {
+                            if (material_properties.ok)
+                            {
+                                stroke_metallic = material_properties.metallic;
+                                stroke_roughness = material_properties.roughness;
+                                ++material_properties_auto_samples;
+                            }
+                            else
+                            {
+                                stroke_metallic = clamp01(sample.metallic);
+                                stroke_roughness = clamp01(sample.roughness);
+                                ++material_properties_source_sample_fallbacks;
+                            }
+                        }
+                        channel = sdk_make_channel(sdk_srgb_to_linear_unit(sample.r),
+                                                   sdk_srgb_to_linear_unit(sample.g),
+                                                   sdk_srgb_to_linear_unit(sample.b),
+                                                   stroke_metallic,
+                                                   stroke_roughness,
+                                                   sdk::EPaintChannelApplyMode::Override);
+                    }
+                    const auto& stroke_brush = fill_mode ? fill_brush : brush;
+                    auto stroke = use_mesh_anchors
+                                      ? sdk_make_mesh_anchor_stroke(sample.u,
+                                                                    sample.v,
+                                                                    channel,
+                                                                    stroke_brush,
+                                                                    paint_target_channel,
+                                                                    sample.world_position,
+                                                                    sample.local_position,
+                                                                    sample.triangle_index,
+                                                                    sample.barycentric_a,
+                                                                    sample.barycentric_b,
+                                                                    sample.barycentric_c)
+                                      : sdk_make_uv_stroke(sample.u,
+                                                           sample.v,
+                                                           channel,
+                                                           stroke_brush,
+                                                           paint_target_channel);
+                    if (stroke.bHasWorldPosition)
+                    {
+                        ++replay_world_anchors;
+                    }
+                    if (stroke.bHasLocalPosition)
+                    {
+                        ++replay_local_anchors;
+                    }
+                    if (stroke.bHasSkeletalTriangleAnchor)
+                    {
+                        ++replay_triangle_anchors;
+                    }
+                    strokes.push_back(stroke);
+                    if (fill_mode)
+                    {
+                        ++replay_fill;
+                    }
+                    else
+                    {
+                        ++replay_paint;
+                    }
+                    if (sample.region == MeshFirstRegion::Front)
+                    {
+                        ++replay_front;
+                        if (fill_mode)
+                        {
+                            ++replay_front_fill;
                         }
                         else
                         {
-                            stroke_metallic = clamp01(sample.metallic);
-                            stroke_roughness = clamp01(sample.roughness);
-                            ++material_properties_source_sample_fallbacks;
+                            ++replay_front_paint;
                         }
                     }
-                    channel = sdk_make_channel(sdk_srgb_to_linear_unit(sample.r),
-                                               sdk_srgb_to_linear_unit(sample.g),
-                                               sdk_srgb_to_linear_unit(sample.b),
-                                               stroke_metallic,
-                                               stroke_roughness,
-                                               sdk::EPaintChannelApplyMode::Override);
-                }
-                const auto& stroke_brush = fill_mode ? fill_brush : brush;
-                auto stroke = use_mesh_anchors
-                                  ? sdk_make_mesh_anchor_stroke(sample.u,
-                                                                sample.v,
-                                                                channel,
-                                                                stroke_brush,
-                                                                paint_target_channel,
-                                                                sample.world_position,
-                                                                sample.local_position,
-                                                                sample.triangle_index,
-                                                                sample.barycentric_a,
-                                                                sample.barycentric_b,
-                                                                sample.barycentric_c)
-                                  : sdk_make_uv_stroke(sample.u,
-                                                       sample.v,
-                                                       channel,
-                                                       stroke_brush,
-                                                       paint_target_channel);
-                if (stroke.bHasWorldPosition)
-                {
-                    ++replay_world_anchors;
-                }
-                if (stroke.bHasLocalPosition)
-                {
-                    ++replay_local_anchors;
-                }
-                if (stroke.bHasSkeletalTriangleAnchor)
-                {
-                    ++replay_triangle_anchors;
-                }
-                strokes.push_back(stroke);
-                if (fill_mode)
-                {
-                    ++replay_fill;
-                }
-                else
-                {
-                    ++replay_paint;
-                }
-                if (sample.region == MeshFirstRegion::Front)
-                {
-                    ++replay_front;
-                    if (fill_mode)
+                    else if (sample.region == MeshFirstRegion::Side)
                     {
-                        ++replay_front_fill;
+                        ++replay_side;
+                        if (fill_mode)
+                        {
+                            ++replay_side_fill;
+                        }
+                        else
+                        {
+                            ++replay_side_paint;
+                        }
                     }
                     else
                     {
-                        ++replay_front_paint;
-                    }
-                }
-                else if (sample.region == MeshFirstRegion::Side)
-                {
-                    ++replay_side;
-                    if (fill_mode)
-                    {
-                        ++replay_side_fill;
-                    }
-                    else
-                    {
-                        ++replay_side_paint;
-                    }
-                }
-                else
-                {
-                    ++replay_back;
-                    if (fill_mode)
-                    {
-                        ++replay_back_fill;
-                    }
-                    else
-                    {
-                        ++replay_back_paint;
+                        ++replay_back;
+                        if (fill_mode)
+                        {
+                            ++replay_back_fill;
+                        }
+                        else
+                        {
+                            ++replay_back_paint;
+                        }
                     }
                 }
             }
@@ -9569,12 +9574,12 @@ namespace
             async_job->server_batch_rpc = "ServerPaintBatch";
             async_job->local_visual_sync_enabled = true;
             async_job->strokes = std::move(strokes);
-            async_job->metadata = metadata + ",\"server_batch_schedule\":\"single_stroke_timer_drained\"";
+            async_job->metadata = metadata + ",\"server_batch_schedule\":\"timer_drained\"";
             async_job->albedo_before = albedo_before;
             async_job->replication_before = replication_before;
-            async_job->server_batch_limit = ServerPaintBatchStrokeLimit;
+            async_job->server_batch_limit = tuning_server_batch_limit;
             async_job->server_batch_delay_ms = effective_server_batch_delay_ms;
-            async_job->local_visual_sync_batch_limit = ServerPaintBatchStrokeLimit;
+            async_job->local_visual_sync_batch_limit = tuning_server_batch_limit;
             async_job->local_visual_sync_delay_ms = effective_server_batch_delay_ms;
             async_job->server_texture_sync_poll_ms = MeshFirstServerTextureSyncPollMs;
             async_job->server_texture_sync_max_polls = MeshFirstServerTextureSyncMaxPolls;
@@ -9589,7 +9594,7 @@ namespace
                 g_mesh_first_batch_job = async_job;
             }
             write_bridge_progress("mesh_server_batch_begin",
-                                  "mesh-first single-stroke ServerPaintBatch stream prepared",
+                                  "mesh-first ServerPaintBatch stream prepared",
                                   0,
                                   static_cast<int>(async_job->strokes.size()),
                                   0.0,
@@ -10088,7 +10093,7 @@ namespace
                                                         job->server_strokes_sent,
                                                         paint_ok ? 0 : 1,
                                                         paint_ok
-                                                            ? "mesh-first paint sent through " + job->server_batch_rpc + " one stroke at a time"
+                                                            ? "mesh-first paint sent through " + job->server_batch_rpc
                                                             : job->server_batch_rpc + " succeeded but local visual sync did not complete",
                                                         metadata));
         };
@@ -10428,7 +10433,7 @@ namespace
         }
 
         write_mesh_progress("mesh_server_batch",
-                            "mesh-first " + job->server_batch_rpc + " single-stroke stream",
+                            "mesh-first " + job->server_batch_rpc + " stream",
                             job->server_strokes_sent,
                             static_cast<int>(job->strokes.size()),
                             MeshFirstBatchPhase::ServerBatch,

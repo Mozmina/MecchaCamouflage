@@ -190,7 +190,8 @@ function statusClass(value) {
 function renderSettings(snapshot) {
   const paint = snapshot.settings.paint;
   setNumberPair("brush-size", "brush-size-number", paint.brushSizeTexels);
-  setValue("stroke-delay", paint.strokeDelayMs);
+  setNumberPair("stroke-delay", "stroke-delay-number", paint.strokeDelayMs);
+  setNumberPair("batch-size", "batch-size-number", paint.serverBatchLimit);
   setChecked("auto-material", paint.autoMaterial);
   setNumberPair("metallic", "metallic-number", paint.metallic);
   setNumberPair("roughness", "roughness-number", paint.roughness);
@@ -420,6 +421,7 @@ function diffSnapshots(before, after) {
   const keys = [
     "app.language",
     "paint.brushSizeTexels",
+    "paint.serverBatchLimit",
     "paint.strokeDelayMs",
     "paint.autoMaterial",
     "paint.metallic",
@@ -604,7 +606,8 @@ function toast(message, level = "success") {
 
 document.addEventListener("DOMContentLoaded", () => {
   bindRangePair("brush-size", "brush-size-number", "paint.brushSizeTexels");
-  bindInput("stroke-delay", "paint.strokeDelayMs", value => Number.parseInt(value, 10));
+  bindRangePair("stroke-delay", "stroke-delay-number", "paint.strokeDelayMs", value => Number.parseInt(value, 10));
+  bindRangePair("batch-size", "batch-size-number", "paint.serverBatchLimit", value => Number.parseInt(value, 10));
   bindCheckbox("auto-material", "paint.autoMaterial");
   bindRangePair("metallic", "metallic-number", "paint.metallic");
   bindRangePair("roughness", "roughness-number", "paint.roughness");

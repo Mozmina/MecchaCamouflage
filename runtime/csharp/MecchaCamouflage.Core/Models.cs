@@ -37,15 +37,15 @@ public sealed record RgbColor(byte R, byte G, byte B)
 
 public sealed class PaintSettings
 {
-    public double StrokeSizeTexels { get; set; } = 9.0;
-    public double CoverageStepTexels { get; set; } = 9.0;
+    public double StrokeSizeTexels { get; set; } = 6.0;
+    public double CoverageStepTexels { get; set; } = 6.0;
     public double SideSourceMaxUv { get; set; } = 0.08;
     public double FrontBackSourceMaxUv { get; set; } = 0.45;
     public RegionMode FrontRegionMode { get; set; } = RegionMode.Fill;
     public RegionMode SideRegionMode { get; set; } = RegionMode.Paint;
     public RegionMode BackRegionMode { get; set; } = RegionMode.Paint;
-    public int ServerBatchLimit { get; set; } = 1;
-    public int ServerBatchDelayMs { get; set; } = 1;
+    public int ServerBatchLimit { get; set; } = 50;
+    public int ServerBatchDelayMs { get; set; } = 100;
     public bool AutoMaterial { get; set; } = false;
     public double Metallic { get; set; } = 0.0;
     public double Roughness { get; set; } = 1.0;
