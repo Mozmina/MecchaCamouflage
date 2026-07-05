@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/demo2.png" alt="Meccha Camouflage demo" width="900" />
+  <img src="assets/meccha-camouflage-readme-banner-v151-1600w.jpg" alt="Meccha Camouflage demo" width="900" />
 </p>
 
 <h1>
