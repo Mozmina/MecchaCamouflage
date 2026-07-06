@@ -334,6 +334,7 @@ function renderRegionButtons(container, key, current) {
 }
 
 function renderEditState() {
+  document.body.classList.toggle("editing", editing);
   byId("edit-settings").disabled = editing;
   byId("save-settings").disabled = !editing;
   byId("cancel-edit").disabled = !editing;

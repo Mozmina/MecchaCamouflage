@@ -11121,45 +11121,21 @@ namespace
             }
             if (!live_uobject(job->controller) || !job->k2_get_pawn_function)
             {
-                finish_failed("mesh_paint_context_changed",
-                              "Paint stopped because the local player controller is no longer available",
-                              "paint_controller_unavailable");
-                return false;
+                // Freecam and spectator-like states can detach the local pawn while
+                // the paint component and packed RPC target are still valid.
+                return true;
             }
 
             sdk::Controller_K2_GetPawn pawn_params{};
             std::string process_failure{};
             if (!process_event(job->controller, job->k2_get_pawn_function, reinterpret_cast<std::uint8_t*>(&pawn_params), process_failure))
             {
-                finish_failed("mesh_paint_context_changed",
-                              "Paint stopped because the local pawn could not be refreshed",
-                              "k2_get_pawn_failed:" + process_failure);
-                return false;
+                return true;
             }
             const auto current_pawn = reinterpret_cast<std::uintptr_t>(pawn_params.ReturnValue);
             if (!live_uobject(current_pawn))
             {
-                finish_failed("mesh_paint_context_changed",
-                              "Paint stopped because the local pawn is no longer available",
-                              "pawn_unavailable");
-                return false;
-            }
-            if (job->pawn && current_pawn != job->pawn)
-            {
-                finish_failed("mesh_paint_context_changed",
-                              "Paint stopped because the local pawn changed",
-                              "pawn_changed");
-                return false;
-            }
-
-            const auto current_component =
-                safe_read<std::uintptr_t>(current_pawn + sdk::FieldOffsets::BP_FirstPersonCharacter_RuntimePaintable);
-            if (live_uobject(current_component) && current_component != job->component)
-            {
-                finish_failed("mesh_paint_context_changed",
-                              "Paint stopped because the game paint component changed",
-                              "paint_component_changed");
-                return false;
+                return true;
             }
             return true;
         };

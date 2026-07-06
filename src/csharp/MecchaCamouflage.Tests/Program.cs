@@ -310,6 +310,7 @@ static void BridgeMessagesAreUserFriendly()
     var noPreview = HostSession.FriendlyBridgeMessage("mesh_unpreview_snapshot_unavailable");
     var contextChanged = HostSession.FriendlyBridgeMessage("mesh_paint_context_changed");
     var componentUnavailable = HostSession.FriendlyBridgeMessage("ServerPackedPaintBatch failed: paint_component_unavailable");
+    var pawnUnavailable = HostSession.FriendlyBridgeMessage("Paint stopped because the local pawn is no longer available");
     var unsafeSampling = HostSession.FriendlyBridgeMessage("planner found unsafe color-transfer candidates in enabled regions; replay was blocked instead of skipping samples");
 
     Assert(alreadyRunning == "Paint: already running.", "already-running message should be friendly");
@@ -319,6 +320,7 @@ static void BridgeMessagesAreUserFriendly()
     Assert(noPreview == "Preview: no active preview to restore.", "missing preview snapshot should be a guard warning");
     Assert(contextChanged == "Paint: stopped because the game paint component changed.", "paint context change should be friendly");
     Assert(componentUnavailable == "Paint: stopped because the game paint component is unavailable.", "paint component unavailable should be friendly");
+    Assert(pawnUnavailable == "Paint: stopped because the local pawn is no longer available.", "pawn unavailable should be friendly");
     Assert(unsafeSampling == "Paint: blocked because the current mesh sampling was unsafe.", "unsafe mesh sampling should be friendly");
     Assert(!alreadyRunning.Contains("mesh", StringComparison.OrdinalIgnoreCase), "internal mesh wording should be hidden");
 }

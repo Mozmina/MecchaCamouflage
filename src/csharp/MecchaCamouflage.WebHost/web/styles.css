@@ -58,7 +58,7 @@ body {
   overflow: hidden;
   background: var(--background);
   color: var(--text);
-  font: 14px/20px var(--font-ui);
+  font: 16px/22px var(--font-ui);
   user-select: none;
 }
 
@@ -195,7 +195,7 @@ a:hover {
   border-bottom: 1px solid var(--hairline);
   padding: 0 12px;
   color: var(--text);
-  font: 700 11px/16px var(--font-ui);
+  font: 700 12px/17px var(--font-ui);
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -222,8 +222,12 @@ a:hover {
 .group-title {
   margin-bottom: 8px;
   color: var(--muted);
-  font: 700 10px/12px var(--font-mono);
+  font: 700 12px/14px var(--font-mono);
   text-transform: uppercase;
+}
+
+body.editing .group-title {
+  color: var(--text);
 }
 
 .setting-grid {
@@ -242,12 +246,17 @@ a:hover {
 .field > span,
 .hotkey-row > span {
   color: var(--muted);
-  font: 700 10px/12px var(--font-mono);
+  font: 700 12px/14px var(--font-mono);
+}
+
+body.editing .field > span,
+body.editing .hotkey-row > span {
+  color: var(--text);
 }
 
 .mono-input {
   padding: 0 8px;
-  font: 12px/18px var(--font-mono);
+  font: 13px/19px var(--font-mono);
 }
 
 .range-row {
@@ -260,7 +269,7 @@ a:hover {
 .range-number {
   padding: 0 6px;
   color: var(--text);
-  font: 700 11px/16px var(--font-mono);
+  font: 700 12px/17px var(--font-mono);
   text-align: right;
 }
 
@@ -279,7 +288,7 @@ a:hover {
   right: 12px;
   color: var(--muted);
   content: "▼";
-  font: 700 9px/1 var(--font-mono);
+  font: 700 10px/1 var(--font-mono);
   pointer-events: none;
   transform: translateY(-50%);
 }
@@ -315,7 +324,11 @@ a:hover {
 
 .region-grid > strong {
   color: var(--muted);
-  font: 700 10px/12px var(--font-mono);
+  font: 700 12px/14px var(--font-mono);
+}
+
+body.editing .region-grid > strong {
+  color: var(--text);
 }
 
 .region-choice {
@@ -329,7 +342,7 @@ a:hover {
   border-color: var(--hairline);
   background: var(--surface-mid);
   color: var(--muted);
-  font: 700 10px/12px var(--font-ui);
+  font: 700 11px/13px var(--font-ui);
 }
 
 .region-choice button.active {
@@ -352,7 +365,7 @@ a:hover {
   border-color: transparent;
   background: transparent;
   color: var(--muted);
-  font: 700 11px/16px var(--font-ui);
+  font: 700 12px/17px var(--font-ui);
 }
 
 .segmented button.active {
@@ -363,6 +376,11 @@ a:hover {
 
 #fill-section.disabled {
   opacity: 0.55;
+}
+
+body.editing #fill-section.disabled .group-title,
+body.editing #fill-section.disabled .field > span {
+  color: var(--muted);
 }
 
 .sub-panel {
@@ -394,7 +412,7 @@ a:hover {
 
 .hotkey-row button {
   padding: 0 8px;
-  font: 700 10px/12px var(--font-mono);
+  font: 700 11px/13px var(--font-mono);
 }
 
 .action-bar {
@@ -434,7 +452,7 @@ a:hover {
   border-color: transparent;
   background: transparent;
   color: var(--muted);
-  font: 700 10px/12px var(--font-mono);
+  font: 700 11px/13px var(--font-mono);
 }
 
 .tab.active {
@@ -451,7 +469,7 @@ a:hover {
 
 .log-actions button {
   height: 26px;
-  font: 700 10px/12px var(--font-mono);
+  font: 700 11px/13px var(--font-mono);
 }
 
 .logs {
@@ -461,7 +479,7 @@ a:hover {
   padding: 8px;
   background-color: var(--surface);
   color: var(--text);
-  font: 12px/18px var(--font-mono);
+  font: 13px/19px var(--font-mono);
   white-space: pre-wrap;
   cursor: text;
   user-select: text;
@@ -497,7 +515,7 @@ a:hover {
   padding: 0 12px;
   background: var(--surface);
   color: var(--muted);
-  font: 700 10px/12px var(--font-mono);
+  font: 700 11px/13px var(--font-mono);
 }
 
 .footer > div {
@@ -534,7 +552,7 @@ a:hover {
   padding: 10px 12px;
   background: var(--surface-low);
   color: var(--text);
-  font: 700 11px/16px var(--font-mono);
+  font: 700 12px/17px var(--font-mono);
   opacity: 0;
   pointer-events: none;
   transform: translateY(8px);
@@ -592,7 +610,7 @@ a:hover {
 
 .hotkey-card span {
   color: var(--muted);
-  font: 12px/18px var(--font-mono);
+  font: 13px/19px var(--font-mono);
 }
 
 .hotkey-dialog.error .hotkey-card {

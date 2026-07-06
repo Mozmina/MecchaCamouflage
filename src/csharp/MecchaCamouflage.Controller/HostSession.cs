@@ -424,6 +424,12 @@ public sealed class HostSession
             return "Paint: completed, but local preview failed.";
         if (lower is "mesh_paint_context_changed" || lower.Contains("paint_context_changed"))
             return "Paint: stopped because the game paint component changed.";
+        if (lower.Contains("game paint component is no longer available"))
+            return "Paint: stopped because the game paint component is no longer available.";
+        if (lower.Contains("local pawn is no longer available"))
+            return "Paint: stopped because the local pawn is no longer available.";
+        if (lower.Contains("local pawn changed"))
+            return "Paint: stopped because the local pawn changed.";
         if (lower.Contains("paint_component_unavailable"))
             return "Paint: stopped because the game paint component is unavailable.";
         if (lower.Contains("unsafe color-transfer candidates"))
