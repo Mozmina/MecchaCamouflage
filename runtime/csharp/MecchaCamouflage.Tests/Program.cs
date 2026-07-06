@@ -28,6 +28,7 @@ var tests = new List<(string Name, Action Run)>
     ("host session rolls back invalid fill color batch", HostSessionRollsBackInvalidFillColorBatch),
     ("host session rolls back invalid theme color batch", HostSessionRollsBackInvalidThemeColorBatch),
     ("host session rolls back invalid region mode batch", HostSessionRollsBackInvalidRegionModeBatch),
+    ("host session progress candidates use bridge state", HostSessionProgressCandidatesUseBridgeState),
     ("host session snapshot ignores pre-paint progress", HostSessionSnapshotIgnoresPrePaintProgress),
     ("host session warns when cancel has no active paint", HostSessionWarnsWhenCancelHasNoActivePaint),
     ("host session counts native cancel jobs", HostSessionCountsNativeCancelJobs)
@@ -449,14 +450,32 @@ static void HostSessionSnapshotIgnoresPrePaintProgress()
 {
     using var temp = new TempHome();
     var session = new HostSession("host-pre-paint-progress-test");
-    Directory.CreateDirectory(session.Paths.ProgressDirectory);
-    File.WriteAllText(Path.Combine(session.Paths.ProgressDirectory, "stale.progress.json"), """
+    Directory.CreateDirectory(session.Paths.BridgeProgressDirectory);
+    File.WriteAllText(Path.Combine(session.Paths.BridgeProgressDirectory, "stale.progress.json"), """
     {"stage":"mesh_paint_done","message":"done","step":1,"total_steps":1,"progress":1.0,"elapsed_ms":1.0}
     """);
 
     var snapshot = session.GetSnapshotAsync().GetAwaiter().GetResult();
 
     Assert(!snapshot.Runtime.ProgressVisible, "pre-paint progress should not be visible");
+}
+
+static void HostSessionProgressCandidatesUseBridgeState()
+{
+    using var temp = new TempHome();
+    var paths = new AppPaths("host-progress-candidates-test");
+    var bridgeProgress = Path.Combine(paths.BridgeProgressDirectory, "bridge.progress.json");
+    var versionProgressDirectory = Path.Combine(paths.VersionRoot, "runtime", "progress");
+    var versionProgress = Path.Combine(versionProgressDirectory, "version.progress.json");
+    Directory.CreateDirectory(paths.BridgeProgressDirectory);
+    Directory.CreateDirectory(versionProgressDirectory);
+    File.WriteAllText(bridgeProgress, "{}");
+    File.WriteAllText(versionProgress, "{}");
+
+    var candidates = HostSession.ProgressSnapshotCandidatePaths(paths);
+
+    Assert(candidates.Contains(Path.GetFullPath(bridgeProgress), StringComparer.OrdinalIgnoreCase), "bridge-state progress should be considered");
+    Assert(!candidates.Contains(Path.GetFullPath(versionProgress), StringComparer.OrdinalIgnoreCase), "version runtime progress should not be scanned");
 }
 
 static void HostSessionWarnsWhenCancelHasNoActivePaint()

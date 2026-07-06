@@ -11,19 +11,24 @@ public sealed class AppPaths
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         if (string.IsNullOrWhiteSpace(local))
             local = Path.GetTempPath();
-        VersionRoot = Path.Combine(local, "MecchaCamouflage", "versions", Version);
+        RootDirectory = Path.Combine(local, "MecchaCamouflage");
+        VersionsDirectory = Path.Combine(RootDirectory, "versions");
+        VersionRoot = Path.Combine(VersionsDirectory, Version);
         ConfigDirectory = Path.Combine(VersionRoot, "config");
         ConfigPath = Path.Combine(ConfigDirectory, "config.json");
         LegacyConfigPath = Path.Combine(VersionRoot, "config.json");
         LogDirectory = Path.Combine(VersionRoot, "logs");
         RuntimeDirectory = Path.Combine(VersionRoot, "runtime");
         RuntimeBinDirectory = Path.Combine(RuntimeDirectory, "bin");
-        ProgressDirectory = Path.Combine(RuntimeDirectory, "progress");
+        BridgeStateDirectory = Path.Combine(RootDirectory, "bridge-state");
+        BridgeProgressDirectory = Path.Combine(BridgeStateDirectory, "progress");
         DebugDirectory = Path.Combine(VersionRoot, "debug");
         DiagnosticsDirectory = Path.Combine(VersionRoot, "diagnostics");
     }
 
     public string Version { get; }
+    public string RootDirectory { get; }
+    public string VersionsDirectory { get; }
     public string VersionRoot { get; }
     public string ConfigDirectory { get; }
     public string ConfigPath { get; }
@@ -31,7 +36,8 @@ public sealed class AppPaths
     public string LogDirectory { get; }
     public string RuntimeDirectory { get; }
     public string RuntimeBinDirectory { get; }
-    public string ProgressDirectory { get; }
+    public string BridgeStateDirectory { get; }
+    public string BridgeProgressDirectory { get; }
     public string DebugDirectory { get; }
     public string DiagnosticsDirectory { get; }
 
@@ -40,7 +46,7 @@ public sealed class AppPaths
         Directory.CreateDirectory(ConfigDirectory);
         Directory.CreateDirectory(LogDirectory);
         Directory.CreateDirectory(RuntimeBinDirectory);
-        Directory.CreateDirectory(ProgressDirectory);
+        Directory.CreateDirectory(BridgeProgressDirectory);
         Directory.CreateDirectory(DiagnosticsDirectory);
     }
 

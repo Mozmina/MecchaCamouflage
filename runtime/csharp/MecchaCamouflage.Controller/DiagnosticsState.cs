@@ -54,6 +54,7 @@ public static class DiagnosticsState
         WriteLine("startup", $"current_directory={Environment.CurrentDirectory}");
         WriteLine("startup", $"local_app_data={Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)}");
         WriteLine("startup", $"runtime_directory={appPaths.RuntimeDirectory}");
+        WriteLine("startup", $"bridge_state_directory={appPaths.BridgeStateDirectory}");
         WriteLine("startup", $"diagnostics_directory={appPaths.DiagnosticsDirectory}");
     }
 

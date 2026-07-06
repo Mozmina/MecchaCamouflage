@@ -63,6 +63,7 @@ public sealed class HostSession
         var ping = await Runtime.PingAsync(cancellationToken, RuntimeBridgeService.BridgeProbeTimeout);
         var progress = ReadCurrentProgressSnapshot(liveOnly: true);
         var bridgeReady = process is not null &&
+            Runtime.IsConnected &&
             ping.Ok &&
             ping.Success &&
             (ping.ProcessId is null || ping.ProcessId == process.Id);
@@ -86,15 +87,6 @@ public sealed class HostSession
             if (process is null)
             {
                 _ = await Runtime.EnsureReadyAsync(Settings.GameProcessName, cancellationToken);
-                nextBridgeWarmupAttempt = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
-                return;
-            }
-            var ping = await Runtime.PingAsync(cancellationToken, RuntimeBridgeService.BridgeProbeTimeout);
-            if (ping.Ok &&
-                ping.Success &&
-                (ping.ProcessId is null || ping.ProcessId == process.Id))
-            {
-                Runtime.ObserveBridgeConnected(process.Id);
                 nextBridgeWarmupAttempt = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
                 return;
             }
@@ -736,10 +728,7 @@ public sealed class HostSession
         var cutoff = currentPaintStartedAt.AddSeconds(-1);
         try
         {
-            if (!Directory.Exists(Paths.ProgressDirectory))
-                return null;
-            foreach (var path in Directory.EnumerateFiles(Paths.ProgressDirectory, "*.progress.json")
-                         .OrderByDescending(File.GetLastWriteTimeUtc))
+            foreach (var path in ProgressSnapshotCandidatePaths(Paths, Runtime.ProgressPath))
             {
                 var progress = ReadProgressSnapshot(path, out var candidateWriteTime);
                 if (progress is null || candidateWriteTime < cutoff)
@@ -752,6 +741,60 @@ public sealed class HostSession
         {
         }
         return null;
+    }
+
+    public static string[] ProgressSnapshotCandidatePaths(AppPaths paths, string? preferredPath = null)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var candidates = new List<string>();
+
+        AddCandidate(preferredPath);
+        AddProgressDirectory(paths.BridgeProgressDirectory);
+
+        return candidates
+            .OrderByDescending(SafeLastWriteTimeUtc)
+            .ToArray();
+
+        void AddProgressDirectory(string directory)
+        {
+            if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+                return;
+            try
+            {
+                foreach (var path in Directory.EnumerateFiles(directory, "*.progress.json"))
+                    AddCandidate(path);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+
+        void AddCandidate(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                return;
+            try
+            {
+                var fullPath = Path.GetFullPath(path);
+                if (seen.Add(fullPath))
+                    candidates.Add(fullPath);
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+
+        static DateTime SafeLastWriteTimeUtc(string path)
+        {
+            try
+            {
+                return File.GetLastWriteTimeUtc(path);
+            }
+            catch
+            {
+                return DateTime.MinValue;
+            }
+        }
     }
 
     private void LogFinalProgressOnce()

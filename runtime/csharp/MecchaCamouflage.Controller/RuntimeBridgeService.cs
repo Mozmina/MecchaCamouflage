@@ -18,6 +18,7 @@ public sealed class RuntimeBridgeService
     private string progressPath = "";
     private string waitingForProcessName = "";
     private string lastBridgeReadyLogKey = "";
+    private string lastBridgeMismatchLogKey = "";
     private string lastRuntimeFilesLogKey = "";
     private int lastInjectionProcessId;
     private int activeBridgePort = BridgePort;
@@ -52,18 +53,12 @@ public sealed class RuntimeBridgeService
     public Task<BridgeReply> ShutdownAsync(CancellationToken cancellationToken = default) =>
         Client(activeBridgePort).ShutdownAsync(cancellationToken);
 
-    public void ObserveBridgeConnected(int processId)
-    {
-        RestoreLoadedBridgeState(processId, activeBridgePort);
-        DiagnosticsState.SetBridgeInjection($"ready pid={processId} port={activeBridgePort}");
-        LogBridgeConnected(processId, activeBridgePort);
-    }
-
     public async Task<bool> EnsureReadyAsync(string processName, CancellationToken cancellationToken = default)
     {
         var process = FindGameProcess(processName);
         if (process is null)
         {
+            bridgeConnected = false;
             if (!string.Equals(waitingForProcessName, processName, StringComparison.OrdinalIgnoreCase))
             {
                 log.Warn($"Game process: waiting for {processName}.");
@@ -80,9 +75,12 @@ public sealed class RuntimeBridgeService
             if (IsBridgeReadyForProcess(ping, process.Id))
             {
                 activeBridgePort = port;
-                RestoreLoadedBridgeState(process.Id, port);
+                if (!ValidateReadyBridge(process, port))
+                    return false;
                 bridgeReadyTimeoutLogged = false;
                 waitingForProcessName = "";
+                RestoreLoadedBridgeState(process.Id, port);
+                DiagnosticsState.SetBridgeInjection($"ready pid={process.Id} port={port}");
                 LogBridgeConnected(process.Id, port);
                 return true;
             }
@@ -122,17 +120,8 @@ public sealed class RuntimeBridgeService
         }
         try
         {
-            try
-            {
-                PrepareNativeRuntime(port);
-                File.WriteAllText(bridgePath + ".port", port + Environment.NewLine);
-            }
-            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
-            {
-                DiagnosticsState.SetLastCode("MC-RT-001", ex.Message);
-                log.Error("Bridge: runtime files could not be prepared: " + FriendlyAccessFailure(ex.Message));
+            if (!PrepareNativeRuntimeForPort(port))
                 return false;
-            }
 
             var loadedBridges = FindLoadedBridgePaths(process);
             if (loadedBridges.Any(path => SamePath(path, bridgePath)))
@@ -212,6 +201,47 @@ public sealed class RuntimeBridgeService
         return false;
     }
 
+    private bool ValidateReadyBridge(Process process, int port)
+    {
+        if (!PrepareNativeRuntimeForPort(port))
+            return false;
+
+        var loadedBridges = FindLoadedBridgePaths(process);
+        if (loadedBridges.Any(path => SamePath(path, bridgePath)))
+            return true;
+
+        var detail = loadedBridges.Count == 0
+            ? "loaded bridge module could not be confirmed"
+            : "loaded=" + string.Join(";", loadedBridges.Select(Path.GetFileName));
+        bridgeConnected = false;
+        DiagnosticsState.SetLastCode("MC-INJ-146", detail);
+        DiagnosticsState.SetBridgeInjection($"different bridge loaded pid={process.Id} port={port}");
+        var key = $"{process.Id}:{port}:{detail}";
+        if (!string.Equals(lastBridgeMismatchLogKey, key, StringComparison.Ordinal))
+        {
+            lastBridgeMismatchLogKey = key;
+            log.Error("Bridge: a different bridge DLL is already loaded in the game. Restart the game before retrying.");
+        }
+        return false;
+    }
+
+    private bool PrepareNativeRuntimeForPort(int port)
+    {
+        try
+        {
+            PrepareNativeRuntime(port);
+            File.WriteAllText(bridgePath + ".port", port + Environment.NewLine);
+            return true;
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+        {
+            bridgeConnected = false;
+            DiagnosticsState.SetLastCode("MC-RT-001", ex.Message);
+            log.Error("Bridge: runtime files could not be prepared: " + FriendlyAccessFailure(ex.Message));
+            return false;
+        }
+    }
+
     private void PrepareNativeRuntime(int port)
     {
         paths.EnsureBaseDirectories();
@@ -235,8 +265,8 @@ public sealed class RuntimeBridgeService
         bridgePath = Path.Combine(runtimeDir, $"runtime-bridge-{hash}-{port}.dll");
         PackagedAssets.CopyIfInvalid(packagedBridge, bridgePath);
         LogRuntimeFilesPrepared(runtimeDir);
-        Directory.CreateDirectory(paths.ProgressDirectory);
-        progressPath = Path.Combine(paths.ProgressDirectory, $"bridge-{hash}-{port}.progress.json");
+        Directory.CreateDirectory(paths.BridgeProgressDirectory);
+        progressPath = Path.Combine(paths.BridgeProgressDirectory, $"bridge-{hash}-{port}.progress.json");
         File.WriteAllText(bridgePath + ".progress.path", progressPath + Environment.NewLine);
 
         var profileRoot = PackagedAssets.ResolveRequiredAssetRoot(paths, "mesh-profiles", log);
