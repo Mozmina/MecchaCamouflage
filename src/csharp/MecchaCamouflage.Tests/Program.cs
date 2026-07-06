@@ -328,13 +328,20 @@ static void BridgeMessagesAreUserFriendly()
 static void SettingsClampSyncsCoverageToBrush()
 {
     var settings = new AppSettings();
-    settings.Paint.StrokeSizeTexels = 7.5;
+    settings.Paint.StrokeSizeTexels = 12.0;
     settings.Paint.CoverageStepTexels = 2.0;
 
     var clamped = SettingsStore.Clamp(settings);
 
-    Assert(Math.Abs(clamped.Paint.StrokeSizeTexels - 7.5) < 0.000001, "brush size should be clamped independently");
+    Assert(Math.Abs(clamped.Paint.StrokeSizeTexels - 10.0) < 0.000001, "brush size should clamp to max");
     Assert(Math.Abs(clamped.Paint.CoverageStepTexels - clamped.Paint.StrokeSizeTexels) < 0.000001, "coverage step should follow brush size");
+
+    settings.Paint.StrokeSizeTexels = -1.0;
+    settings.Paint.CoverageStepTexels = 2.0;
+    clamped = SettingsStore.Clamp(settings);
+
+    Assert(Math.Abs(clamped.Paint.StrokeSizeTexels - 1.0) < 0.000001, "brush size should clamp to min");
+    Assert(Math.Abs(clamped.Paint.CoverageStepTexels - clamped.Paint.StrokeSizeTexels) < 0.000001, "coverage step should follow clamped min brush size");
 }
 
 static void SettingsDetectSupportedSystemLanguage()
@@ -394,9 +401,9 @@ static void HostSessionResetRestoresDefault()
     using var temp = new TempHome();
     var session = new HostSession("host-reset-test");
 
-    var update = session.UpdateSetting("paint.brushSizeTexels", JsonSerializer.SerializeToElement(12.0));
+    var update = session.UpdateSetting("paint.brushSizeTexels", JsonSerializer.SerializeToElement(10.0));
     Assert(update.Success, update.Message);
-    Assert(Math.Abs(session.Settings.Paint.StrokeSizeTexels - 12.0) < 0.000001, "setting should update");
+    Assert(Math.Abs(session.Settings.Paint.StrokeSizeTexels - 10.0) < 0.000001, "setting should update");
 
     var reset = session.ResetSetting("paint.brushSizeTexels");
     Assert(reset.Success, reset.Message);
@@ -432,13 +439,13 @@ static void HostSessionAppliesMultipleSettingUpdatesAtomically()
     var session = new HostSession("host-batch-valid-test");
 
     var update = session.UpdateSettings([
-        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(12.0)),
+        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(10.0)),
         new SettingChange("paint.fillColor", JsonSerializer.SerializeToElement("#112233")),
         new SettingChange("app.processName", JsonSerializer.SerializeToElement("Game.exe"))
     ]);
 
     Assert(update.Success, update.Message);
-    Assert(Math.Abs(session.Settings.Paint.StrokeSizeTexels - 12.0) < 0.000001, "brush size should update");
+    Assert(Math.Abs(session.Settings.Paint.StrokeSizeTexels - 10.0) < 0.000001, "brush size should update");
     Assert(session.Settings.Paint.FillColor.ToHex() == "#112233", "fill color should update");
     Assert(session.Settings.GameProcessName == "Game.exe", "process name should update");
 }
@@ -451,7 +458,7 @@ static void HostSessionRollsBackDuplicateHotkeyBatch()
     var originalPreview = session.Settings.PreviewHotkey;
 
     var update = session.UpdateSettings([
-        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(12.0)),
+        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(10.0)),
         new SettingChange("app.previewHotkey", JsonSerializer.SerializeToElement(session.Settings.StartHotkey))
     ]);
 
@@ -468,7 +475,7 @@ static void HostSessionRollsBackInvalidFillColorBatch()
     var originalColor = session.Settings.Paint.FillColor;
 
     var update = session.UpdateSettings([
-        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(12.0)),
+        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(10.0)),
         new SettingChange("paint.fillColor", JsonSerializer.SerializeToElement("not-a-color"))
     ]);
 
@@ -485,7 +492,7 @@ static void HostSessionRollsBackInvalidThemeColorBatch()
     var originalTheme = session.Settings.ThemeColor;
 
     var update = session.UpdateSettings([
-        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(12.0)),
+        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(10.0)),
         new SettingChange("app.themeColor", JsonSerializer.SerializeToElement("not-a-color"))
     ]);
 
@@ -502,7 +509,7 @@ static void HostSessionRollsBackInvalidRegionModeBatch()
     var originalMode = session.Settings.Paint.FrontRegionMode;
 
     var update = session.UpdateSettings([
-        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(12.0)),
+        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(10.0)),
         new SettingChange("paint.frontRegionMode", JsonSerializer.SerializeToElement("invalid"))
     ]);
 

@@ -37,8 +37,8 @@ public sealed record RgbColor(byte R, byte G, byte B)
 
 public sealed class PaintSettings
 {
-    public double StrokeSizeTexels { get; set; } = 9.0;
-    public double CoverageStepTexels { get; set; } = 9.0;
+    public double StrokeSizeTexels { get; set; } = 5.0;
+    public double CoverageStepTexels { get; set; } = 5.0;
     public double SideSourceMaxUv { get; set; } = 0.08;
     public double FrontBackSourceMaxUv { get; set; } = 0.45;
     public RegionMode FrontRegionMode { get; set; } = RegionMode.Fill;

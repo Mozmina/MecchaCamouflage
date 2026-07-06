@@ -100,7 +100,7 @@ public sealed class SettingsStore
         if (string.IsNullOrWhiteSpace(settings.StopHotkey))
             settings.StopHotkey = "F4";
 
-        settings.Paint.StrokeSizeTexels = Math.Clamp(settings.Paint.StrokeSizeTexels, 1.0, 12.0);
+        settings.Paint.StrokeSizeTexels = Math.Clamp(settings.Paint.StrokeSizeTexels, 1.0, 10.0);
         settings.Paint.CoverageStepTexels = settings.Paint.StrokeSizeTexels;
         settings.Paint.SideSourceMaxUv = Math.Clamp(settings.Paint.SideSourceMaxUv, 0.001, 0.50);
         settings.Paint.FrontBackSourceMaxUv = Math.Clamp(settings.Paint.FrontBackSourceMaxUv, 0.001, 2.00);
