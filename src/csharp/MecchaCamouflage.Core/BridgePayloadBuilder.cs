@@ -27,9 +27,13 @@ public static class BridgePayloadBuilder
             },
             ["tuning"] = new Dictionary<string, object?>
             {
-                ["stroke_size_texels"] = paint.StrokeSizeTexels,
-                ["server_batch_delay_ms"] = paint.PackedBatchDelayMs,
-                ["coverage_step_texels"] = paint.CoverageStepTexels,
+                ["brush_1_size_texels"] = paint.Brush1SizeTexels,
+                ["brush_2_size_texels"] = paint.Brush2SizeTexels,
+                ["brush_pipeline_version"] = 2,
+                ["stroke_size_texels"] = paint.Brush2SizeTexels,
+                ["server_batch_limit"] = paint.PackedBatchLimit,
+                ["server_batch_pacing_ms"] = paint.PackedBatchPacingMs,
+                ["coverage_step_texels"] = paint.Brush2SizeTexels,
                 ["side_source_max_uv"] = paint.SideSourceMaxUv,
                 ["front_back_source_max_uv"] = paint.FrontBackSourceMaxUv,
                 ["auto_material"] = paint.AutoMaterial,

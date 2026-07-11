@@ -72,6 +72,11 @@ These require MECCHA CHAMELEON.
   - the new controller instance starts and authenticates its own direct bridge.
   - older direct bridges or any other resident module do not produce a restart-required state.
   - an indeterminate injector timeout is diagnosed and requires an explicit retry; it does not trigger unload or thread termination.
+- Cancel and then shut down separate paints while each is still in the planning
+  phase. Each command must report one active job, the paint must reach a
+  cancelled terminal reply, shutdown must report
+  `active_paint_quiescent=true`, and an immediate fresh injection must complete
+  without restarting the game.
 
 ## v1.6 Direct Bridge and WebView2 Gates
 
@@ -104,6 +109,30 @@ Collect these separately for painter-as-host and painter-as-joining-client:
   - `ServerPackedPaintBatch > 0`
   - `SendCustomStrokeBatchToServer == 0`
   - `ServerRelayPackedStrokeBatch == 0`
+  - `PaintAtUVWithBrush == 0`
+  - legacy full-stroke multicast calls are `0`
+- production-route metadata:
+  - `local_packed_queue_resolver_status == "resolved"`
+  - `local_packed_queue_exact_manager_class_ok == true`
+  - packed/local batch boundaries and stroke totals are identical
+  - `local_packed_queue_strokes_submitted == server_strokes_sent`
+  - `local_packed_queue_delta_mismatches == 0`
+  - `local_packed_queue_call_exceptions == 0`
+  - `server_local_diverged == false` on interrupted runs
+  - `packed_mesh_radius_calibration_ok == true`
+  - `packed_mesh_radius_calibration_invalid_triangles == 0`
+  - the effective scale, mesh bounds diameter, and weighted local/UV scale are
+    finite and identical for server/local construction of the job
+  - per-pass effective subdivision level/pixel-size/template-resolution are
+    all zero sentinels before packed decode
+- before/after texture probes show a nontrivial changed-texel area on the
+  painter's resolved component after queue drain. Record
+  `texture_delta.pixels_changed_any_channel` and its ratio; checksum inequality
+  alone is insufficient because a few tiny dots also change the hash. Collect
+  corresponding remote-client changed-texel evidence after replication and
+  require both replication queues to return to zero. Inspect the coordinate
+  dump or the character as well: a regular point grid with gaps is a failure
+  even when changed-texel count is nontrivial
 
 Do not release if joining-client paint crashes the server, or if other clients
 finish closer to the old multi-minute replication drain path than to the new

@@ -5,10 +5,15 @@ namespace MecchaCamouflage.WebHost;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         var paths = new MecchaCamouflage.Core.AppPaths(VersionInfo.Current);
         DiagnosticsState.Initialize(paths, VersionInfo.Current);
+        if (ResearchRunner.IsRequested(args))
+        {
+            Environment.ExitCode = ResearchRunner.RunAsync(args).GetAwaiter().GetResult();
+            return;
+        }
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, args) => DiagnosticsState.RecordException("winforms_thread_exception", args.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>

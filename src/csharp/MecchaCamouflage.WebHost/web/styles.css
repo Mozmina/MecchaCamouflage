@@ -273,6 +273,10 @@ body.editing .hotkey-row > span {
   text-align: right;
 }
 
+.reverse-range {
+  direction: rtl;
+}
+
 .select-wrap {
   position: relative;
 }

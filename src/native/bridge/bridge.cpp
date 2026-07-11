@@ -26,12 +26,14 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "../include/sdk.hpp"
 #include "../include/direct_bridge_abi.hpp"
+#include "../include/runtime_contract.hpp"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Gdi32.lib")
@@ -48,13 +50,14 @@ namespace
     constexpr int ProcessEventVtableIndex = 0x4C;
     constexpr int AutoEventWatchSampleBytes = 8192;
     constexpr UINT PaintDispatchMessage = WM_APP + 0x4D43;
-    constexpr int PackedReplicationDefaultBatchLimit = 50;
-    constexpr int PackedReplicationMaxBatchLimit = 50;
-    constexpr int PackedReplicationDefaultPacingMs = 75;
+    constexpr int PackedReplicationDefaultBatchLimit = 20;
+    constexpr int PackedReplicationMaxBatchLimit = 20;
+    constexpr int PackedReplicationDefaultPacingMs = 50;
     constexpr int PackedReplicationMinPacingMs = 50;
     constexpr int PackedReplicationFallbackMaxStrokesPerTick = 24;
     constexpr int PackedReplicationResolvedPacingMinMs = 1;
     constexpr int PackedReplicationBatchSize = 20;
+    constexpr int InternalNoResendMaxCallsPerTick = runtime_contract::InternalNoResendMaxCallsPerTick;
     constexpr int PackedReplicationFallbackOutgoingBatchesPerSecond = 20;
     constexpr int PackedReplicationMaxPacingMs = 500;
     constexpr int MeshFirstFastApplyStrokesPerTick = 0;
@@ -63,6 +66,14 @@ namespace
     constexpr int MeshFirstServerTextureSyncMaxPolls = 40;
     constexpr int MeshFirstTextureSyncObserverPollMs = 50;
     constexpr int MeshFirstTextureSyncObserverMaxPolls = 40;
+    constexpr int MeshFirstProgressMinIntervalMs = 250;
+    // A production request remains owned until the game-side local receiver
+    // queue has drained.  The former 240-second listener timeout could release
+    // admission while a low-FPS client was still rendering a valid job.
+    constexpr int PaintRequestTimeoutSeconds = 900;
+    // Total duration may legitimately grow at very low FPS. Fail only when a
+    // measurable receiver queue makes no forward progress for this interval.
+    constexpr int LocalQueueDrainIdleTimeoutMs = 120000;
     constexpr bool MeshFirstPostImportTextureSyncEnabled = false;
     constexpr double MeshFirstRuntimeCoordinateMaxAvgErrorCm = 50.0;
     constexpr std::uintptr_t RuntimePaintableComponentPackedSourceIdOffset = 0x2A8;
@@ -79,7 +90,10 @@ namespace
     constexpr std::uintptr_t OffUFieldNext = 0x28;
     constexpr std::uintptr_t OffFFieldNext = 0x18;
     constexpr std::uintptr_t OffFFieldName = 0x20;
-    constexpr std::uintptr_t OffFPropertyElementSize = 0x3C;
+    // FProperty: ArrayDim@0x30, ElementSize@0x34, PropertyFlags@0x38,
+    // Offset_Internal@0x44 for the supported game build. Reading +0x3c returns
+    // the high dword of PropertyFlags (for example 0x180010), not a byte size.
+    constexpr std::uintptr_t OffFPropertyElementSize = runtime_contract::FPropertyElementSizeOffset;
     constexpr std::uintptr_t OffFPropertyOffset = 0x44;
     constexpr std::uintptr_t OffFStructPropertyStruct = 0x70;
 
@@ -101,6 +115,14 @@ namespace
     std::atomic<SOCKET> g_listener{INVALID_SOCKET};
     std::atomic<std::uint32_t> g_bound_port{0};
     std::atomic<bool> g_bridge_started{false};
+    // Command admission is distinct from the listener lifetime.  Shutdown closes
+    // admission first so a client which was accepted just before closesocket()
+    // cannot start a new game-thread job while the old bridge is draining.
+    std::atomic<bool> g_accepting_bridge_commands{false};
+    // Paint/probe commands share a single Win32 message hook and a single async
+    // scheduler.  Make that ownership explicit instead of allowing concurrent
+    // handlers to replace one another's hook.
+    std::atomic<bool> g_paint_request_in_progress{false};
     std::mutex g_bridge_start_mutex;
     BridgeStartBlockV1 g_bridge_identity{};
     std::atomic<int> g_active_client_handlers{0};
@@ -109,8 +131,14 @@ namespace
     std::atomic<HHOOK> g_message_hook{nullptr};
     std::atomic<std::uint32_t> g_active_hook_callbacks{0};
     std::atomic<std::uint32_t> g_active_ue_calls{0};
+    std::atomic<std::uint32_t> g_active_paint_dispatches{0};
     std::atomic<DWORD> g_game_thread_id{0};
     std::atomic<HWND> g_game_window{nullptr};
+    // Coalesce wakeups from the listener, timer and ProcessEvent hook.  Without
+    // this gate a timer tick and the request wait-loop can enqueue duplicate
+    // messages; each duplicate re-enters the scheduler only to discover that
+    // its lane is not due yet.
+    std::atomic<bool> g_paint_dispatch_message_pending{false};
     std::atomic<std::uintptr_t> g_observed_sync_channel_function{0};
     std::atomic<std::uintptr_t> g_observed_sync_compressed_channel_function{0};
     std::atomic<int> g_observed_sync_channel_calls{0};
@@ -122,8 +150,12 @@ namespace
     std::atomic<std::int64_t> g_observed_sync_compressed_channel_uncompressed_bytes{0};
     std::mutex g_hook_mutex;
     std::mutex g_auto_event_watch_sample_mutex;
+    std::mutex g_auto_event_watch_lifecycle_mutex;
+    std::mutex g_auto_event_watch_wait_mutex;
+    std::condition_variable g_auto_event_watch_wait_cv;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> g_process_event_hook_slots;
     thread_local bool g_inside_process_event_hook = false;
+    std::atomic<std::uintptr_t> g_auto_event_watch_replication_manager{0};
 
     struct AutoEventWatchEntry
     {
@@ -138,6 +170,21 @@ namespace
         std::atomic<int> last_i32_24;
         std::atomic<std::int64_t> total_i32_16{0};
         std::atomic<std::int64_t> total_i32_24{0};
+        // Research-only attribution of changes to RuntimePaintReplicationManager::QueuedBatches.
+        // These counters are sampled immediately around the watched ProcessEvent call.  The
+        // queue's total field only changes when strokes are appended, whereas its processed
+        // cursor advances independently during draining.
+        std::atomic<std::int64_t> last_queued_batches_total_before{-1};
+        std::atomic<std::int64_t> last_queued_batches_total_after{-1};
+        std::atomic<std::int64_t> last_queued_batches_total_delta{0};
+        std::atomic<std::int64_t> queued_batches_total_positive_delta{0};
+        std::atomic<std::int64_t> queued_batches_total_signed_delta{0};
+        std::atomic<int> queued_batches_delta_observations{0};
+        std::atomic<int> queued_batches_delta_unavailable{0};
+        // The ProcessEvent receiver is recorded as an opaque address only.  It is
+        // intentionally not dereferenced from the hook: consumers compare it with
+        // the read-only component inventory captured by the pressure probe.
+        std::atomic<std::uintptr_t> last_process_event_object{0};
         int last_array0_sample_len{0};
         int last_array0_sample_total_len{0};
         int last_array0_sample_element_size{1};
@@ -153,6 +200,7 @@ namespace
         {"ServerCompactPaintBatch", 0, 0, -1, -1, 0, 0, -1, -1},
         {"ServerPackedPaintBatch", 0, 0, -1, -1, 0, 0, -1, -1},
         {"SendStrokeBatchToServer", 0, 0, -1, -1, 0, 0, -1, -1},
+        {"SendPaintToServer", 0, 0, -1, -1, 0, 0, -1, -1},
         {"SendCustomStrokeBatchToServer", 0, 0, -1, -1, 0, 0, -1, -1},
         {"RequestStrokeBatchOnServer", 0, 0, -1, -1, 0, 0, -1, -1},
         {"ServerSendStrokeBatch", 0, 0, -1, -1, 0, 0, -1, -1},
@@ -168,6 +216,7 @@ namespace
         {"ServerRelayCompactStrokeBatch", 0, 0, -1, -1, 0, 0, -1, -1},
         {"ServerRelayPackedStrokeBatch", 0, 0, -1, -1, 0, 0, -1, -1},
         {"ServerRelayCompactPaint", 0, 0, -1, -1, 0, 0, -1, -1},
+        {"PaintAtUVWithBrush", 0, 0, -1, -1, 0, 0, -1, -1},
         {"MulticastSyncChannelData", 0, 0, -1, -1, 0, 0, -1, -1},
         {"MulticastSyncCompressedChannelData", 0, 0, -1, -1, 0, 0, -1, -1},
         {"RelayTextureSyncToServer", 0, 0, -1, -1, 0, 0, -1, -1},
@@ -175,9 +224,28 @@ namespace
     };
     std::atomic<bool> g_auto_event_watch_enabled{false};
     std::atomic<bool> g_auto_event_watch_writer_running{false};
-    std::wstring g_auto_event_watch_path{};
+    std::atomic<std::uint64_t> g_auto_event_watch_generation{0};
+    std::thread g_auto_event_watch_writer{};
 
     using ProcessEventFn = void(__fastcall*)(void*, void*, void*);
+
+    enum class PaintJobState : int
+    {
+        Queued = 0,
+        Executing = 1,
+        Async = 2,
+        Terminal = 3,
+    };
+
+    enum class PaintCancelReason : int
+    {
+        None = 0,
+        Cancelled = 1,
+        UserRequest = 2,
+        Shutdown = 3,
+        RequestTimeout = 4,
+        BridgeStopping = 5,
+    };
 
     struct QueuedPaintJob
     {
@@ -185,6 +253,13 @@ namespace
         std::string response{};
         bool dispatched{false};
         bool done{false};
+        std::atomic<int> state{static_cast<int>(PaintJobState::Queued)};
+        // Publishing an immutable enum avoids the former listener/game-thread
+        // data race on a mutable std::string cancellation reason.
+        std::atomic<int> cancel_reason{static_cast<int>(PaintCancelReason::None)};
+        // First-wins timestamp lets planner/preflight reports distinguish a
+        // queued cancellation from one observed after an uninterruptible UE call.
+        std::atomic<std::uint64_t> cancel_requested_tick_ms{0};
     };
 
     struct TextureSyncObserverSnapshot
@@ -201,6 +276,10 @@ namespace
     std::mutex g_paint_jobs_mutex;
     std::condition_variable g_paint_jobs_cv;
     std::vector<std::shared_ptr<QueuedPaintJob>> g_paint_jobs;
+    // A job moves here in the same critical section that removes it from the
+    // queued list.  Thus shutdown can observe planning as active work; there is
+    // no queue-empty/async-not-yet-published gap.
+    std::vector<std::shared_ptr<QueuedPaintJob>> g_executing_paint_jobs;
     std::atomic<bool> g_mesh_snapshot_ready{false};
     std::atomic<bool> g_dump_cancel_requested{false};
 
@@ -216,7 +295,9 @@ namespace
     auto paint_replication_probe_on_game_thread(const std::string& request) -> std::string;
     auto is_paint_packed_replay_probe_request(const std::string& request) -> bool;
     auto paint_packed_replay_probe_on_game_thread(const std::string& request) -> std::string;
-    auto auto_event_watch_record(std::uintptr_t function_address, std::uint8_t* params_bytes) -> void;
+    auto auto_event_watch_record(std::uintptr_t object_address,
+                                 std::uintptr_t function_address,
+                                 std::uint8_t* params_bytes) -> void;
     void __fastcall hooked_process_event(void* object, void* function, void* params);
     LRESULT CALLBACK message_hook_proc(int code, WPARAM wparam, LPARAM lparam);
 
@@ -267,14 +348,32 @@ namespace
 
     auto post_paint_dispatch_message() -> void
     {
-        if (const auto hwnd = g_game_window.load())
+        bool expected_pending = false;
+        if (!g_paint_dispatch_message_pending.compare_exchange_strong(
+                expected_pending, true, std::memory_order_acq_rel))
         {
-            PostMessageW(hwnd, PaintDispatchMessage, 0, 0);
+            return;
         }
+        // The WH_GETMESSAGE hook consumes the game thread's queue directly.
+        // Prefer one thread message; a window message is only a fallback for
+        // titles that have not exposed their game-thread id yet.
         if (const auto thread_id = g_game_thread_id.load())
         {
-            PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
+            if (PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0))
+            {
+                return;
+            }
         }
+        if (const auto hwnd = g_game_window.load())
+        {
+            if (PostMessageW(hwnd, PaintDispatchMessage, 0, 0))
+            {
+                return;
+            }
+        }
+        // No route was available.  Allow a later lifecycle or timer event to
+        // retry instead of leaving the coalescing gate permanently closed.
+        g_paint_dispatch_message_pending.store(false, std::memory_order_release);
     }
 
     void CALLBACK paint_dispatch_timer_proc(HWND, UINT, UINT_PTR timer_id, DWORD)
@@ -312,6 +411,52 @@ namespace
         }
     }
 
+    struct EventWatchQueuedBatchesSnapshot
+    {
+        bool valid{false};
+        std::int64_t total{0};
+        std::int64_t processed{0};
+        std::int64_t remaining{0};
+        int entries{0};
+    };
+
+    auto auto_event_watch_queued_batches_snapshot() -> EventWatchQueuedBatchesSnapshot
+    {
+        EventWatchQueuedBatchesSnapshot snapshot{};
+        const auto manager = g_auto_event_watch_replication_manager.load();
+        if (!manager)
+        {
+            return snapshot;
+        }
+
+        constexpr std::uintptr_t QueuedBatchesOffset = 0x68;
+        constexpr std::uintptr_t QueueEntrySize = 0x28;
+        const auto data = safe_read<std::uintptr_t>(manager + QueuedBatchesOffset);
+        const int num = safe_read<int>(manager + QueuedBatchesOffset + 8, -1);
+        const int max = safe_read<int>(manager + QueuedBatchesOffset + 12, -1);
+        if (num < 0 || num > 1024 || max < num || max > 100000 || (num != 0 && !data))
+        {
+            return snapshot;
+        }
+
+        for (int index = 0; index < num; ++index)
+        {
+            const auto entry = data + static_cast<std::uintptr_t>(index) * QueueEntrySize;
+            const int total = safe_read<int>(entry + 0x10, -1);
+            const int processed = safe_read<int>(entry + 0x18, -1);
+            if (total < 0 || processed < 0 || processed > total)
+            {
+                return {};
+            }
+            snapshot.total += total;
+            snapshot.processed += processed;
+            snapshot.remaining += total - processed;
+        }
+        snapshot.entries = num;
+        snapshot.valid = true;
+        return snapshot;
+    }
+
     auto lower_copy(std::string text) -> std::string
     {
         std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -332,6 +477,100 @@ namespace
 
 #include "bridge_json.inc"
 
+    auto paint_cancel_reason_from_text(const char* reason) -> PaintCancelReason
+    {
+        if (!reason || !*reason)
+        {
+            return PaintCancelReason::Cancelled;
+        }
+        if (std::strcmp(reason, "cancel_paint") == 0)
+        {
+            return PaintCancelReason::UserRequest;
+        }
+        if (std::strcmp(reason, "shutdown") == 0)
+        {
+            return PaintCancelReason::Shutdown;
+        }
+        if (std::strcmp(reason, "paint_request_timeout") == 0)
+        {
+            return PaintCancelReason::RequestTimeout;
+        }
+        if (std::strcmp(reason, "bridge_stopping") == 0)
+        {
+            return PaintCancelReason::BridgeStopping;
+        }
+        return PaintCancelReason::Cancelled;
+    }
+
+    auto paint_cancel_reason_name(PaintCancelReason reason) -> const char*
+    {
+        switch (reason)
+        {
+        case PaintCancelReason::UserRequest:
+            return "cancel_paint";
+        case PaintCancelReason::Shutdown:
+            return "shutdown";
+        case PaintCancelReason::RequestTimeout:
+            return "paint_request_timeout";
+        case PaintCancelReason::BridgeStopping:
+            return "bridge_stopping";
+        case PaintCancelReason::Cancelled:
+            return "cancelled";
+        case PaintCancelReason::None:
+        default:
+            return "cancelled";
+        }
+    }
+
+    auto queued_paint_cancel_reason(const std::shared_ptr<QueuedPaintJob>& job) -> PaintCancelReason
+    {
+        return job
+                   ? static_cast<PaintCancelReason>(job->cancel_reason.load(std::memory_order_acquire))
+                   : PaintCancelReason::None;
+    }
+
+    auto request_queued_paint_cancel(const std::shared_ptr<QueuedPaintJob>& job, const char* reason) -> bool
+    {
+        if (!job)
+        {
+            return false;
+        }
+        int expected = static_cast<int>(PaintCancelReason::None);
+        const bool won = job->cancel_reason.compare_exchange_strong(expected,
+                                                                     static_cast<int>(paint_cancel_reason_from_text(reason)),
+                                                                     std::memory_order_acq_rel,
+                                                                     std::memory_order_acquire);
+        if (won)
+        {
+            job->cancel_requested_tick_ms.store(GetTickCount64(), std::memory_order_release);
+        }
+        return won;
+    }
+
+    auto queued_paint_cancel_response(const std::shared_ptr<QueuedPaintJob>& job,
+                                      const char* stage = "paint_cancelled") -> std::string
+    {
+        const auto reason = queued_paint_cancel_reason(job);
+        const std::string reason_name = paint_cancel_reason_name(reason);
+        const auto requested_tick_ms =
+            job ? job->cancel_requested_tick_ms.load(std::memory_order_acquire) : 0;
+        const auto observed_after_ms = requested_tick_ms > 0
+                                           ? std::max<std::uint64_t>(0, GetTickCount64() - requested_tick_ms)
+                                           : 0;
+        return response_json(false,
+                             stage,
+                             0,
+                             1,
+                             "paint cancelled: " + reason_name,
+                             "\"cancelled\":true,\"cancel_reason\":\"" + json_escape(reason_name) + "\"" +
+                                 ",\"cancel_phase\":\"planning_or_queued\"" +
+                                 ",\"cancel_requested_tick_ms\":" + std::to_string(requested_tick_ms) +
+                                 ",\"cancel_request_to_observe_ms\":" + std::to_string(observed_after_ms) +
+                                 ",\"server_strokes_sent\":0,\"local_strokes_synced\":0" +
+                                 ",\"partial_commit\":false,\"server_local_diverged\":false" +
+                                 ",\"automatic_retry_safe\":false");
+    }
+
     void complete_queued_paint_job(const std::shared_ptr<QueuedPaintJob>& job, const std::string& response)
     {
         if (!job)
@@ -340,8 +579,16 @@ namespace
         }
         {
             std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            if (job->done)
+            {
+                return;
+            }
             job->response = response;
             job->done = true;
+            job->state.store(static_cast<int>(PaintJobState::Terminal), std::memory_order_release);
+            g_executing_paint_jobs.erase(
+                std::remove(g_executing_paint_jobs.begin(), g_executing_paint_jobs.end(), job),
+                g_executing_paint_jobs.end());
         }
         g_paint_jobs_cv.notify_all();
     }
@@ -359,6 +606,10 @@ namespace
                 return false;
             }
             job->dispatched = true;
+            if (job->state.load(std::memory_order_relaxed) == static_cast<int>(PaintJobState::Queued))
+            {
+                job->state.store(static_cast<int>(PaintJobState::Executing), std::memory_order_release);
+            }
         }
         g_paint_jobs_cv.notify_all();
         return true;
@@ -482,10 +733,126 @@ namespace
         return {reinterpret_cast<std::uintptr_t>(base), nt->OptionalHeader.SizeOfImage};
     }
 
+    struct ModuleTextFileIdentity
+    {
+        bool ok{false};
+        std::uint32_t raw_size{0};
+        std::uint64_t fnv1a64{0};
+    };
+
+    auto main_module_text_file_identity() -> ModuleTextFileIdentity
+    {
+        wchar_t module_path[MAX_PATH]{};
+        if (!GetModuleFileNameW(nullptr, module_path, MAX_PATH))
+        {
+            return {};
+        }
+        const HANDLE file = CreateFileW(module_path,
+                                        GENERIC_READ,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr,
+                                        OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL,
+                                        nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return {};
+        }
+        LARGE_INTEGER file_size{};
+        if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0)
+        {
+            CloseHandle(file);
+            return {};
+        }
+        const HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!mapping)
+        {
+            CloseHandle(file);
+            return {};
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
+        if (!bytes)
+        {
+            CloseHandle(mapping);
+            CloseHandle(file);
+            return {};
+        }
+
+        ModuleTextFileIdentity out{};
+        const auto size = static_cast<std::uint64_t>(file_size.QuadPart);
+        if (size >= sizeof(IMAGE_DOS_HEADER))
+        {
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(bytes);
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0 &&
+                static_cast<std::uint64_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) <= size)
+            {
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(bytes + dos->e_lfanew);
+                const auto* sections = IMAGE_FIRST_SECTION(nt);
+                const auto section_table_offset =
+                    static_cast<std::uint64_t>(reinterpret_cast<const std::uint8_t*>(sections) - bytes);
+                const auto section_table_size =
+                    static_cast<std::uint64_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+                if (nt->Signature == IMAGE_NT_SIGNATURE &&
+                    nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+                    section_table_offset + section_table_size <= size)
+                {
+                    for (unsigned index = 0; index < nt->FileHeader.NumberOfSections; ++index)
+                    {
+                        const auto& section = sections[index];
+                        if (std::memcmp(section.Name, ".text", 5) != 0 ||
+                            section.PointerToRawData == 0 || section.SizeOfRawData == 0)
+                        {
+                            continue;
+                        }
+                        const auto begin = static_cast<std::uint64_t>(section.PointerToRawData);
+                        const auto length = static_cast<std::uint64_t>(section.SizeOfRawData);
+                        if (begin + length > size)
+                        {
+                            break;
+                        }
+                        std::uint64_t hash = 1469598103934665603ULL;
+                        for (std::uint64_t offset = 0; offset < length; ++offset)
+                        {
+                            hash ^= bytes[begin + offset];
+                            hash *= 1099511628211ULL;
+                        }
+                        out.ok = true;
+                        out.raw_size = section.SizeOfRawData;
+                        out.fnv1a64 = hash;
+                        break;
+                    }
+                }
+            }
+        }
+        UnmapViewOfFile(bytes);
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return out;
+    }
+
     auto address_in_main_module(std::uintptr_t address) -> bool
     {
         const auto module = main_module_range();
         return module.base && address >= module.base && address < module.base + module.size;
+    }
+
+    auto address_in_main_module_code(std::uintptr_t address) -> bool
+    {
+        const auto module = main_module_range();
+        if (!module.base || !module.size)
+        {
+            return false;
+        }
+        const auto* base = reinterpret_cast<const std::uint8_t*>(module.base);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || nt->Signature != IMAGE_NT_SIGNATURE)
+        {
+            return false;
+        }
+        const auto code_begin = module.base + nt->OptionalHeader.BaseOfCode;
+        const auto code_end = code_begin + nt->OptionalHeader.SizeOfCode;
+        return address >= code_begin && address < code_end;
     }
 
     auto address_in_bridge_module(std::uintptr_t address) -> bool
@@ -524,6 +891,27 @@ namespace
         }
         const auto flags = safe_read<std::uint32_t>(object + OffObjectFlags, 0);
         return (flags & RFClassDefaultObject) == 0;
+    }
+
+    auto live_uobject_not_destroyed(std::uintptr_t object) -> bool
+    {
+        if (!object || address_in_main_module(object))
+        {
+            return false;
+        }
+        std::uint32_t flags = 0;
+        if (!safe_copy(&flags, reinterpret_cast<const void*>(object + OffObjectFlags), sizeof(flags)))
+        {
+            return false;
+        }
+        std::uintptr_t class_object = 0;
+        std::uint32_t class_flags = 0;
+        return safe_copy(&class_object, reinterpret_cast<const void*>(object + OffClass), sizeof(class_object)) &&
+               class_object && !address_in_main_module(class_object) &&
+               safe_copy(&class_flags,
+                         reinterpret_cast<const void*>(class_object + OffObjectFlags),
+                         sizeof(class_flags)) &&
+               runtime_contract::uobject_flags_usable(flags, class_flags);
     }
 
     auto match_pattern(const std::uint8_t* data, const std::uint8_t* pattern, const std::uint8_t* mask, std::size_t length) -> bool
@@ -1393,6 +1781,67 @@ namespace
         return out;
     }
 
+    auto paint_probe_native_pointer_scan(std::uintptr_t function) -> std::string
+    {
+        if (!function)
+        {
+            return "";
+        }
+        const auto module = main_module_range();
+        std::string out{};
+        for (int offset = 0; offset <= 0x180; offset += 8)
+        {
+            const auto candidate = safe_read<std::uintptr_t>(function + static_cast<std::uintptr_t>(offset));
+            if (!address_in_main_module_code(candidate))
+            {
+                continue;
+            }
+            if (!out.empty())
+            {
+                out += ";";
+            }
+            out += hex_address(static_cast<std::uintptr_t>(offset)) + "=" + hex_address(candidate);
+            if (module.base && candidate >= module.base)
+            {
+                out += "@rva" + hex_address(candidate - module.base);
+            }
+        }
+        return out;
+    }
+
+    auto paint_probe_declared_function_inventory(Reflection& ref,
+                                                  std::uintptr_t structure,
+                                                  int max_functions = 128) -> std::string
+    {
+        if (!structure)
+        {
+            return "[]";
+        }
+        std::string out{"["};
+        int returned = 0;
+        int visited = 0;
+        for (auto child = safe_read<std::uintptr_t>(structure + OffChildren);
+             child && visited < 512 && returned < max_functions;
+             child = safe_read<std::uintptr_t>(child + OffUFieldNext), ++visited)
+        {
+            if (lower_copy(ref.class_name(child)) != "function")
+            {
+                continue;
+            }
+            if (returned > 0)
+            {
+                out += ",";
+            }
+            out += "{\"name\":\"" + json_escape(ref.object_name(child)) + "\"";
+            out += ",\"function\":\"" + hex_address(child) + "\"";
+            out += ",\"params_size\":" + std::to_string(safe_read<int>(child + OffPropertiesSize, -1));
+            out += ",\"native_pointer_scan\":\"" + json_escape(paint_probe_native_pointer_scan(child)) + "\"}";
+            ++returned;
+        }
+        out += "]";
+        return out;
+    }
+
     auto paint_replication_function_probe_metadata(Reflection& ref,
                                                    std::uintptr_t object,
                                                    const char* prefix,
@@ -1422,6 +1871,8 @@ namespace
                 metadata += ",\"" + name_key + "_params_size\":" + std::to_string(safe_read<int>(function + OffPropertiesSize, -1));
                 metadata += ",\"" + name_key + "_schema\":\"" + json_escape(paint_probe_function_schema(ref, function)) + "\"";
                 metadata += ",\"" + name_key + "_deep_schema\":\"" + json_escape(paint_probe_function_deep_schema(ref, function)) + "\"";
+                metadata += ",\"" + name_key + "_native_pointer_scan\":\"" +
+                            json_escape(paint_probe_native_pointer_scan(function)) + "\"";
                 metadata += ",\"" + name_key + "_batch_schema\":\"" + json_escape(paint_probe_struct_schema_for_param(ref, function, "Batch")) + "\"";
                 metadata += ",\"" + name_key + "_stroke_schema\":\"" + json_escape(paint_probe_struct_schema_for_param(ref, function, "Stroke")) + "\"";
             }
@@ -1470,6 +1921,51 @@ namespace
                 }
             }
         }
+        return metadata;
+    }
+
+    auto paint_property_offset_inventory_metadata(Reflection& ref,
+                                                  std::uintptr_t object,
+                                                  const char* key,
+                                                  int minimum_offset,
+                                                  int maximum_offset) -> std::string
+    {
+        const std::string name(key ? key : "paint_property_offset_inventory");
+        std::string metadata = ",\"" + name + "\":[";
+        std::unordered_set<std::string> seen{};
+        int returned = 0;
+        auto structure = live_uobject(object) ? ref.class_ptr(object) : 0;
+        for (int depth = 0; structure && depth < 32 && returned < 256; ++depth)
+        {
+            int visited = 0;
+            for (auto prop = safe_read<std::uintptr_t>(structure + OffChildProperties);
+                 prop && visited < 1024 && returned < 256;
+                 prop = safe_read<std::uintptr_t>(prop + OffFFieldNext), ++visited)
+            {
+                const auto property_name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+                const int offset = prop_offset(prop);
+                if (property_name.empty() || offset < minimum_offset || offset > maximum_offset || !seen.insert(property_name).second)
+                {
+                    continue;
+                }
+                const auto address = object + static_cast<std::uintptr_t>(offset);
+                if (returned > 0)
+                {
+                    metadata += ",";
+                }
+                metadata += "{\"name\":\"" + json_escape(property_name) + "\"";
+                metadata += ",\"offset\":" + std::to_string(offset);
+                metadata += ",\"size\":" + std::to_string(prop_element_size(prop));
+                metadata += ",\"raw_u8\":" +
+                            std::to_string(static_cast<unsigned>(safe_read<std::uint8_t>(address, 0)));
+                metadata += ",\"raw_u32\":" + std::to_string(safe_read<std::uint32_t>(address, 0));
+                metadata += "}";
+                ++returned;
+            }
+            structure = safe_read<std::uintptr_t>(structure + OffSuperStruct);
+        }
+        metadata += "]";
+        metadata += ",\"" + name + "_count\":" + std::to_string(returned);
         return metadata;
     }
 
@@ -1549,7 +2045,7 @@ namespace
             failure = "process_event_target_untrusted";
             return false;
         }
-        auto_event_watch_record(function, params);
+        auto_event_watch_record(object, function, params);
         g_active_ue_calls.fetch_add(1);
         bool ok = false;
         __try
@@ -2323,6 +2819,7 @@ namespace
         }
         g_game_thread_id.store(0);
         g_game_window.store(nullptr);
+        g_paint_dispatch_message_pending.store(false, std::memory_order_release);
         g_process_event_hook_installed.store(false);
     }
 
@@ -2348,7 +2845,10 @@ namespace
             }
         }
         g_process_event_hook_slots.clear();
-        g_original_process_event.store(0);
+        // The DLL remains resident after bridge shutdown.  A CPU may already have
+        // loaded the old vtable slot and enter hooked_process_event after the slot
+        // is restored.  Retaining the verified original target lets that late
+        // callback forward the UE event instead of dropping it.
     }
 
     auto uninstall_process_event_hook() -> void
@@ -2356,6 +2856,35 @@ namespace
         uninstall_message_hook();
         uninstall_process_event_vtable_hooks();
         g_process_event_hook_installed.store(false);
+    }
+
+    auto wait_for_hook_callbacks_quiescent(std::chrono::milliseconds timeout) -> bool
+    {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        auto zero_since = std::chrono::steady_clock::time_point{};
+        constexpr auto StableZeroInterval = std::chrono::milliseconds(50);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (g_active_hook_callbacks.load(std::memory_order_acquire) == 0)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                if (zero_since.time_since_epoch().count() == 0)
+                {
+                    zero_since = now;
+                }
+                else if (now - zero_since >= StableZeroInterval)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                zero_since = {};
+            }
+            Sleep(1);
+        }
+        return zero_since.time_since_epoch().count() != 0 &&
+               std::chrono::steady_clock::now() - zero_since >= StableZeroInterval;
     }
 
     auto write_text_file_w(const std::wstring& path, const std::string& text) -> bool
@@ -2412,14 +2941,27 @@ namespace
         return {};
     }
 
-    auto auto_event_watch_snapshot_json(const char* stage) -> std::string
+    auto auto_event_watch_snapshot_json(const char* stage,
+                                        const BridgeStartBlockV1& identity,
+                                        std::uint64_t generation) -> std::string
     {
         int available = 0;
         int observed = 0;
+        std::size_t hook_slot_count = 0;
+        {
+            std::lock_guard<std::mutex> hook_lock(g_hook_mutex);
+            hook_slot_count = g_process_event_hook_slots.size();
+        }
         std::string out = "{\"stage\":\"";
         out += stage ? stage : "event_watch";
         out += "\",\"pid\":";
         out += std::to_string(GetCurrentProcessId());
+        out += ",\"instance_id\":\"";
+        out += bytes_to_hex(identity.instance_guid, 16);
+        out += "\",\"bridge_hash\":\"";
+        out += bytes_to_hex(identity.sha256, 32);
+        out += "\"";
+        out += ",\"generation\":" + std::to_string(generation);
         out += ",\"tick_ms\":";
         out += std::to_string(GetTickCount64());
         out += ",\"entries\":{";
@@ -2443,6 +2985,8 @@ namespace
             }
             out += "\"" + json_escape(entry.name) + "\":{";
             out += "\"function\":\"" + hex_address(function) + "\"";
+            out += ",\"last_process_event_object\":\"" +
+                   hex_address(entry.last_process_event_object.load()) + "\"";
             out += ",\"calls\":" + std::to_string(calls);
             out += ",\"last_array0_num\":" + std::to_string(entry.last_array0_num.load());
             out += ",\"last_array8_num\":" + std::to_string(entry.last_array8_num.load());
@@ -2452,6 +2996,20 @@ namespace
             out += ",\"last_i32_24\":" + std::to_string(entry.last_i32_24.load());
             out += ",\"total_i32_16\":" + std::to_string(entry.total_i32_16.load());
             out += ",\"total_i32_24\":" + std::to_string(entry.total_i32_24.load());
+            out += ",\"last_queued_batches_total_before\":" +
+                   std::to_string(entry.last_queued_batches_total_before.load());
+            out += ",\"last_queued_batches_total_after\":" +
+                   std::to_string(entry.last_queued_batches_total_after.load());
+            out += ",\"last_queued_batches_total_delta\":" +
+                   std::to_string(entry.last_queued_batches_total_delta.load());
+            out += ",\"queued_batches_total_positive_delta\":" +
+                   std::to_string(entry.queued_batches_total_positive_delta.load());
+            out += ",\"queued_batches_total_signed_delta\":" +
+                   std::to_string(entry.queued_batches_total_signed_delta.load());
+            out += ",\"queued_batches_delta_observations\":" +
+                   std::to_string(entry.queued_batches_delta_observations.load());
+            out += ",\"queued_batches_delta_unavailable\":" +
+                   std::to_string(entry.queued_batches_delta_unavailable.load());
             {
                 std::lock_guard<std::mutex> sample_lock(g_auto_event_watch_sample_mutex);
                 out += ",\"last_array0_sample_len\":" + std::to_string(entry.last_array0_sample_len);
@@ -2469,12 +3027,16 @@ namespace
         }
         out += "},\"available_count\":" + std::to_string(available);
         out += ",\"observed_count\":" + std::to_string(observed);
-        out += ",\"hook_slots\":" + std::to_string(g_process_event_hook_slots.size());
+        out += ",\"hook_slots\":" + std::to_string(hook_slot_count);
+        out += ",\"replication_manager\":\"" +
+               hex_address(g_auto_event_watch_replication_manager.load()) + "\"";
         out += "}\n";
         return out;
     }
 
-    auto auto_event_watch_record(std::uintptr_t function_address, std::uint8_t* params_bytes) -> void
+    auto auto_event_watch_record(std::uintptr_t object_address,
+                                 std::uintptr_t function_address,
+                                 std::uint8_t* params_bytes) -> void
     {
         if (!g_auto_event_watch_enabled.load() || !params_bytes)
         {
@@ -2551,7 +3113,15 @@ namespace
             {
                 continue;
             }
+            entry.last_process_event_object.store(object_address);
             entry.calls.fetch_add(1);
+            // PaintAtUVWithBrush has a fixed value-parameter layout rather than
+            // the batch TArray layout decoded below.  The watch only needs its
+            // receiver and call count, so avoid producing misleading field data.
+            if (std::strcmp(entry.name, "PaintAtUVWithBrush") == 0)
+            {
+                return;
+            }
             const int array0 = read_array_num(0);
             const int array8 = read_array_num(8);
             const int i32_16 = read_i32(16);
@@ -2592,13 +3162,71 @@ namespace
         }
     }
 
+    auto reset_auto_event_watch_state() -> void
+    {
+        g_auto_event_watch_replication_manager.store(0);
+        for (auto& entry : g_auto_event_watch)
+        {
+            entry.function.store(0);
+            entry.calls.store(0);
+            entry.last_array0_num.store(-1);
+            entry.last_array8_num.store(-1);
+            entry.total_array0_num.store(0);
+            entry.total_array8_num.store(0);
+            entry.last_i32_16.store(-1);
+            entry.last_i32_24.store(-1);
+            entry.total_i32_16.store(0);
+            entry.total_i32_24.store(0);
+            entry.last_queued_batches_total_before.store(-1);
+            entry.last_queued_batches_total_after.store(-1);
+            entry.last_queued_batches_total_delta.store(0);
+            entry.queued_batches_total_positive_delta.store(0);
+            entry.queued_batches_total_signed_delta.store(0);
+            entry.queued_batches_delta_observations.store(0);
+            entry.queued_batches_delta_unavailable.store(0);
+            entry.last_process_event_object.store(0);
+        }
+        std::lock_guard<std::mutex> sample_lock(g_auto_event_watch_sample_mutex);
+        for (auto& entry : g_auto_event_watch)
+        {
+            entry.last_array0_sample.fill(0);
+            entry.last_array0_sample_len = 0;
+            entry.last_array0_sample_total_len = 0;
+            entry.last_array0_sample_element_size = 1;
+            entry.last_array8_sample.fill(0);
+            entry.last_array8_sample_len = 0;
+            entry.last_array8_sample_total_len = 0;
+            entry.last_array8_sample_element_size = 1;
+        }
+    }
+
+    auto stop_auto_event_watch_and_join() -> void
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(g_auto_event_watch_lifecycle_mutex);
+        g_auto_event_watch_enabled.store(false, std::memory_order_release);
+        g_auto_event_watch_generation.fetch_add(1, std::memory_order_acq_rel);
+        g_auto_event_watch_wait_cv.notify_all();
+        if (g_auto_event_watch_writer.joinable())
+        {
+            g_auto_event_watch_writer.join();
+        }
+        g_auto_event_watch_writer_running.store(false, std::memory_order_release);
+    }
+
     auto start_auto_event_watch_if_configured() -> void
     {
         const auto output_path = auto_event_watch_output_path();
-        if (output_path.empty() || g_auto_event_watch_enabled.load())
+        if (output_path.empty())
         {
             return;
         }
+
+        std::lock_guard<std::mutex> lifecycle_lock(g_auto_event_watch_lifecycle_mutex);
+        if (g_auto_event_watch_enabled.load(std::memory_order_acquire) || g_auto_event_watch_writer.joinable())
+        {
+            return;
+        }
+        reset_auto_event_watch_state();
 
         Reflection ref{};
         std::string failure{};
@@ -2642,19 +3270,41 @@ namespace
             return false;
         });
 
-        g_auto_event_watch_path = output_path;
-        g_auto_event_watch_enabled.store(true);
-        g_auto_event_watch_writer_running.store(true);
-        write_text_file_w(output_path, auto_event_watch_snapshot_json("event_watch_started"));
-        std::thread([]() {
-            while (g_auto_event_watch_enabled.load())
-            {
-                write_text_file_w(g_auto_event_watch_path, auto_event_watch_snapshot_json("event_watch_running"));
-                Sleep(1000);
-            }
-            write_text_file_w(g_auto_event_watch_path, auto_event_watch_snapshot_json("event_watch_stopped"));
-            g_auto_event_watch_writer_running.store(false);
-        }).detach();
+        const auto generation = g_auto_event_watch_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const BridgeStartBlockV1 identity = g_bridge_identity;
+        g_auto_event_watch_enabled.store(true, std::memory_order_release);
+        g_auto_event_watch_writer_running.store(true, std::memory_order_release);
+        write_text_file_w(output_path, auto_event_watch_snapshot_json("event_watch_started", identity, generation));
+        try
+        {
+            g_auto_event_watch_writer = std::thread([output_path, identity, generation]() {
+                while (runtime_contract::event_watch_generation_active(
+                    g_auto_event_watch_enabled.load(std::memory_order_acquire),
+                    g_auto_event_watch_generation.load(std::memory_order_acquire),
+                    generation))
+                {
+                    write_text_file_w(output_path, auto_event_watch_snapshot_json("event_watch_running", identity, generation));
+                    std::unique_lock<std::mutex> wait_lock(g_auto_event_watch_wait_mutex);
+                    g_auto_event_watch_wait_cv.wait_for(wait_lock,
+                                                        std::chrono::seconds(1),
+                                                        [generation]() {
+                                                            return !runtime_contract::event_watch_generation_active(
+                                                                g_auto_event_watch_enabled.load(std::memory_order_acquire),
+                                                                g_auto_event_watch_generation.load(std::memory_order_acquire),
+                                                                generation);
+                                                        });
+                }
+                write_text_file_w(output_path, auto_event_watch_snapshot_json("event_watch_stopped", identity, generation));
+                g_auto_event_watch_writer_running.store(false, std::memory_order_release);
+            });
+        }
+        catch (...)
+        {
+            g_auto_event_watch_enabled.store(false, std::memory_order_release);
+            g_auto_event_watch_writer_running.store(false, std::memory_order_release);
+            g_auto_event_watch_generation.fetch_add(1, std::memory_order_acq_rel);
+            write_text_file_w(output_path, "{\"stage\":\"event_watch_writer_start_failed\"}\n");
+        }
         (void)hook_slots;
     }
 
@@ -2695,6 +3345,10 @@ namespace
         std::uintptr_t controller{0};
         std::uintptr_t k2_get_pawn_function{0};
         std::uintptr_t pawn{0};
+        // Preserve the pawn directly returned by the local controller. `pawn` may later be
+        // replaced by component fallback selection, so it cannot by itself label inventory items
+        // as local or remote.
+        std::uintptr_t local_pawn_from_controller{0};
         std::uintptr_t k2_get_actor_location_function{0};
         sdk::FVector body_world_position{};
         std::uintptr_t component{0};
@@ -3326,6 +3980,7 @@ namespace
             ctx.message = "K2_GetPawn returned null or invalid pawn";
             return ctx;
         }
+        ctx.local_pawn_from_controller = ctx.pawn;
         ctx.k2_get_actor_location_function = ref.find_function(ctx.pawn, "K2_GetActorLocation");
         if (ctx.k2_get_actor_location_function)
         {
@@ -3883,7 +4538,7 @@ namespace
 
     auto sdk_transform_score(const sdk::FTransform& transform) -> int
     {
-        if (!sdk_transform_finite(transform))
+        if (!sdk::transform_is_plausible(transform))
         {
             return -1000000;
         }
@@ -3911,6 +4566,35 @@ namespace
             score += 4;
         }
         return score;
+    }
+
+    auto mesh_first_transform_diagnostic_metadata(const char* prefix,
+                                                  bool available,
+                                                  const sdk::FTransform& transform) -> std::string
+    {
+        const std::string key(prefix ? prefix : "component_transform");
+        std::string metadata = ",\"" + key + "_available\":" + (available ? "true" : "false");
+        if (!available)
+        {
+            return metadata;
+        }
+        const double rotation_length = std::sqrt(transform.Rotation.X * transform.Rotation.X +
+                                                 transform.Rotation.Y * transform.Rotation.Y +
+                                                 transform.Rotation.Z * transform.Rotation.Z +
+                                                 transform.Rotation.W * transform.Rotation.W);
+        metadata += ",\"" + key + "_score\":" + std::to_string(sdk_transform_score(transform));
+        metadata += ",\"" + key + "_rotation_x\":" + std::to_string(transform.Rotation.X);
+        metadata += ",\"" + key + "_rotation_y\":" + std::to_string(transform.Rotation.Y);
+        metadata += ",\"" + key + "_rotation_z\":" + std::to_string(transform.Rotation.Z);
+        metadata += ",\"" + key + "_rotation_w\":" + std::to_string(transform.Rotation.W);
+        metadata += ",\"" + key + "_rotation_length\":" + std::to_string(rotation_length);
+        metadata += ",\"" + key + "_translation_x\":" + std::to_string(transform.Translation.X);
+        metadata += ",\"" + key + "_translation_y\":" + std::to_string(transform.Translation.Y);
+        metadata += ",\"" + key + "_translation_z\":" + std::to_string(transform.Translation.Z);
+        metadata += ",\"" + key + "_scale_x\":" + std::to_string(transform.Scale3D.X);
+        metadata += ",\"" + key + "_scale_y\":" + std::to_string(transform.Scale3D.Y);
+        metadata += ",\"" + key + "_scale_z\":" + std::to_string(transform.Scale3D.Z);
+        return metadata;
     }
 
     auto sdk_read_transform_array(std::uintptr_t data,
@@ -4171,6 +4855,55 @@ namespace
                                      double barycentric_b,
                                      double barycentric_c) -> sdk::FPaintStroke;
     auto sdk_strokes_are_packed_compatible(const std::vector<sdk::FPaintStroke>& strokes) -> bool;
+    auto sdk_guid_is_zero(const sdk::FGuid& id) -> bool;
+
+    struct InternalNoResendRoute
+    {
+        bool resolved{false};
+        std::string status{"not_requested"};
+        std::string failure{};
+        std::uintptr_t thunk{0};
+        std::uintptr_t impl{0};
+        std::uintptr_t stroke_constructor{0};
+        std::uintptr_t common{0};
+    };
+
+    struct LocalPackedQueueRoute
+    {
+        bool resolved{false};
+        std::string status{"not_requested"};
+        std::string failure{};
+        std::uintptr_t thunk{0};
+        std::uintptr_t implementation{0};
+        std::uintptr_t decoder{0};
+        std::uintptr_t enqueue_inner{0};
+        std::uintptr_t manager_enqueue{0};
+        std::uintptr_t component_context_resolver{0};
+        std::uintptr_t manager_resolver{0};
+    };
+
+    auto resolve_internal_no_resend_route(Reflection& ref,
+                                          std::uintptr_t paint_at_uv_with_brush_function) -> InternalNoResendRoute;
+    auto resolve_local_packed_queue_route(Reflection& ref,
+                                          std::uintptr_t component,
+                                          std::uintptr_t multicast_packed_paint_batch_function) -> LocalPackedQueueRoute;
+    auto sdk_resolve_local_packed_queue_manager(std::uintptr_t component,
+                                                std::uintptr_t component_context_resolver,
+                                                std::uintptr_t manager_resolver,
+                                                bool& exception_raised,
+                                                std::string& failure) -> std::uintptr_t;
+    auto sdk_validate_internal_common_no_resend_preconditions(std::uintptr_t component,
+                                                              std::uintptr_t stroke_constructor,
+                                                              std::uintptr_t common,
+                                                              const sdk::FPaintStroke& source,
+                                                              std::string& failure) -> bool;
+    auto sdk_call_internal_common_no_resend(std::uintptr_t component,
+                                            std::uintptr_t stroke_constructor,
+                                            std::uintptr_t common,
+                                            const sdk::FPaintStroke& source,
+                                            bool& exception_raised,
+                                            bool& common_returned,
+                                            std::string& failure) -> bool;
     auto sdk_call_paint_at_uv_with_brush(std::uintptr_t component,
                                          std::uintptr_t function,
                                          const sdk::FPaintStroke& stroke,
@@ -4188,7 +4921,127 @@ namespace
                                                   std::size_t offset,
                                                   std::size_t count,
                                                   const sdk::FGuid& source_id,
-                                                  int texture_size,
+                                                  double packed_wire_radius_scale,
+                                                  std::string& failure) -> bool;
+    auto sdk_invoke_local_packed_queue(std::uintptr_t component,
+                                       std::uintptr_t implementation,
+                                       sdk::TArray<std::uint8_t>* packed_array,
+                                       std::int32_t stroke_count,
+                                       bool& exception_raised,
+                                       bool& implementation_returned) -> bool
+    {
+        using LocalPackedReceiverFn = void(__fastcall*)(void*, sdk::TArray<std::uint8_t>*, std::int32_t);
+        exception_raised = false;
+        implementation_returned = false;
+        g_active_ue_calls.fetch_add(1);
+        __try
+        {
+            reinterpret_cast<LocalPackedReceiverFn>(implementation)(
+                reinterpret_cast<void*>(component),
+                packed_array,
+                stroke_count);
+            implementation_returned = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            exception_raised = true;
+        }
+        g_active_ue_calls.fetch_sub(1);
+        return implementation_returned && !exception_raised;
+    }
+
+    auto sdk_invoke_pointer_resolver(std::uintptr_t function,
+                                     std::uintptr_t argument,
+                                     std::uintptr_t& result,
+                                     bool& exception_raised) -> bool
+    {
+        using ResolverFn = void*(__fastcall*)(void*);
+        result = 0;
+        exception_raised = false;
+        g_active_ue_calls.fetch_add(1);
+        __try
+        {
+            result = reinterpret_cast<std::uintptr_t>(
+                reinterpret_cast<ResolverFn>(function)(reinterpret_cast<void*>(argument)));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            exception_raised = true;
+        }
+        g_active_ue_calls.fetch_sub(1);
+        return result != 0 && !exception_raised;
+    }
+
+    auto sdk_resolve_local_packed_queue_manager(std::uintptr_t component,
+                                                std::uintptr_t component_context_resolver,
+                                                std::uintptr_t manager_resolver,
+                                                bool& exception_raised,
+                                                std::string& failure) -> std::uintptr_t
+    {
+        exception_raised = false;
+        if (!address_in_main_module_code(component_context_resolver) ||
+            !address_in_main_module_code(manager_resolver))
+        {
+            failure = "local_packed_queue_manager_route_untrusted";
+            return 0;
+        }
+        if (!live_uobject_not_destroyed(component))
+        {
+            failure = "paint_component_unavailable";
+            return 0;
+        }
+        auto context = safe_read<std::uintptr_t>(component + 0xA8);
+        if (!context)
+        {
+            bool resolver_exception = false;
+            if (!sdk_invoke_pointer_resolver(component_context_resolver,
+                                             component,
+                                             context,
+                                             resolver_exception))
+            {
+                exception_raised = resolver_exception;
+                failure = resolver_exception
+                              ? "local_packed_queue_component_context_resolver_exception"
+                              : "local_packed_queue_component_context_unavailable";
+                return 0;
+            }
+        }
+        if (!live_uobject_not_destroyed(context))
+        {
+            failure = "local_packed_queue_component_context_invalid";
+            return 0;
+        }
+        std::uintptr_t manager = 0;
+        bool resolver_exception = false;
+        if (!sdk_invoke_pointer_resolver(manager_resolver,
+                                         context,
+                                         manager,
+                                         resolver_exception))
+        {
+            exception_raised = resolver_exception;
+            failure = resolver_exception
+                          ? "local_packed_queue_manager_resolver_exception"
+                          : "local_packed_queue_manager_unavailable";
+            return 0;
+        }
+        if (!live_uobject_not_destroyed(manager))
+        {
+            failure = "local_packed_queue_manager_invalid";
+            return 0;
+        }
+        failure = "ok";
+        return manager;
+    }
+
+    auto sdk_call_local_packed_queue_from_strokes(std::uintptr_t component,
+                                                  std::uintptr_t implementation,
+                                                  const std::vector<sdk::FPaintStroke>& strokes,
+                                                  std::size_t offset,
+                                                  std::size_t count,
+                                                  const sdk::FGuid& source_id,
+                                                  double packed_wire_radius_scale,
+                                                  bool& exception_raised,
+                                                  bool& implementation_returned,
                                                   std::string& failure) -> bool;
 
     auto sdk_resolve_skinned_pose(Reflection& ref,
@@ -5265,6 +6118,37 @@ namespace
         std::vector<std::uint8_t> roughness_bytes{};
     };
 
+    struct MeshFirstResearchTextureSnapshot
+    {
+        bool available{false};
+        std::uintptr_t component{0};
+        std::vector<std::uint8_t> albedo_bytes{};
+        std::vector<std::uint8_t> metallic_bytes{};
+        std::vector<std::uint8_t> roughness_bytes{};
+    };
+
+    struct MeshFirstResearchTextureDelta
+    {
+        bool capture_ok{false};
+        bool baseline_available{false};
+        bool baseline_component_match{false};
+        bool albedo_dump_written{false};
+        int albedo_dump_texture_size{0};
+        std::string albedo_dump_path{};
+        int pixels_total{0};
+        int pixels_changed_any_channel{0};
+        int albedo_pixels_changed{0};
+        int metallic_pixels_changed{0};
+        int roughness_pixels_changed{0};
+        int albedo_bytes_changed{0};
+        int metallic_bytes_changed{0};
+        int roughness_bytes_changed{0};
+        MeshFirstChannelChecksum albedo_checksum{};
+        MeshFirstChannelChecksum metallic_checksum{};
+        MeshFirstChannelChecksum roughness_checksum{};
+        std::string failure{"not_run"};
+    };
+
     struct MeshFirstPaintMaterialPattern
     {
         sdk::FLinearColor albedo_color{};
@@ -5298,6 +6182,14 @@ namespace
 
     std::mutex g_mesh_first_preview_mutex;
     MeshFirstPreviewSnapshot g_mesh_first_preview_snapshot{};
+    std::mutex g_mesh_first_research_texture_mutex;
+    MeshFirstResearchTextureSnapshot g_mesh_first_research_texture_snapshot{};
+
+    auto mesh_first_clear_research_texture_snapshot() -> void
+    {
+        std::lock_guard<std::mutex> lock(g_mesh_first_research_texture_mutex);
+        g_mesh_first_research_texture_snapshot = {};
+    }
 
     auto mesh_first_store_preview_snapshot(std::uintptr_t component,
                                            int texture_size,
@@ -5474,6 +6366,38 @@ namespace
         return hash;
     }
 
+    auto mesh_first_hash_stroke_plan(const std::vector<sdk::FPaintStroke>& strokes) -> std::uint64_t
+    {
+        std::uint64_t hash = 1469598103934665603ULL;
+        auto append = [&hash](const void* data, std::size_t size) {
+            const auto* bytes = static_cast<const std::uint8_t*>(data);
+            for (std::size_t index = 0; index < size; ++index)
+            {
+                hash ^= static_cast<std::uint64_t>(bytes[index]);
+                hash *= 1099511628211ULL;
+            }
+        };
+
+        const auto count = static_cast<std::uint64_t>(strokes.size());
+        append(&count, sizeof(count));
+        for (const auto& stroke : strokes)
+        {
+            auto canonical = stroke;
+            const std::uint8_t has_brush_texture = canonical.BrushSettings.BrushTexture ? 1 : 0;
+            canonical.BrushSettings.BrushTexture = nullptr;
+            std::memset(canonical.Pad_29, 0, sizeof(canonical.Pad_29));
+            std::memset(canonical.Pad_4A, 0, sizeof(canonical.Pad_4A));
+            std::memset(canonical.BrushSettings.Pad_12, 0, sizeof(canonical.BrushSettings.Pad_12));
+            std::memset(canonical.BrushSettings.Pad_24, 0, sizeof(canonical.BrushSettings.Pad_24));
+            std::memset(canonical.ChannelData.Pad_1D, 0, sizeof(canonical.ChannelData.Pad_1D));
+            std::memset(canonical.Pad_B1, 0, sizeof(canonical.Pad_B1));
+            std::memset(canonical.Pad_DC, 0, sizeof(canonical.Pad_DC));
+            append(&canonical, sizeof(canonical));
+            append(&has_brush_texture, sizeof(has_brush_texture));
+        }
+        return hash;
+    }
+
     auto mesh_first_export_channel_bytes(Reflection& ref,
                                          std::uintptr_t component,
                                          sdk::EPaintChannel channel) -> MeshFirstChannelBytes
@@ -5575,6 +6499,123 @@ namespace
         out.failure.clear();
         out.bytes = static_cast<int>(bytes.bytes.size());
         out.hash = mesh_first_hash_channel_bytes(bytes.bytes);
+        return out;
+    }
+
+    auto mesh_first_capture_research_texture_delta(Reflection& ref,
+                                                   std::uintptr_t component) -> MeshFirstResearchTextureDelta
+    {
+        MeshFirstResearchTextureDelta out{};
+        const auto albedo = mesh_first_export_channel_bytes(ref, component, sdk::EPaintChannel::Albedo);
+        const auto metallic = mesh_first_export_channel_bytes(ref, component, sdk::EPaintChannel::Metallic);
+        const auto roughness = mesh_first_export_channel_bytes(ref, component, sdk::EPaintChannel::Roughness);
+        auto assign_checksum = [](const MeshFirstChannelBytes& bytes, MeshFirstChannelChecksum& checksum) {
+            checksum.ok = bytes.ok;
+            checksum.failure = bytes.failure;
+            checksum.bytes = static_cast<int>(bytes.bytes.size());
+            if (bytes.ok)
+            {
+                checksum.hash = mesh_first_hash_channel_bytes(bytes.bytes);
+            }
+        };
+        assign_checksum(albedo, out.albedo_checksum);
+        assign_checksum(metallic, out.metallic_checksum);
+        assign_checksum(roughness, out.roughness_checksum);
+        if (!albedo.ok || !metallic.ok || !roughness.ok)
+        {
+            out.failure = "channel_export_failed:albedo=" + albedo.failure +
+                          ";metallic=" + metallic.failure +
+                          ";roughness=" + roughness.failure;
+            return out;
+        }
+        if (albedo.bytes.empty() ||
+            albedo.bytes.size() != metallic.bytes.size() ||
+            albedo.bytes.size() != roughness.bytes.size() ||
+            (albedo.bytes.size() % 4U) != 0U)
+        {
+            out.failure = "channel_export_layout_mismatch";
+            return out;
+        }
+
+        const std::size_t pixel_count = albedo.bytes.size() / 4U;
+        out.pixels_total = static_cast<int>(std::min<std::size_t>(
+            pixel_count,
+            static_cast<std::size_t>(std::numeric_limits<int>::max())));
+        const int square_size = static_cast<int>(std::lround(std::sqrt(
+            static_cast<double>(pixel_count))));
+        if (square_size > 0 &&
+            static_cast<std::size_t>(square_size) * static_cast<std::size_t>(square_size) == pixel_count)
+        {
+            const auto directory = runtime_log_dir_path();
+            if (!directory.empty())
+            {
+                const auto path = directory + L"\\research-texture-albedo-" +
+                                  std::to_wstring(GetTickCount64()) + L".rgba";
+                out.albedo_dump_written = write_binary_file_w(path, albedo.bytes);
+                if (out.albedo_dump_written)
+                {
+                    out.albedo_dump_texture_size = square_size;
+                    out.albedo_dump_path.reserve(path.size());
+                    for (const auto ch : path)
+                    {
+                        out.albedo_dump_path.push_back(
+                            ch >= 0 && ch < 128 ? static_cast<char>(ch) : '?');
+                    }
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mesh_first_research_texture_mutex);
+            const auto& baseline = g_mesh_first_research_texture_snapshot;
+            out.baseline_available = baseline.available;
+            out.baseline_component_match = baseline.available && baseline.component == component;
+            const bool comparable = out.baseline_component_match &&
+                                    baseline.albedo_bytes.size() == albedo.bytes.size() &&
+                                    baseline.metallic_bytes.size() == metallic.bytes.size() &&
+                                    baseline.roughness_bytes.size() == roughness.bytes.size();
+            if (comparable)
+            {
+                for (std::size_t pixel = 0; pixel < pixel_count; ++pixel)
+                {
+                    const std::size_t first = pixel * 4U;
+                    bool albedo_changed = false;
+                    bool metallic_changed = false;
+                    bool roughness_changed = false;
+                    for (std::size_t channel_byte = 0; channel_byte < 4U; ++channel_byte)
+                    {
+                        const std::size_t index = first + channel_byte;
+                        if (baseline.albedo_bytes[index] != albedo.bytes[index])
+                        {
+                            albedo_changed = true;
+                            ++out.albedo_bytes_changed;
+                        }
+                        if (baseline.metallic_bytes[index] != metallic.bytes[index])
+                        {
+                            metallic_changed = true;
+                            ++out.metallic_bytes_changed;
+                        }
+                        if (baseline.roughness_bytes[index] != roughness.bytes[index])
+                        {
+                            roughness_changed = true;
+                            ++out.roughness_bytes_changed;
+                        }
+                    }
+                    out.albedo_pixels_changed += albedo_changed ? 1 : 0;
+                    out.metallic_pixels_changed += metallic_changed ? 1 : 0;
+                    out.roughness_pixels_changed += roughness_changed ? 1 : 0;
+                    out.pixels_changed_any_channel +=
+                        (albedo_changed || metallic_changed || roughness_changed) ? 1 : 0;
+                }
+            }
+
+            g_mesh_first_research_texture_snapshot.available = true;
+            g_mesh_first_research_texture_snapshot.component = component;
+            g_mesh_first_research_texture_snapshot.albedo_bytes = albedo.bytes;
+            g_mesh_first_research_texture_snapshot.metallic_bytes = metallic.bytes;
+            g_mesh_first_research_texture_snapshot.roughness_bytes = roughness.bytes;
+        }
+        out.capture_ok = true;
+        out.failure = out.baseline_component_match ? "ok" : "baseline_captured";
         return out;
     }
 
@@ -5967,6 +7008,8 @@ namespace
         double barycentric_c{1.0 / 3.0};
         sdk::FVector local_position{};
         sdk::FVector world_position{};
+        sdk::FVector reference_position{};
+        bool reference_position_available{false};
         double facing_dot{0.0};
         double uv_area{0.0};
         int uv_island{-1};
@@ -5989,6 +7032,122 @@ namespace
         sdk::FVector local[3]{};
         sdk::FVector2D uv[3]{};
     };
+
+    auto mesh_first_triangle_max_units_per_uv(const MeshFirstRuntimeTriangle& triangle,
+                                               bool use_world_positions,
+                                               double& scale) -> bool
+    {
+        scale = 0.0;
+        const auto* positions = use_world_positions ? triangle.world : triangle.local;
+        const double du1 = triangle.uv[1].X - triangle.uv[0].X;
+        const double dv1 = triangle.uv[1].Y - triangle.uv[0].Y;
+        const double du2 = triangle.uv[2].X - triangle.uv[0].X;
+        const double dv2 = triangle.uv[2].Y - triangle.uv[0].Y;
+        const double determinant = du1 * dv2 - du2 * dv1;
+        if (!std::isfinite(determinant) || std::abs(determinant) <= 1.0e-12)
+        {
+            return false;
+        }
+        const auto edge1 = sdk_vec_sub(positions[1], positions[0]);
+        const auto edge2 = sdk_vec_sub(positions[2], positions[0]);
+        const auto dp_du = sdk_vec_mul(
+            sdk_vec_sub(sdk_vec_mul(edge1, dv2), sdk_vec_mul(edge2, dv1)),
+            1.0 / determinant);
+        const auto dp_dv = sdk_vec_mul(
+            sdk_vec_add(sdk_vec_mul(edge1, -du2), sdk_vec_mul(edge2, du1)),
+            1.0 / determinant);
+        const double g00 = sdk_vec_dot(dp_du, dp_du);
+        const double g01 = sdk_vec_dot(dp_du, dp_dv);
+        const double g11 = sdk_vec_dot(dp_dv, dp_dv);
+        if (!std::isfinite(g00) || !std::isfinite(g01) || !std::isfinite(g11) ||
+            g00 <= 0.0 || g11 <= 0.0)
+        {
+            return false;
+        }
+        const double discriminant = std::max(0.0,
+            (g00 - g11) * (g00 - g11) + 4.0 * g01 * g01);
+        const double largest_eigenvalue = 0.5 * (g00 + g11 + std::sqrt(discriminant));
+        if (!std::isfinite(largest_eigenvalue) || largest_eigenvalue <= 0.0)
+        {
+            return false;
+        }
+        scale = std::sqrt(largest_eigenvalue);
+        return std::isfinite(scale) && scale > 0.0;
+    }
+
+    struct MeshFirstPackedRadiusCalibration
+    {
+        bool ok{false};
+        double mesh_sphere_radius{0.0};
+        double mesh_bounds_diameter{0.0};
+        double uv_area_sum{0.0};
+        double weighted_world_units_per_uv{0.0};
+        double raw_world_scale{0.0};
+        double scale{0.0};
+        int valid_triangles{0};
+        int invalid_triangles{0};
+        std::string failure{"not_run"};
+    };
+
+    auto mesh_first_resolve_packed_radius_calibration(
+        std::uintptr_t mesh,
+        const std::vector<MeshFirstRuntimeTriangle>& triangles) -> MeshFirstPackedRadiusCalibration
+    {
+        MeshFirstPackedRadiusCalibration out{};
+        // Exact Shipping build: USkeletalMeshComponent inherited
+        // FBoxSphereBounds3d::SphereRadius is a double at +0x138.  Native
+        // preflight RVA 0x50F6110 reads and doubles this same field.
+        constexpr std::uintptr_t MeshBoundsSphereRadiusOffset = 0x138;
+        if (!live_uobject(mesh) ||
+            !safe_copy(&out.mesh_sphere_radius,
+                       reinterpret_cast<const void*>(mesh + MeshBoundsSphereRadiusOffset),
+                       sizeof(out.mesh_sphere_radius)) ||
+            !std::isfinite(out.mesh_sphere_radius) || out.mesh_sphere_radius <= 0.0)
+        {
+            out.failure = "mesh_bounds_sphere_radius_unavailable";
+            return out;
+        }
+        out.mesh_bounds_diameter = out.mesh_sphere_radius * 2.0;
+        double weighted_sum = 0.0;
+        for (const auto& triangle : triangles)
+        {
+            const double du1 = triangle.uv[1].X - triangle.uv[0].X;
+            const double dv1 = triangle.uv[1].Y - triangle.uv[0].Y;
+            const double du2 = triangle.uv[2].X - triangle.uv[0].X;
+            const double dv2 = triangle.uv[2].Y - triangle.uv[0].Y;
+            const double uv_area = std::abs(du1 * dv2 - du2 * dv1) * 0.5;
+            double world_units_per_uv = 0.0;
+            if (!std::isfinite(uv_area) || uv_area <= 1.0e-12 ||
+                !mesh_first_triangle_max_units_per_uv(triangle,
+                                                       true,
+                                                       world_units_per_uv))
+            {
+                ++out.invalid_triangles;
+                continue;
+            }
+            out.uv_area_sum += uv_area;
+            weighted_sum += uv_area * world_units_per_uv;
+            ++out.valid_triangles;
+        }
+        if (out.valid_triangles <= 0 || out.invalid_triangles > 0 ||
+            !std::isfinite(out.uv_area_sum) || out.uv_area_sum <= 0.0 ||
+            !std::isfinite(weighted_sum) || weighted_sum <= 0.0)
+        {
+            out.failure = "triangle_uv_world_scale_invalid";
+            return out;
+        }
+        out.weighted_world_units_per_uv = weighted_sum / out.uv_area_sum;
+        out.raw_world_scale = out.weighted_world_units_per_uv / out.mesh_bounds_diameter;
+        out.scale = out.raw_world_scale * runtime_contract::PackedMeshAnchorCoverageSafetyFactor;
+        if (!std::isfinite(out.scale) || out.scale < 0.5 || out.scale > 6.0)
+        {
+            out.failure = "packed_radius_calibration_out_of_range";
+            return out;
+        }
+        out.ok = true;
+        out.failure = "ok";
+        return out;
+    }
 
     struct MeshFirstRuntimeTriangleCache
     {
@@ -6754,6 +7913,8 @@ namespace
 
     auto mesh_first_emit_runtime_triangle_sample(std::vector<MeshFirstPlanSample>& samples,
                                                  const MeshFirstRuntimeTriangle& triangle,
+                                                 const sdk::FVector (&reference_triangle)[3],
+                                                 bool reference_position_available,
                                                  const MeshFirstProfile::TriangleMeta& meta,
                                                  int triangle_index,
                                                  MeshFirstRegion region,
@@ -6777,6 +7938,12 @@ namespace
         sample.barycentric_c = c;
         sample.local_position = sdk_vec_add(sdk_vec_add(sdk_vec_mul(triangle.local[0], a), sdk_vec_mul(triangle.local[1], b)), sdk_vec_mul(triangle.local[2], c));
         sample.world_position = sdk_vec_add(sdk_vec_add(sdk_vec_mul(triangle.world[0], a), sdk_vec_mul(triangle.world[1], b)), sdk_vec_mul(triangle.world[2], c));
+        sample.reference_position = sdk_vec_add(
+            sdk_vec_add(sdk_vec_mul(reference_triangle[0], a),
+                        sdk_vec_mul(reference_triangle[1], b)),
+            sdk_vec_mul(reference_triangle[2], c));
+        sample.reference_position_available = reference_position_available &&
+                                              mesh_first_finite_vector(sample.reference_position);
         sample.uv_island = meta.uv_island;
         sample.dominant_bone = meta.dominant_bone;
         sample.body_region = meta.body_region;
@@ -6833,7 +8000,8 @@ namespace
                 if (profile)
                 {
                     const int vertex_index = profile->indices[index_base + static_cast<std::size_t>(vertex_slot)];
-                    if (vertex_index < 0 || vertex_index >= profile->vertex_count)
+                    if (vertex_index < 0 || vertex_index >= profile->vertex_count ||
+                        static_cast<std::size_t>(vertex_index) >= profile->vertices.size())
                     {
                         valid_indices = false;
                         continue;
@@ -6851,6 +8019,19 @@ namespace
             {
                 ++stats.invalid_triangles;
                 continue;
+            }
+            sdk::FVector reference_triangle[3]{triangle.local[0], triangle.local[1], triangle.local[2]};
+            bool reference_position_available = false;
+            if (profile)
+            {
+                reference_position_available = true;
+                for (int vertex_slot = 0; vertex_slot < 3; ++vertex_slot)
+                {
+                    const int vertex_index = profile->indices[index_base + static_cast<std::size_t>(vertex_slot)];
+                    reference_triangle[vertex_slot] = profile->vertices[static_cast<std::size_t>(vertex_index)].position;
+                    reference_position_available = reference_position_available &&
+                                                   mesh_first_finite_vector(reference_triangle[vertex_slot]);
+                }
             }
             const auto world_normal = sdk_vec_normalize(sdk_vec_cross(sdk_vec_sub(triangle.world[1], triangle.world[0]),
                                                                       sdk_vec_sub(triangle.world[2], triangle.world[0])));
@@ -6926,13 +8107,37 @@ namespace
                     {
                         continue;
                     }
-                    mesh_first_emit_runtime_triangle_sample(samples, triangle, meta, static_cast<int>(tri), region, source_candidate, camera_facing, uv_area, a, b, c);
+                    mesh_first_emit_runtime_triangle_sample(samples,
+                                                            triangle,
+                                                            reference_triangle,
+                                                            reference_position_available,
+                                                            meta,
+                                                            static_cast<int>(tri),
+                                                            region,
+                                                            source_candidate,
+                                                            camera_facing,
+                                                            uv_area,
+                                                            a,
+                                                            b,
+                                                            c);
                     ++emitted;
                 }
             }
             if (emitted == 0 && uv_area > 0.0)
             {
-                mesh_first_emit_runtime_triangle_sample(samples, triangle, meta, static_cast<int>(tri), region, source_candidate, camera_facing, uv_area, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0);
+                mesh_first_emit_runtime_triangle_sample(samples,
+                                                        triangle,
+                                                        reference_triangle,
+                                                        reference_position_available,
+                                                        meta,
+                                                        static_cast<int>(tri),
+                                                        region,
+                                                        source_candidate,
+                                                        camera_facing,
+                                                        uv_area,
+                                                        1.0 / 3.0,
+                                                        1.0 / 3.0,
+                                                        1.0 / 3.0);
             }
         }
 
@@ -7700,7 +8905,9 @@ namespace
     static_assert(sizeof(MeshFirstGetReplicationPressureParams) == 0x10,
                   "GetReplicationPressure params layout mismatch");
 
-    auto mesh_first_capture_replication_snapshot(Reflection& ref, std::uintptr_t component) -> MeshFirstReplicationSnapshot
+    auto mesh_first_capture_replication_snapshot(Reflection& ref,
+                                                 std::uintptr_t component,
+                                                 std::uintptr_t manager_hint = 0) -> MeshFirstReplicationSnapshot
     {
         MeshFirstReplicationSnapshot snapshot{};
         if (live_uobject(component))
@@ -7735,7 +8942,7 @@ namespace
             snapshot.failure = "paint_component_unavailable";
         }
 
-        const auto manager = ref.find_first_instance("RuntimePaintReplicationManager");
+        const auto manager = manager_hint ? manager_hint : ref.find_first_instance("RuntimePaintReplicationManager");
         snapshot.manager = manager;
         snapshot.manager_available = live_uobject(manager);
         if (!snapshot.manager_available)
@@ -8006,7 +9213,9 @@ namespace
     enum class MeshFirstBatchPhase
     {
         Planning,
+        Preflight,
         ServerBatch,
+        LocalQueueDrain,
         LocalTextureImport,
         TextureSyncObserve,
         ServerTextureSync,
@@ -8016,26 +9225,94 @@ namespace
         Failed
     };
 
+    struct InternalNoResendPreflightDescriptor
+    {
+        std::uintptr_t brush_texture{0};
+        int target_channel{0};
+        std::size_t representative_stroke{0};
+        int covered_strokes{0};
+    };
+
     struct MeshFirstServerBatchAsyncJob
     {
         std::shared_ptr<QueuedPaintJob> queued{};
         std::uintptr_t controller{0};
         std::uintptr_t pawn{0};
         std::uintptr_t component{0};
+        std::uintptr_t component_class{0};
+        std::uintptr_t component_outer{0};
         std::uintptr_t relay_component{0};
         std::uintptr_t k2_get_pawn_function{0};
         std::uintptr_t server_packed_paint_batch_function{0};
         std::uintptr_t server_relay_packed_stroke_batch_function{0};
         std::uintptr_t local_paint_at_uv_function{0};
+        bool local_packed_queue_enabled{false};
+        std::string local_packed_queue_resolver_status{"not_requested"};
+        std::string local_packed_queue_resolver_failure{};
+        std::uintptr_t local_packed_queue_thunk{0};
+        std::uintptr_t local_packed_queue_implementation{0};
+        std::uintptr_t local_packed_queue_decoder{0};
+        std::uintptr_t local_packed_queue_enqueue_inner{0};
+        std::uintptr_t local_packed_queue_manager_enqueue{0};
+        std::uintptr_t local_packed_queue_component_context_resolver{0};
+        std::uintptr_t local_packed_queue_manager_resolver{0};
+        sdk::FGuid local_packed_queue_source_id{};
+        int local_packed_queue_calls_returned{0};
+        int local_packed_queue_call_exceptions{0};
+        int local_packed_queue_strokes_submitted{0};
+        int local_packed_queue_delta_mismatches{0};
+        int local_packed_queue_last_queue_before{-1};
+        int local_packed_queue_last_queue_after{-1};
+        int local_packed_queue_last_queue_delta{-1};
+        int local_packed_queue_initial_queue{-1};
+        int local_packed_queue_drain_current_queue{-1};
+        int local_packed_queue_drain_last_queue{-1};
+        int local_packed_queue_drained_strokes{0};
+        int local_packed_queue_drain_polls{0};
+        int local_packed_queue_drain_zero_observations{0};
+        int local_packed_queue_drain_queue_increase_observations{0};
+        int local_packed_queue_drain_stall_observations{0};
+        int local_packed_queue_drain_poll_ms{250};
+        int local_packed_queue_drain_idle_timeout_ms{LocalQueueDrainIdleTimeoutMs};
+        bool local_packed_queue_drain_started{false};
+        double local_packed_queue_drain_strokes_per_ms{-1.0};
+        double local_packed_queue_drain_elapsed_ms{-1.0};
+        std::chrono::steady_clock::time_point local_packed_queue_drain_started_at{};
+        std::chrono::steady_clock::time_point local_packed_queue_drain_last_sample_at{};
+        std::chrono::steady_clock::time_point local_packed_queue_drain_last_progress_at{};
+        std::int64_t local_packed_queue_raw_i64_170_before{-1};
+        std::int64_t local_packed_queue_raw_i64_170_after{-1};
+        DWORD local_packed_queue_last_thread_id{0};
+        bool internal_no_resend_local_apply_enabled{false};
+        std::string no_resend_resolver_status{"not_requested"};
+        std::string no_resend_resolver_failure{};
+        std::uintptr_t no_resend_thunk{0};
+        std::uintptr_t no_resend_impl{0};
+        std::uintptr_t no_resend_stroke_constructor{0};
+        std::uintptr_t no_resend_common{0};
+        int internal_no_resend_calls_returned{0};
+        int internal_no_resend_calls_validated{0};
+        int internal_no_resend_call_exceptions{0};
+        DWORD internal_no_resend_last_thread_id{0};
+        bool internal_no_resend_preflight_complete{false};
+        int internal_no_resend_preflight_strokes_validated{0};
+        int internal_no_resend_preflight_descriptors_validated{0};
+        std::size_t internal_no_resend_preflight_next_descriptor{0};
+        std::vector<InternalNoResendPreflightDescriptor> internal_no_resend_preflight_descriptors{};
+        std::string internal_no_resend_preflight_failure{};
         bool server_packed_paint_batch_enabled{false};
         bool server_packed_paint_batch_use_relay{true};
         sdk::FGuid server_packed_paint_source_id{};
         std::string server_batch_rpc{"ServerPackedPaintBatch"};
+        double packed_wire_radius_scale{1.0};
         std::vector<sdk::FPaintStroke> strokes{};
         std::string metadata{};
         MeshFirstChannelChecksum albedo_before{};
         std::vector<std::uint8_t> albedo_before_bytes{};
         MeshFirstReplicationSnapshot replication_before{};
+        bool pacing_used_contract_fallback{false};
+        std::string pacing_source{"game_limits"};
+        std::string pacing_fallback_reason{};
         int server_batch_limit{PackedReplicationDefaultBatchLimit};
         int server_batch_delay_ms{PackedReplicationDefaultPacingMs};
         int local_visual_sync_batch_limit{PackedReplicationDefaultBatchLimit};
@@ -8076,12 +9353,15 @@ namespace
         int replay_front{0};
         int replay_side{0};
         int replay_back{0};
+        std::size_t replay_fill_end{0};
+        std::size_t replay_coarse_end{0};
+        int replay_pass_boundary_limited_batches{0};
         int server_batch_calls{0};
         int server_batch_success{0};
         int server_batch_failures{0};
         int server_strokes_sent{0};
         double server_batch_elapsed_ms{-1.0};
-        std::size_t offset{0};
+        std::size_t server_offset{0};
         std::string first_failure{};
         bool local_visual_sync_enabled{false};
         bool local_sync_started{false};
@@ -8128,20 +9408,191 @@ namespace
         int local_stroke_success{0};
         int local_stroke_failures{0};
         int local_batch_calls{0};
+        int local_render_target_write_budget{runtime_contract::FallbackRenderTargetWritesPerFrame};
+        int local_render_target_writes_scheduled{0};
+        int local_write_budget_yields{0};
+        int local_cpu_budget_yields{0};
+        double local_common_call_total_ms{0.0};
+        double local_common_call_max_ms{0.0};
+        double local_dispatch_total_ms{0.0};
+        double local_dispatch_max_ms{0.0};
         std::string local_visual_sync_failure{};
         std::chrono::steady_clock::time_point started{};
+        std::chrono::steady_clock::time_point server_submission_started_at{};
         std::chrono::steady_clock::time_point local_sync_started_at{};
         std::chrono::steady_clock::time_point server_texture_sync_started_at{};
         std::chrono::steady_clock::time_point texture_sync_observer_wait_started_at{};
         double local_visual_sync_elapsed_ms{0.0};
         double server_texture_sync_elapsed_ms{-1.0};
         std::chrono::steady_clock::time_point next_dispatch_time{};
+        std::chrono::steady_clock::time_point server_next_dispatch_time{};
+        std::chrono::steady_clock::time_point local_next_dispatch_time{};
         UINT_PTR dispatch_timer_id{0};
         MeshFirstBatchPhase phase{MeshFirstBatchPhase::Planning};
-        std::atomic<bool> cancel_requested{false};
+        // The job is intended to advance on the game thread. ProcessEvent hooks can
+        // be entered by more than one caller, so retain evidence of, and suppress,
+        // concurrent scheduler re-entry rather than submitting a batch twice.
+        std::atomic<bool> tick_in_progress{false};
+        std::atomic<int> tick_entries{0};
+        std::atomic<int> tick_reentrancy_suppressed{0};
+        std::atomic<DWORD> last_tick_thread_id{0};
+        std::atomic<DWORD> last_reentrant_tick_thread_id{0};
+        std::chrono::steady_clock::time_point last_progress_write_at{};
+        MeshFirstBatchPhase last_progress_phase{MeshFirstBatchPhase::Planning};
+        bool last_progress_phase_initialized{false};
+        int progress_updates_written{0};
+        int progress_updates_suppressed{0};
+        int initial_stroke_count{0};
         std::atomic<bool> completed{false};
-        std::string cancel_reason{"cancelled"};
     };
+
+    struct MeshFirstTickScope
+    {
+        std::atomic<bool>& active;
+
+        ~MeshFirstTickScope()
+        {
+            active.store(false);
+        }
+    };
+
+    auto mesh_first_tick_diagnostics_metadata(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> std::string
+    {
+        if (!job)
+        {
+            return {};
+        }
+        return ",\"scheduler_initial_stroke_count\":" + std::to_string(job->initial_stroke_count) +
+               ",\"scheduler_current_stroke_count\":" + std::to_string(job->strokes.size()) +
+               ",\"scheduler_tick_entries\":" + std::to_string(job->tick_entries.load()) +
+               ",\"scheduler_tick_reentrancy_suppressed\":" + std::to_string(job->tick_reentrancy_suppressed.load()) +
+               ",\"scheduler_last_tick_thread_id\":" + std::to_string(job->last_tick_thread_id.load()) +
+               ",\"scheduler_last_reentrant_tick_thread_id\":" +
+                   std::to_string(job->last_reentrant_tick_thread_id.load()) +
+               ",\"progress_updates_written\":" + std::to_string(job->progress_updates_written) +
+               ",\"progress_updates_suppressed\":" + std::to_string(job->progress_updates_suppressed) +
+               ",\"replay_pass_boundary_limited_batches\":" +
+                   std::to_string(job->replay_pass_boundary_limited_batches) +
+               ",\"progress_min_interval_ms\":" + std::to_string(MeshFirstProgressMinIntervalMs);
+    }
+
+    auto mesh_first_interrupted_commit_metadata(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> std::string
+    {
+        const int server_sent = job ? job->server_strokes_sent : 0;
+        const int local_submitted = job ? job->local_stroke_success : 0;
+        return ",\"partial_commit\":" +
+                   std::string(json_bool(server_sent > 0 || local_submitted > 0)) +
+               ",\"server_local_diverged\":" +
+                   std::string(json_bool(server_sent != local_submitted)) +
+               ",\"automatic_retry_safe\":false";
+    }
+
+    auto mesh_first_internal_no_resend_metadata(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> std::string
+    {
+        if (!job)
+        {
+            return {};
+        }
+        if (job->local_packed_queue_enabled)
+        {
+            const auto raw_i64_170_delta =
+                job->local_packed_queue_raw_i64_170_before >= 0 &&
+                        job->local_packed_queue_raw_i64_170_after >= 0
+                    ? job->local_packed_queue_raw_i64_170_after -
+                          job->local_packed_queue_raw_i64_170_before
+                    : -1;
+            return ",\"local_packed_queue_calls_returned\":" +
+                       std::to_string(job->local_packed_queue_calls_returned) +
+                   ",\"local_packed_queue_call_exceptions\":" +
+                       std::to_string(job->local_packed_queue_call_exceptions) +
+                   ",\"local_packed_queue_strokes_submitted\":" +
+                       std::to_string(job->local_packed_queue_strokes_submitted) +
+                   ",\"local_packed_queue_delta_mismatches\":" +
+                       std::to_string(job->local_packed_queue_delta_mismatches) +
+                   ",\"local_packed_queue_last_queue_before\":" +
+                       std::to_string(job->local_packed_queue_last_queue_before) +
+                   ",\"local_packed_queue_last_queue_after\":" +
+                       std::to_string(job->local_packed_queue_last_queue_after) +
+                   ",\"local_packed_queue_last_queue_delta\":" +
+                       std::to_string(job->local_packed_queue_last_queue_delta) +
+                   ",\"local_packed_queue_initial_queue\":" +
+                       std::to_string(job->local_packed_queue_initial_queue) +
+                   ",\"local_packed_queue_drain_started\":" +
+                       std::string(json_bool(job->local_packed_queue_drain_started)) +
+                   ",\"local_packed_queue_drain_current_queue\":" +
+                       std::to_string(job->local_packed_queue_drain_current_queue) +
+                   ",\"local_packed_queue_drained_strokes\":" +
+                       std::to_string(job->local_packed_queue_drained_strokes) +
+                   ",\"local_packed_queue_drain_polls\":" +
+                       std::to_string(job->local_packed_queue_drain_polls) +
+                   ",\"local_packed_queue_drain_zero_observations\":" +
+                       std::to_string(job->local_packed_queue_drain_zero_observations) +
+                   ",\"local_packed_queue_drain_queue_increase_observations\":" +
+                       std::to_string(job->local_packed_queue_drain_queue_increase_observations) +
+                   ",\"local_packed_queue_drain_stall_observations\":" +
+                       std::to_string(job->local_packed_queue_drain_stall_observations) +
+                   ",\"local_packed_queue_drain_idle_timeout_ms\":" +
+                       std::to_string(job->local_packed_queue_drain_idle_timeout_ms) +
+                   ",\"local_packed_queue_drain_strokes_per_sec\":" +
+                       std::to_string(job->local_packed_queue_drain_strokes_per_ms > 0.0
+                                          ? job->local_packed_queue_drain_strokes_per_ms * 1000.0
+                                          : -1.0) +
+                   ",\"local_packed_queue_drain_elapsed_ms\":" +
+                       std::to_string(job->local_packed_queue_drain_elapsed_ms) +
+                   ",\"local_packed_queue_raw_i64_170_before\":" +
+                       std::to_string(job->local_packed_queue_raw_i64_170_before) +
+                   ",\"local_packed_queue_raw_i64_170_after\":" +
+                       std::to_string(job->local_packed_queue_raw_i64_170_after) +
+                   ",\"local_packed_queue_raw_i64_170_delta\":" +
+                       std::to_string(raw_i64_170_delta) +
+                   ",\"local_packed_queue_last_thread_id\":" +
+                       std::to_string(job->local_packed_queue_last_thread_id) +
+                   ",\"local_dispatch_total_ms\":" +
+                       std::to_string(job->local_dispatch_total_ms) +
+                   ",\"local_dispatch_max_ms\":" +
+                       std::to_string(job->local_dispatch_max_ms);
+        }
+        if (!job->internal_no_resend_local_apply_enabled)
+        {
+            return {};
+        }
+        return ",\"local_apply_calls_returned\":" +
+                   std::to_string(job->internal_no_resend_calls_returned) +
+               ",\"local_apply_calls_validated\":" +
+                   std::to_string(job->internal_no_resend_calls_validated) +
+               ",\"local_apply_call_exceptions\":" +
+                   std::to_string(job->internal_no_resend_call_exceptions) +
+               ",\"local_apply_last_thread_id\":" +
+                   std::to_string(job->internal_no_resend_last_thread_id) +
+               ",\"local_apply_preflight_complete\":" +
+                   std::string(json_bool(job->internal_no_resend_preflight_complete)) +
+               ",\"local_apply_preflight_strokes_validated\":" +
+                   std::to_string(job->internal_no_resend_preflight_strokes_validated) +
+               ",\"local_apply_preflight_descriptors_validated\":" +
+                   std::to_string(job->internal_no_resend_preflight_descriptors_validated) +
+               ",\"local_apply_preflight_descriptors_total\":" +
+                   std::to_string(job->internal_no_resend_preflight_descriptors.size()) +
+               ",\"local_render_target_write_budget\":" +
+                   std::to_string(job->local_render_target_write_budget) +
+               ",\"local_render_target_writes_scheduled\":" +
+                   std::to_string(job->local_render_target_writes_scheduled) +
+               ",\"local_write_budget_yields\":" +
+                   std::to_string(job->local_write_budget_yields) +
+               ",\"local_cpu_budget_us\":" +
+                   std::to_string(runtime_contract::LocalDispatchCpuBudgetUs) +
+               ",\"local_cpu_budget_yields\":" +
+                   std::to_string(job->local_cpu_budget_yields) +
+               ",\"local_common_call_total_ms\":" +
+                   std::to_string(job->local_common_call_total_ms) +
+               ",\"local_common_call_max_ms\":" +
+                   std::to_string(job->local_common_call_max_ms) +
+               ",\"local_dispatch_total_ms\":" +
+                   std::to_string(job->local_dispatch_total_ms) +
+               ",\"local_dispatch_max_ms\":" +
+                   std::to_string(job->local_dispatch_max_ms) +
+               ",\"local_apply_preflight_failure\":\"" +
+                   json_escape(job->internal_no_resend_preflight_failure) + "\"";
+    }
 
     auto mesh_first_capture_cached_replication_snapshot(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job)
         -> MeshFirstReplicationSnapshot
@@ -8339,7 +9790,6 @@ namespace
         if (job->server_batch_limit > job->replication_pacing_resolved_batch_limit)
         {
             job->server_batch_limit = job->replication_pacing_resolved_batch_limit;
-            job->local_visual_sync_batch_limit = job->server_batch_limit;
         }
     }
 
@@ -8365,8 +9815,6 @@ namespace
         }
         job->server_batch_limit = mesh_first_replication_pacing_clamp_batch(job, batch_limit);
         job->server_batch_delay_ms = mesh_first_replication_pacing_clamp_delay(job, delay_ms);
-        job->local_visual_sync_batch_limit = job->server_batch_limit;
-        job->local_visual_sync_delay_ms = job->server_batch_delay_ms;
     }
 
     auto mesh_first_replication_pacing_latest_pressure(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job)
@@ -8428,8 +9876,30 @@ namespace
             }
             target = target <= 0.0 ? sample : (target * 0.70) + (sample * 0.30);
         };
-        update_rate(job->replication_pacing_queue_drain_strokes_per_ms,
-                    static_cast<double>(drained) / delta_ms);
+        const bool exact_packed_local_queue_rate =
+            job->local_packed_queue_enabled &&
+            job->local_sync_started &&
+            job->local_sync_started_at.time_since_epoch().count() != 0;
+        if (exact_packed_local_queue_rate)
+        {
+            const double receiver_elapsed_ms =
+                std::chrono::duration<double, std::milli>(
+                    now - job->local_sync_started_at)
+                    .count();
+            const int rendered = runtime_contract::receiver_queue_rendered_strokes(
+                job->server_strokes_sent,
+                queue,
+                0);
+            job->replication_pacing_queue_drain_strokes_per_ms =
+                receiver_elapsed_ms >= 250.0 && std::isfinite(receiver_elapsed_ms) && rendered > 0
+                    ? static_cast<double>(rendered) / receiver_elapsed_ms
+                    : -1.0;
+        }
+        else
+        {
+            update_rate(job->replication_pacing_queue_drain_strokes_per_ms,
+                        static_cast<double>(drained) / delta_ms);
+        }
         update_rate(job->replication_pacing_send_strokes_per_ms,
                     static_cast<double>(sent_delta) / delta_ms);
 
@@ -8512,12 +9982,19 @@ namespace
                std::to_string(mesh_first_replication_pacing_requested_batch(job));
         out += ",\"replication_pacing_resolved_batch_limit\":" +
                std::to_string(mesh_first_replication_pacing_resolved_batch(job));
-        out += ",\"replication_pacing_requested_delay_ms\":" +
+        out += ",\"replication_pacing_requested_ms\":" +
                std::to_string(job ? mesh_first_replication_pacing_requested_delay(job) : PackedReplicationDefaultPacingMs);
         out += ",\"replication_pacing_resolved_pacing_ms\":" +
                std::to_string(job ? mesh_first_replication_pacing_resolved_pacing(job) : PackedReplicationDefaultPacingMs);
         out += ",\"replication_pacing_batch_limit\":" + std::to_string(job ? std::max(1, job->server_batch_limit) : PackedReplicationDefaultBatchLimit);
-        out += ",\"replication_pacing_delay_ms\":" + std::to_string(job ? std::max(0, job->server_batch_delay_ms) : PackedReplicationDefaultPacingMs);
+        out += ",\"replication_pacing_ms\":" + std::to_string(job ? std::max(0, job->server_batch_delay_ms) : PackedReplicationDefaultPacingMs);
+        out += ",\"replication_pacing_control\":\"batch_sliders\"";
+        out += ",\"replication_pacing_source\":\"" +
+               json_escape(job ? job->pacing_source : "game_limits") + "\"";
+        out += ",\"replication_pacing_used_contract_fallback\":" +
+               std::string(json_bool(job && job->pacing_used_contract_fallback));
+        out += ",\"replication_pacing_fallback_reason\":\"" +
+               json_escape(job ? job->pacing_fallback_reason : std::string{}) + "\"";
         out += ",\"replication_pacing_pressure_level\":\"" + json_escape(job ? job->replication_pacing_pressure_level : "unknown") + "\"";
         out += ",\"replication_pacing_backoff_count\":" + std::to_string(job ? job->replication_pacing_backoff_count : 0);
         out += ",\"replication_pacing_queue_wait_count\":" + std::to_string(job ? job->replication_pacing_backoff_count : 0);
@@ -8636,8 +10113,12 @@ namespace
         {
         case MeshFirstBatchPhase::Planning:
             return "planning";
+        case MeshFirstBatchPhase::Preflight:
+            return "preflight";
         case MeshFirstBatchPhase::ServerBatch:
             return "server_batch";
+        case MeshFirstBatchPhase::LocalQueueDrain:
+            return "local_queue_drain";
         case MeshFirstBatchPhase::LocalTextureImport:
             return "local_texture_import";
         case MeshFirstBatchPhase::TextureSyncObserve:
@@ -8791,6 +10272,101 @@ namespace
         return job->replication_pacing_model_eta_ms;
     }
 
+    auto mesh_first_completed_strokes(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
+    {
+        if (!job)
+        {
+            return 0;
+        }
+
+        const int server_completed = std::max(0, job->server_strokes_sent);
+        const int local_completed = std::max(0, job->local_stroke_success);
+        if (job->server_packed_paint_batch_enabled && job->local_visual_sync_enabled)
+        {
+            return std::min(server_completed, local_completed);
+        }
+        if (job->server_packed_paint_batch_enabled)
+        {
+            return server_completed;
+        }
+        if (job->local_visual_sync_enabled)
+        {
+            return local_completed;
+        }
+        return std::max(server_completed, local_completed);
+    }
+
+    auto mesh_first_rendered_strokes(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
+    {
+        if (!job)
+        {
+            return 0;
+        }
+        if (job->local_packed_queue_enabled)
+        {
+            return std::clamp(job->local_packed_queue_drained_strokes,
+                              0,
+                              static_cast<int>(job->strokes.size()));
+        }
+        return mesh_first_completed_strokes(job);
+    }
+
+    auto mesh_first_replay_pass_name(runtime_contract::ReplayPass pass) -> const char*
+    {
+        switch (pass)
+        {
+        case runtime_contract::ReplayPass::Fill:
+            return "fill";
+        case runtime_contract::ReplayPass::CoarsePaint:
+            return "coarse_paint";
+        case runtime_contract::ReplayPass::FinePaint:
+            return "fine_paint";
+        case runtime_contract::ReplayPass::Complete:
+            return "complete";
+        }
+        return "unknown";
+    }
+
+    auto mesh_first_replay_pass_metadata(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> std::string
+    {
+        const std::size_t total = job ? job->strokes.size() : 0;
+        const std::size_t fill_end = job ? job->replay_fill_end : 0;
+        const std::size_t coarse_end = job ? job->replay_coarse_end : 0;
+        const std::size_t server_offset = job ? std::min(job->server_offset, total) : 0;
+        const std::size_t local_offset = job ? std::min(job->local_offset, total) : 0;
+        // The packed local route owns an initially empty exact component queue,
+        // so its queue cursor is the visual progress source from the first
+        // paired batch onward, not only after submission has finished.
+        const bool receiver_drain_progress = job && job->local_packed_queue_enabled;
+        const std::size_t completed_offset = static_cast<std::size_t>(
+            std::max(0, mesh_first_rendered_strokes(job)));
+        const auto server_window = runtime_contract::replay_pass_window(
+            server_offset, total, fill_end, coarse_end);
+        const auto local_window = runtime_contract::replay_pass_window(
+            local_offset, total, fill_end, coarse_end);
+        const auto completed_window = runtime_contract::replay_pass_window(
+            completed_offset, total, fill_end, coarse_end);
+        const auto window_metadata = [](const char* prefix,
+                                        const runtime_contract::ReplayPassWindow& window) {
+            const std::string key(prefix ? prefix : "replay_current");
+            return ",\"" + key + "_pass\":\"" +
+                   std::string(mesh_first_replay_pass_name(window.pass)) +
+                   "\",\"" + key + "_pass_start\":" + std::to_string(window.begin) +
+                   ",\"" + key + "_pass_end\":" + std::to_string(window.end);
+        };
+        return std::string(",\"replay_pass_order\":\"fill,coarse_paint,fine_paint\"") +
+               ",\"replay_progress_source\":\"" +
+               std::string(receiver_drain_progress ? "receiver_queue_drain" : "submission") + "\"" +
+               ",\"replay_fill_end\":" + std::to_string(std::min(fill_end, total)) +
+               ",\"replay_coarse_end\":" + std::to_string(std::min(std::max(coarse_end, fill_end), total)) +
+               ",\"replay_fine_begin\":" + std::to_string(std::min(std::max(coarse_end, fill_end), total)) +
+               ",\"replay_server_offset\":" + std::to_string(server_offset) +
+               ",\"replay_local_offset\":" + std::to_string(local_offset) +
+               window_metadata("replay_server_current", server_window) +
+               window_metadata("replay_local_current", local_window) +
+               window_metadata("replay_current", completed_window);
+    }
+
     auto mesh_first_progress_extra(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
                                    MeshFirstBatchPhase phase,
                                    bool terminal,
@@ -8802,7 +10378,9 @@ namespace
         const int server_batch_delay_ms = std::max(0, job ? job->server_batch_delay_ms : PackedReplicationDefaultPacingMs);
         const int local_batch_limit = std::max(1, job ? job->local_visual_sync_batch_limit : PackedReplicationDefaultBatchLimit);
         const int local_batch_delay_ms = std::max(0, job ? job->local_visual_sync_delay_ms : PackedReplicationDefaultPacingMs);
-        const int server_batches_total = mesh_first_div_ceil(total_strokes, server_batch_limit);
+        const bool server_route_enabled = job && job->server_packed_paint_batch_enabled;
+        const bool local_route_enabled = job && job->local_visual_sync_enabled;
+        const int server_batches_total = server_route_enabled ? mesh_first_div_ceil(total_strokes, server_batch_limit) : 0;
         const int local_batches_total = mesh_first_div_ceil(total_strokes, local_batch_limit);
         const int server_batches_done = job ? std::max(0, job->server_batch_success) : 0;
         const int local_batches_done = job ? std::max(0, job->local_batch_calls) : 0;
@@ -8838,16 +10416,18 @@ namespace
             return std::max(delay_floor_ms, observed_ms_per_unit * static_cast<double>(remaining_units));
         };
 
-        const bool lockstep_local_sync = job && job->local_visual_sync_enabled;
-        const int remaining_server_strokes = std::max(0, total_strokes - server_strokes_sent);
+        const bool lockstep_local_sync = server_route_enabled && local_route_enabled;
+        const int remaining_server_strokes = server_route_enabled ? std::max(0, total_strokes - server_strokes_sent) : 0;
         const int remaining_local_strokes = std::max(0, total_strokes - local_strokes_synced);
         const int remaining_server_batches = mesh_first_div_ceil(remaining_server_strokes, server_batch_limit);
         const int remaining_local_batches = mesh_first_div_ceil(remaining_local_strokes, local_batch_limit);
-        const int paint_strokes_done = lockstep_local_sync ? std::min(server_strokes_sent, local_strokes_synced)
-                                                           : std::max(server_strokes_sent, local_strokes_synced);
-        const int paint_delay_ms = lockstep_local_sync ? std::max(server_batch_delay_ms, local_batch_delay_ms)
-                                                       : std::max(server_batch_delay_ms, local_batch_delay_ms);
-        const double server_observed_elapsed_ms = lockstep_local_sync ? paint_elapsed_ms : server_elapsed_ms;
+        const int paint_strokes_done = mesh_first_rendered_strokes(job);
+        const double server_observed_elapsed_ms =
+            job && job->server_submission_started_at.time_since_epoch().count() != 0
+                ? std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - job->server_submission_started_at)
+                      .count()
+                : (lockstep_local_sync ? paint_elapsed_ms : server_elapsed_ms);
         const double server_observed_ms_per_stroke =
             server_strokes_sent > 0 ? server_observed_elapsed_ms / static_cast<double>(server_strokes_sent) : -1.0;
         const double paint_observed_ms_per_stroke =
@@ -8887,7 +10467,8 @@ namespace
                                                                remaining_server_strokes,
                                                                remaining_server_batches,
                                                                server_batch_delay_ms);
-                if (server_strokes_sent > 0 &&
+                if (!job->local_packed_queue_enabled &&
+                    server_strokes_sent > 0 &&
                     observed_server_eta_ms >= 0.0 &&
                     std::isfinite(observed_server_eta_ms))
                 {
@@ -8920,7 +10501,9 @@ namespace
                 else
                 {
                     paint_eta_ms = server_eta_ms >= 0.0 ? server_eta_ms : 0.0;
-                    if (observed_paint_eta_ms >= 0.0 && std::isfinite(observed_paint_eta_ms))
+                    if (!job->local_packed_queue_enabled &&
+                        observed_paint_eta_ms >= 0.0 &&
+                        std::isfinite(observed_paint_eta_ms))
                     {
                         paint_eta_ms = std::max(paint_eta_ms, observed_paint_eta_ms);
                     }
@@ -8929,8 +10512,8 @@ namespace
             }
             else
             {
-                local_eta_ms = job && job->local_visual_sync_enabled
-                                   ? std::max(0, local_batches_total - 1) * static_cast<double>(local_batch_delay_ms)
+                local_eta_ms = local_route_enabled
+                                   ? std::max(0, remaining_local_batches - 1) * static_cast<double>(local_batch_delay_ms)
                                    : 0.0;
                 paint_eta_ms = server_eta_ms + local_eta_ms;
                 paint_eta_source = job && job->replication_pacing_enabled ? "queue_drain_model" : "observed_rate";
@@ -8945,11 +10528,73 @@ namespace
                                                   local_batch_delay_ms);
             paint_eta_ms = local_eta_ms;
         }
+        else if (phase == MeshFirstBatchPhase::LocalQueueDrain)
+        {
+            server_eta_ms = 0.0;
+            server_eta_source = "submission_complete";
+            const int queued_strokes = job
+                                           ? std::max(0, job->local_packed_queue_drain_current_queue)
+                                           : 0;
+            const double drain_rate = job ? job->local_packed_queue_drain_strokes_per_ms : -1.0;
+            if (queued_strokes <= 0)
+            {
+                local_eta_ms = 0.0;
+            }
+            else if (drain_rate > 0.0 && std::isfinite(drain_rate))
+            {
+                local_eta_ms = static_cast<double>(queued_strokes) / drain_rate;
+            }
+            else
+            {
+                local_eta_ms = -1.0;
+            }
+            paint_eta_ms = local_eta_ms;
+            paint_eta_source = "receiver_queue_observed_rate";
+        }
+
+        const auto current_pass_window = runtime_contract::replay_pass_window(
+            static_cast<std::size_t>(std::max(0, paint_strokes_done)),
+            static_cast<std::size_t>(std::max(0, total_strokes)),
+            job ? job->replay_fill_end : 0,
+            job ? job->replay_coarse_end : 0);
+        const int current_pass_completed = static_cast<int>(
+            std::min(current_pass_window.end,
+                     static_cast<std::size_t>(std::max(0, paint_strokes_done))) -
+            current_pass_window.begin);
+        const int current_pass_total = static_cast<int>(
+            current_pass_window.end - current_pass_window.begin);
+        double current_pass_eta_ms = -1.0;
+        if (current_pass_window.pass == runtime_contract::ReplayPass::Complete)
+        {
+            current_pass_eta_ms = 0.0;
+        }
+        else if (job && job->local_packed_queue_enabled)
+        {
+            const double receiver_rate =
+                job->local_packed_queue_drain_strokes_per_ms > 0.0 &&
+                        std::isfinite(job->local_packed_queue_drain_strokes_per_ms)
+                    ? job->local_packed_queue_drain_strokes_per_ms
+                    : job->replication_pacing_queue_drain_strokes_per_ms;
+            current_pass_eta_ms =
+                receiver_rate > 0.0 && std::isfinite(receiver_rate)
+                    ? static_cast<double>(
+                          std::max(0, current_pass_total - current_pass_completed)) /
+                          receiver_rate
+                    : -1.0;
+        }
+        else if (phase == MeshFirstBatchPhase::ServerBatch)
+        {
+            const int pass_remaining = std::max(0, current_pass_total - current_pass_completed);
+            const int pass_batches = mesh_first_div_ceil(pass_remaining, server_batch_limit);
+            current_pass_eta_ms = static_cast<double>(std::max(0, pass_batches - 1)) *
+                                  static_cast<double>(server_batch_delay_ms);
+        }
         if (terminal)
         {
             server_eta_ms = 0.0;
             local_eta_ms = 0.0;
             paint_eta_ms = 0.0;
+            current_pass_eta_ms = result && std::string(result) == "done" ? 0.0 : -1.0;
             if (job)
             {
                 job->replication_pacing_model_eta_ms = 0.0;
@@ -8961,7 +10606,8 @@ namespace
         out += ",\"result\":\"" + std::string(result && *result ? result : (terminal ? "done" : "running")) + "\"";
         out += ",\"total_strokes\":" + std::to_string(total_strokes);
         out += ",\"server_batch_limit\":" + std::to_string(server_batch_limit);
-        out += ",\"server_batch_delay_ms\":" + std::to_string(server_batch_delay_ms);
+        out += ",\"server_batch_pacing_ms\":" + std::to_string(server_batch_delay_ms);
+        out += mesh_first_replay_pass_metadata(job);
         out += mesh_first_replication_pacing_metadata(job);
         out += ",\"server_batch_rpc\":\"" + json_escape(job ? job->server_batch_rpc : "ServerPackedPaintBatch") + "\"";
         out += ",\"server_packed_paint_batch_enabled\":" +
@@ -8981,7 +10627,7 @@ namespace
         out += ",\"server_eta_source\":\"" + server_eta_source + "\"";
         out += ",\"server_observed_ms_per_stroke\":" + std::to_string(server_observed_ms_per_stroke);
         out += ",\"local_batch_limit\":" + std::to_string(local_batch_limit);
-        out += ",\"local_batch_delay_ms\":" + std::to_string(local_batch_delay_ms);
+        out += ",\"local_batch_pacing_ms\":" + std::to_string(local_batch_delay_ms);
         out += ",\"local_batches_total\":" + std::to_string(local_batches_total);
         out += ",\"local_batches_done\":" + std::to_string(local_batches_done);
         out += ",\"local_strokes_synced\":" + std::to_string(local_strokes_synced);
@@ -8991,6 +10637,19 @@ namespace
         out += ",\"local_visual_sync_elapsed_ms\":" + std::to_string(local_elapsed_ms);
         out += ",\"local_elapsed_ms\":" + std::to_string(local_elapsed_ms);
         out += ",\"local_eta_ms\":" + std::to_string(local_eta_ms);
+        if (job && job->local_packed_queue_enabled)
+        {
+            out += ",\"local_packed_queue_resolver_status\":\"" +
+                   json_escape(job->local_packed_queue_resolver_status) + "\"";
+            out += ",\"local_packed_queue_resolver_failure\":\"" +
+                   json_escape(job->local_packed_queue_resolver_failure) + "\"";
+            out += ",\"local_packed_queue_exact_manager\":\"" +
+                   hex_address(job->replication_manager) + "\"";
+        }
+        out += ",\"paint_strokes_completed\":" + std::to_string(paint_strokes_done);
+        out += ",\"replay_current_pass_completed\":" + std::to_string(current_pass_completed);
+        out += ",\"replay_current_pass_total\":" + std::to_string(current_pass_total);
+        out += ",\"replay_current_pass_eta_ms\":" + std::to_string(current_pass_eta_ms);
         out += ",\"paint_eta_source\":\"" + paint_eta_source + "\"";
         out += ",\"paint_observed_ms_per_stroke\":" + std::to_string(paint_observed_ms_per_stroke);
         out += ",\"server_texture_sync_started\":" + std::string(json_bool(job && job->server_texture_sync_started));
@@ -9007,8 +10666,17 @@ namespace
         out += ",\"paint_eta_ms\":" + std::to_string(paint_eta_ms);
         if (job)
         {
-            out += ",\"cancel_requested\":" + std::string(json_bool(job->cancel_requested.load()));
-            out += ",\"cancel_reason\":\"" + json_escape(job->cancel_reason) + "\"";
+            const auto cancel_reason = queued_paint_cancel_reason(job->queued);
+            out += ",\"cancel_requested\":" +
+                   std::string(json_bool(cancel_reason != PaintCancelReason::None));
+            out += ",\"cancel_reason\":\"" +
+                   json_escape(paint_cancel_reason_name(cancel_reason)) + "\"";
+        }
+        out += mesh_first_internal_no_resend_metadata(job);
+        if (terminal &&
+            (phase == MeshFirstBatchPhase::Cancelled || phase == MeshFirstBatchPhase::Failed))
+        {
+            out += mesh_first_interrupted_commit_metadata(job);
         }
         if (!extra.empty())
         {
@@ -9027,11 +10695,7 @@ namespace
             return 0;
         }
         const int total = static_cast<int>(job->strokes.size());
-        if (job->phase == MeshFirstBatchPhase::LocalSync)
-        {
-            return std::max(0, total - job->local_stroke_success);
-        }
-        return std::max(0, total - job->server_strokes_sent);
+        return std::max(0, total - mesh_first_completed_strokes(job));
     }
 
     std::mutex g_mesh_first_batch_mutex;
@@ -9046,6 +10710,10 @@ namespace
     auto paint_mesh_first_on_game_thread(const std::string& request,
                                          const std::shared_ptr<QueuedPaintJob>& queued_job) -> std::string
     {
+        if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+        {
+            return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+        }
         const auto front_region_mode = mesh_first_parse_region_mode(request, "front_region_mode");
         const auto side_region_mode = mesh_first_parse_region_mode(request, "side_region_mode");
         const auto back_region_mode = mesh_first_parse_region_mode(request, "back_region_mode");
@@ -9058,11 +10726,52 @@ namespace
         const bool any_paint_region = enable_front || enable_side || enable_back;
         const bool preview_only = json_bool_field(request, "preview_only", false);
         const bool unpreview_only = json_bool_field(request, "unpreview_only", false);
-        const bool normal_paint_requires_packed = !preview_only && !unpreview_only;
-        const int packed_server_batch_limit = PackedReplicationBatchSize;
+        const double requested_brush_pipeline_version =
+            json_number_field(request, "brush_pipeline_version", 0.0);
+        const auto brush_pipeline_version = runtime_contract::resolve_brush_pipeline_version(
+            requested_brush_pipeline_version,
+            preview_only,
+            unpreview_only);
         const bool research_artifacts = json_bool_field(request, "research_artifacts", false);
-        const double tuning_stroke_size_texels = clamp_range(json_number_field(request, "stroke_size_texels", 9.0), 1.0, 12.0);
-        const double tuning_coverage_step_texels = clamp_range(json_number_field(request, "coverage_step_texels", 9.0), 1.0, 12.0);
+        const std::string requested_research_route_mode =
+            research_artifacts ? lower_copy(json_string_field(request, "research_route_mode", "combined")) : "combined";
+        const bool research_local_only = requested_research_route_mode == "local-only";
+        const bool research_packed_only = requested_research_route_mode == "packed-only";
+        const bool research_combined_no_resend = requested_research_route_mode == "combined-no-resend";
+        const bool research_packed_local_queue = requested_research_route_mode == "packed-local-queue";
+        const bool research_route_mode_valid = requested_research_route_mode == "combined" ||
+                                               research_local_only || research_packed_only ||
+                                               research_combined_no_resend || research_packed_local_queue;
+        const int research_stroke_limit = research_artifacts
+                                              ? json_int_field(request, "research_stroke_limit", 0, 0, 100000)
+                                              : 0;
+        const double research_packed_radius_scale_override =
+            research_artifacts
+                ? json_number_field(request, "research_packed_radius_scale", 0.0)
+                : 0.0;
+        const bool research_triangle_world_radius =
+            research_artifacts && json_bool_field(request, "research_triangle_world_radius", false);
+        const bool normal_paint_requires_packed = !preview_only && !unpreview_only && !research_local_only;
+        const bool local_visual_sync_requested = !preview_only && !unpreview_only && !research_packed_only;
+        const bool use_packed_local_queue = normal_paint_requires_packed &&
+                                            local_visual_sync_requested &&
+                                            (research_packed_local_queue || !research_artifacts);
+        const bool use_internal_no_resend_local_apply = runtime_contract::requires_internal_no_resend(
+            preview_only,
+            unpreview_only,
+            research_local_only,
+            research_packed_only) &&
+            !use_packed_local_queue;
+        const double legacy_stroke_size_texels =
+            clamp_range(json_number_field(request, "stroke_size_texels", 10.0), 1.0, 20.0);
+        const double tuning_brush_1_size_texels =
+            clamp_range(json_number_field(request, "brush_1_size_texels", 20.0), 15.0, 20.0);
+        const double tuning_brush_2_size_texels =
+            clamp_range(json_number_field(request,
+                                          "brush_2_size_texels",
+                                          legacy_stroke_size_texels),
+                        5.0,
+                        10.0);
         const double tuning_side_source_max_uv = clamp_range(json_number_field(request, "side_source_max_uv", 0.08), 0.001, 0.50);
         const double tuning_front_back_source_max_uv = clamp_range(json_number_field(request, "front_back_source_max_uv", 0.45), 0.001, 2.00);
         const bool tuning_auto_material = json_bool_field(request, "auto_material", false);
@@ -9073,11 +10782,53 @@ namespace
         const double fill_color_b = clamp_range(json_number_field(request, "fill_color_b", 1.0), 0.0, 1.0);
         const double fill_metallic = clamp_range(json_number_field(request, "fill_metallic", 1.0), 0.0, 1.0);
         const double fill_roughness = clamp_range(json_number_field(request, "fill_roughness", 0.0), 0.0, 1.0);
+        const bool research_force_paint_color =
+            research_artifacts && !preview_only && !unpreview_only &&
+            json_bool_field(request, "research_force_paint_color", false);
+        const double research_paint_color_r =
+            clamp_range(json_number_field(request, "research_paint_color_r", 0.0), 0.0, 1.0);
+        const double research_paint_color_g =
+            clamp_range(json_number_field(request, "research_paint_color_g", 1.0), 0.0, 1.0);
+        const double research_paint_color_b =
+            clamp_range(json_number_field(request, "research_paint_color_b", 0.0), 0.0, 1.0);
         const bool tuning_replication_pacing_enabled =
             json_bool_field(request, "replication_pacing_enabled", json_bool_field(request, "adaptive_batch_enabled", true));
-        const int tuning_server_batch_limit = json_int_field(request, "server_batch_limit", PackedReplicationDefaultBatchLimit, 1, PackedReplicationMaxBatchLimit);
-        const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", PackedReplicationDefaultPacingMs, 50, 100);
-        const int packed_server_batch_seed_delay_ms = tuning_server_batch_delay_ms;
+        // New payloads expose two direct sliders.  The old mode/delay fields are
+        // accepted only as migration defaults so a staged older controller does
+        // not accidentally select a zero-delay scheduler loop.
+        const std::string legacy_server_pacing_mode =
+            lower_copy(json_string_field(request, "server_pacing_mode", ""));
+        const int legacy_server_batch_delay_ms = json_int_field(request,
+                                                                "server_batch_delay_ms",
+                                                                PackedReplicationDefaultPacingMs,
+                                                                PackedReplicationMinPacingMs,
+                                                                PackedReplicationMaxPacingMs);
+        const bool legacy_manual_pacing = legacy_server_pacing_mode == "manual" ||
+                                          legacy_server_pacing_mode == "manual_slower";
+        const int legacy_batch_limit = legacy_server_pacing_mode == "compatibility" ? 6 : PackedReplicationDefaultBatchLimit;
+        const int legacy_batch_pacing_ms = legacy_server_pacing_mode == "compatibility"
+                                               ? 75
+                                               : (legacy_manual_pacing || legacy_server_pacing_mode.empty()
+                                                      ? legacy_server_batch_delay_ms
+                                                      : PackedReplicationDefaultPacingMs);
+        const int tuning_server_batch_limit = json_int_field(request,
+                                                              "server_batch_limit",
+                                                              legacy_batch_limit,
+                                                              1,
+                                                              PackedReplicationMaxBatchLimit);
+        const int tuning_server_batch_pacing_ms = json_int_field(request,
+                                                                  "server_batch_pacing_ms",
+                                                                  legacy_batch_pacing_ms,
+                                                                  PackedReplicationMinPacingMs,
+                                                                  PackedReplicationMaxPacingMs);
+        const auto requested_pacing_decision = runtime_contract::resolve_pacing(
+            tuning_server_batch_limit,
+            tuning_server_batch_pacing_ms,
+            runtime_contract::FallbackOutgoingStrokesPerBatch,
+            runtime_contract::FallbackOutgoingBatchesPerSecond,
+            runtime_contract::FallbackReplicatedStrokesPerTick,
+            runtime_contract::FallbackRenderTargetWritesPerFrame);
+        const int packed_server_batch_seed_pacing_ms = requested_pacing_decision.remote_delay_ms;
         const std::string requested_server_batch_rpc = json_string_field(request, "server_batch_rpc", "");
         const std::string requested_server_batch_rpc_normalized = lower_copy(requested_server_batch_rpc);
         const std::string requested_packed_route = lower_copy(json_string_field(request, "packed_route", "component"));
@@ -9104,6 +10855,26 @@ namespace
         metadata += ",\"server_paint_batch_required\":" + std::string(json_bool(normal_paint_requires_packed));
         metadata += ",\"server_packed_paint_batch_required\":" + std::string(json_bool(normal_paint_requires_packed));
         metadata += ",\"research_artifacts_requested\":" + std::string(json_bool(research_artifacts));
+        metadata += ",\"research_route_mode\":\"" + json_escape(requested_research_route_mode) + "\"";
+        metadata += ",\"research_route_mode_valid\":" + std::string(json_bool(research_route_mode_valid));
+        metadata += ",\"research_local_only\":" + std::string(json_bool(research_local_only));
+        metadata += ",\"research_packed_only\":" + std::string(json_bool(research_packed_only));
+        metadata += ",\"research_combined_no_resend\":" + std::string(json_bool(research_combined_no_resend));
+        metadata += ",\"internal_no_resend_local_apply_requested\":" +
+                    std::string(json_bool(use_internal_no_resend_local_apply));
+        metadata += ",\"research_stroke_limit\":" + std::to_string(research_stroke_limit);
+        metadata += ",\"research_packed_radius_scale_override\":" +
+                    std::to_string(research_packed_radius_scale_override);
+        metadata += ",\"research_triangle_world_radius\":" +
+                    std::string(json_bool(research_triangle_world_radius));
+        metadata += ",\"research_force_paint_color\":" +
+                    std::string(json_bool(research_force_paint_color));
+        if (research_force_paint_color)
+        {
+            metadata += ",\"research_paint_color_r\":" + std::to_string(research_paint_color_r);
+            metadata += ",\"research_paint_color_g\":" + std::to_string(research_paint_color_g);
+            metadata += ",\"research_paint_color_b\":" + std::to_string(research_paint_color_b);
+        }
         metadata += ",\"front_region_mode\":\"" + std::string(mesh_first_region_mode_name(front_region_mode)) + "\"";
         metadata += ",\"side_region_mode\":\"" + std::string(mesh_first_region_mode_name(side_region_mode)) + "\"";
         metadata += ",\"back_region_mode\":\"" + std::string(mesh_first_region_mode_name(back_region_mode)) + "\"";
@@ -9120,8 +10891,20 @@ namespace
         metadata += ",\"server_batch_rpc_requested\":\"" + json_escape(requested_server_batch_rpc) + "\"";
         metadata += ",\"packed_route_requested_valid\":" + std::string(json_bool(packed_route_requested));
         metadata += ",\"packed_route_requested\":\"" + json_escape(requested_packed_route) + "\"";
-        metadata += ",\"stroke_size_texels\":" + std::to_string(tuning_stroke_size_texels);
-        metadata += ",\"coverage_step_texels\":" + std::to_string(tuning_coverage_step_texels);
+        metadata += ",\"brush_pipeline\":\"fill_coarse_paint_fine_paint\"";
+        metadata += ",\"brush_pipeline_version_requested\":" +
+                    std::to_string(brush_pipeline_version.requested_version);
+        metadata += ",\"brush_pipeline_version_supported\":" +
+                    std::string(json_bool(brush_pipeline_version.supported));
+        metadata += ",\"brush_pipeline_version_required\":" +
+                    std::string(json_bool(brush_pipeline_version.required));
+        metadata += ",\"brush_pipeline_supported_version\":" +
+                    std::to_string(brush_pipeline_version.supported_version);
+        metadata += ",\"brush_1_size_texels\":" + std::to_string(tuning_brush_1_size_texels);
+        metadata += ",\"brush_2_size_texels\":" + std::to_string(tuning_brush_2_size_texels);
+        metadata += ",\"legacy_stroke_size_texels\":" + std::to_string(legacy_stroke_size_texels);
+        metadata += ",\"stroke_size_texels\":" + std::to_string(tuning_brush_2_size_texels);
+        metadata += ",\"coverage_step_texels\":" + std::to_string(tuning_brush_2_size_texels);
         metadata += ",\"side_source_max_uv\":" + std::to_string(tuning_side_source_max_uv);
         metadata += ",\"front_back_source_max_uv\":" + std::to_string(tuning_front_back_source_max_uv);
         metadata += ",\"auto_material\":" + std::string(json_bool(tuning_auto_material));
@@ -9136,11 +10919,30 @@ namespace
         metadata += ",\"fill_roughness\":" + std::to_string(fill_roughness);
         metadata += ",\"replication_pacing_requested_enabled\":" + std::string(json_bool(tuning_replication_pacing_enabled));
         metadata += ",\"replication_pacing_enabled\":" + std::string(json_bool(normal_paint_requires_packed));
+        metadata += ",\"server_batch_control\":\"sliders\"";
         metadata += ",\"server_batch_limit\":" +
-                    std::to_string(normal_paint_requires_packed ? packed_server_batch_limit : tuning_server_batch_limit);
-        metadata += ",\"server_batch_delay_ms\":" +
-                    std::to_string(normal_paint_requires_packed ? packed_server_batch_seed_delay_ms : tuning_server_batch_delay_ms);
+                    std::to_string(normal_paint_requires_packed
+                                       ? requested_pacing_decision.remote_batch_limit
+                                       : tuning_server_batch_limit);
+        metadata += ",\"server_batch_pacing_ms\":" +
+                    std::to_string(normal_paint_requires_packed
+                                       ? packed_server_batch_seed_pacing_ms
+                                       : tuning_server_batch_pacing_ms);
         metadata += ",\"bridge_events\":[\"mesh_profile_load\",\"pose_resolve\",\"planner_build\",\"bridge.paint_batch.request\",\"bridge.paint_batch.response\"]";
+
+        if (!brush_pipeline_version.supported)
+        {
+            return response_json(
+                false,
+                "mesh_brush_pipeline_version_unsupported",
+                0,
+                1,
+                "brush_pipeline_version must be " +
+                    std::to_string(brush_pipeline_version.supported_version) +
+                    " for two-pass paint; requested " +
+                    std::to_string(brush_pipeline_version.requested_version),
+                metadata + ",\"replay_blocked\":true");
+        }
 
         if (queued_job)
         {
@@ -9162,6 +10964,46 @@ namespace
                                  0,
                                  1,
                                  "mesh-first paint requires the async queued dispatcher",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+
+        if (!research_route_mode_valid)
+        {
+            return response_json(false,
+                                 "research_route_mode_invalid",
+                                 0,
+                                 1,
+                                 "research_route_mode must be combined, combined-no-resend, packed-local-queue, local-only, or packed-only",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+
+        if (research_triangle_world_radius && !normal_paint_requires_packed)
+        {
+            return response_json(false,
+                                 "research_triangle_world_radius_requires_packed_route",
+                                 0,
+                                 1,
+                                 "triangle world-radius research requires a packed server route",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        if (research_packed_radius_scale_override != 0.0 &&
+            !normal_paint_requires_packed)
+        {
+            return response_json(false,
+                                 "research_packed_radius_scale_requires_packed_route",
+                                 0,
+                                 1,
+                                 "uniform packed-radius research requires a packed server route",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        if (research_triangle_world_radius &&
+            research_packed_radius_scale_override != 0.0)
+        {
+            return response_json(false,
+                                 "research_packed_radius_modes_conflict",
+                                 0,
+                                 1,
+                                 "triangle world-radius and uniform packed-radius override are mutually exclusive",
                                  metadata + ",\"replay_blocked\":true");
         }
 
@@ -9328,6 +11170,29 @@ namespace
         metadata += ",\"selected_mesh_asset\":\"" + hex_address(selected_mesh.asset) + "\"";
         metadata += ",\"selected_mesh_asset_name\":\"" + json_escape(ref.object_name(selected_mesh.asset)) + "\"";
         metadata += ",\"selected_mesh_asset_path\":\"" + json_escape(ref.object_path(selected_mesh.asset)) + "\"";
+        const auto initialized_paint_mesh = normal_paint_requires_packed
+                                                ? call_no_params_return_object(
+                                                      ref,
+                                                      ctx.component,
+                                                      "GetInitializedPaintMesh")
+                                                : 0;
+        const bool initialized_paint_mesh_matches =
+            !normal_paint_requires_packed ||
+            (live_uobject_not_destroyed(initialized_paint_mesh) &&
+             initialized_paint_mesh == selected_mesh.mesh);
+        metadata += ",\"packed_radius_calibration_initialized_mesh\":\"" +
+                    hex_address(initialized_paint_mesh) + "\"";
+        metadata += ",\"packed_radius_calibration_selected_mesh_match\":" +
+                    std::string(json_bool(initialized_paint_mesh_matches));
+        if (!initialized_paint_mesh_matches)
+        {
+            return response_json(false,
+                                 "packed_radius_calibration_target_mesh_mismatch",
+                                 0,
+                                 1,
+                                 "packed radius calibration mesh does not match the receiver TargetMesh",
+                                 metadata + ",\"replay_blocked\":true");
+        }
 
         write_bridge_progress("mesh_profile_load",
                               "Loading required mesh profile",
@@ -9411,6 +11276,36 @@ namespace
         metadata += ",\"component_world_x\":" + std::to_string(component_to_world.Translation.X);
         metadata += ",\"component_world_y\":" + std::to_string(component_to_world.Translation.Y);
         metadata += ",\"component_world_z\":" + std::to_string(component_to_world.Translation.Z);
+        metadata += mesh_first_transform_diagnostic_metadata("component_world_selected", true, component_to_world);
+
+        // Current-build, read-only diagnostics. Static analysis of the game's runtime triangle
+        // cache builder/update routines shows that they transform cached local vertices with the
+        // FTransform stored at USceneComponent + 0x1e0. Keep this separate from selection until
+        // the reflected getter ABI and the raw cache-coupled transform have been compared live.
+        sdk::FTransform component_to_world_get_component_transform{};
+        bool component_to_world_get_component_transform_available = false;
+        sdk::FTransform component_to_world_raw_1e0{};
+        bool component_to_world_raw_1e0_available = false;
+        if (research_artifacts)
+        {
+            component_to_world_get_component_transform_available =
+                sdk_call_no_params_return_transform(ref,
+                                                    selected_mesh.mesh,
+                                                    "GetComponentTransform",
+                                                    component_to_world_get_component_transform) &&
+                sdk_transform_score(component_to_world_get_component_transform) > 0;
+            component_to_world_raw_1e0_available =
+                safe_copy(&component_to_world_raw_1e0,
+                          reinterpret_cast<const void*>(selected_mesh.mesh + 0x1e0),
+                          sizeof(component_to_world_raw_1e0)) &&
+                sdk_transform_score(component_to_world_raw_1e0) > 0;
+            metadata += mesh_first_transform_diagnostic_metadata("component_world_get_component_transform",
+                                                                 component_to_world_get_component_transform_available,
+                                                                 component_to_world_get_component_transform);
+            metadata += mesh_first_transform_diagnostic_metadata("component_world_raw_1e0",
+                                                                 component_to_world_raw_1e0_available,
+                                                                 component_to_world_raw_1e0);
+        }
 
         std::vector<sdk::FVector> skinned_component_positions{};
         std::vector<sdk::FVector> skinned_world_positions{};
@@ -9562,6 +11457,31 @@ namespace
         metadata += ",\"runtime_triangle_coordinate_direct_avg_error\":" + std::to_string(runtime_coordinate_selection.direct_avg_error);
         metadata += ",\"runtime_triangle_coordinate_swapped_avg_error\":" + std::to_string(runtime_coordinate_selection.swapped_avg_error);
         metadata += ",\"runtime_triangle_coordinate_selected_avg_error\":" + std::to_string(runtime_coordinate_selection.selected_avg_error);
+        auto append_transform_coordinate_probe = [&](const char* prefix,
+                                                     bool available,
+                                                     const sdk::FTransform& transform) {
+            MeshFirstRuntimeTriangleCoordinateSelection selection{};
+            if (available)
+            {
+                auto triangles = runtime_triangle_cache.triangles;
+                selection = mesh_first_select_runtime_triangle_coordinates(triangles, transform);
+            }
+            const std::string key(prefix ? prefix : "component_transform");
+            metadata += ",\"" + key + "_coordinate_samples\":" + std::to_string(selection.samples);
+            metadata += ",\"" + key + "_coordinate_mode\":\"" + json_escape(selection.mode) + "\"";
+            metadata += ",\"" + key + "_coordinate_direct_avg_error\":" + std::to_string(selection.direct_avg_error);
+            metadata += ",\"" + key + "_coordinate_swapped_avg_error\":" + std::to_string(selection.swapped_avg_error);
+            metadata += ",\"" + key + "_coordinate_selected_avg_error\":" + std::to_string(selection.selected_avg_error);
+        };
+        if (research_artifacts)
+        {
+            append_transform_coordinate_probe("component_world_get_component_transform",
+                                              component_to_world_get_component_transform_available,
+                                              component_to_world_get_component_transform);
+            append_transform_coordinate_probe("component_world_raw_1e0",
+                                              component_to_world_raw_1e0_available,
+                                              component_to_world_raw_1e0);
+        }
         metadata += ",\"component_world_transform_effective_source\":\"" + json_escape(component_transform_source) + "\"";
         const int active_texture_size = profile_available ? profile.texture_size : 1024;
         const char region_axis = profile_available ? mesh_first_region_axis(profile)
@@ -9694,7 +11614,7 @@ namespace
                                                                  center_ray.location,
                                                                  camera_direction,
                                                                  region_axis,
-                                                                 tuning_coverage_step_texels,
+                                                                 tuning_brush_2_size_texels,
                                                                  plan_samples,
                                                                  plan_stats,
                                                                  planner_failure))
@@ -9708,6 +11628,10 @@ namespace
                                  "mesh-first planner could not build a safe plan",
                                  metadata + ",\"replay_blocked\":true");
         }
+        if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+        {
+            return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+        }
         SdkNativeFrontSampleResult native_front{};
         native_front.mesh = selected_mesh.mesh;
         native_front.viewport_width = viewport.width;
@@ -9719,6 +11643,10 @@ namespace
         native_front.samples.reserve(static_cast<std::size_t>(plan_stats.source_samples));
         for (std::size_t sample_index = 0; sample_index < plan_samples.size(); ++sample_index)
         {
+            if ((sample_index % 64) == 0 && queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+            {
+                return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+            }
             const auto& sample = plan_samples[sample_index];
             if (!sample.source_candidate)
             {
@@ -9740,7 +11668,7 @@ namespace
             front.component_position = sample.local_position;
             native_front.samples.push_back(front);
         }
-        if (any_paint_region && native_front.samples.empty())
+        if (any_paint_region && !research_force_paint_color && native_front.samples.empty())
         {
             metadata += ",";
             metadata += mesh_first_plan_stats_metadata(plan_stats);
@@ -9764,8 +11692,57 @@ namespace
         }
 
         SdkFrontCaptureResult capture{};
-        metadata += ",\"mesh_capture_required\":" + std::string(json_bool(any_paint_region));
-        if (any_paint_region)
+        int research_constant_paint_color_assignments = 0;
+        const bool mesh_capture_required = any_paint_region && !research_force_paint_color;
+        metadata += ",\"mesh_capture_required\":" + std::string(json_bool(mesh_capture_required));
+        if (research_force_paint_color && any_paint_region)
+        {
+            capture.failure = "skipped_research_constant_paint_color";
+            metadata += ",\"mesh_capture_skipped\":true";
+            metadata += ",\"mesh_capture_skip_reason\":\"research_constant_paint_color\"";
+            metadata += ",\"mesh_capture_elapsed_ms\":0";
+            metadata += ",\"mesh_capture_request_width\":" + std::to_string(capture_request_width);
+            metadata += ",\"mesh_capture_request_height\":" + std::to_string(capture_request_height);
+            plan_stats.enabled_samples = 0;
+            plan_stats.unsafe_candidates = 0;
+            plan_stats.unsafe_front = 0;
+            plan_stats.unsafe_side = 0;
+            plan_stats.unsafe_back = 0;
+            plan_stats.unsafe_enabled = 0;
+            plan_stats.unsafe_projection_color = 0;
+            plan_stats.unsafe_body_region = 0;
+            plan_stats.unsafe_limb_group = 0;
+            plan_stats.unsafe_source_distance = 0;
+            plan_stats.source_direct_assignments = 0;
+            plan_stats.source_projection_assignments = 0;
+            plan_stats.source_distance_avg_uv = 0.0;
+            plan_stats.source_distance_p95_uv = 0.0;
+            plan_stats.source_distance_max_uv = 0.0;
+            plan_stats.source_distance_avg_component = 0.0;
+            plan_stats.source_distance_p95_component = 0.0;
+            plan_stats.source_distance_max_component = 0.0;
+            for (auto& sample : plan_samples)
+            {
+                const bool enabled = (sample.region == MeshFirstRegion::Front && enable_front) ||
+                                     (sample.region == MeshFirstRegion::Side && enable_side) ||
+                                     (sample.region == MeshFirstRegion::Back && enable_back);
+                if (!enabled)
+                {
+                    continue;
+                }
+                sample.r = research_paint_color_r;
+                sample.g = research_paint_color_g;
+                sample.b = research_paint_color_b;
+                sample.roughness = tuning_roughness;
+                sample.metallic = tuning_metallic;
+                sample.unsafe = false;
+                sample.source_distance_uv = 0.0;
+                sample.source_distance_component = 0.0;
+                ++plan_stats.enabled_samples;
+                ++research_constant_paint_color_assignments;
+            }
+        }
+        else if (any_paint_region)
         {
             write_bridge_progress("mesh_basecolor_capture",
                                   "Capturing mesh-first source BaseColor",
@@ -9776,6 +11753,10 @@ namespace
             const auto capture_started = std::chrono::steady_clock::now();
             capture = sdk_capture_front_colors(ref, ctx, native_front, capture_request_width, capture_request_height);
             const auto capture_elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - capture_started).count();
+            if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+            {
+                return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+            }
             metadata += sdk_capture_metadata(capture);
             metadata += ",\"mesh_capture_elapsed_ms\":" + std::to_string(capture_elapsed_ms);
             metadata += ",\"mesh_capture_request_width\":" + std::to_string(capture_request_width);
@@ -9800,6 +11781,10 @@ namespace
                                      enable_back,
                                      tuning_side_source_max_uv,
                                      plan_stats);
+            if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+            {
+                return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+            }
         }
         else
         {
@@ -9813,13 +11798,23 @@ namespace
 
         metadata += ",";
         metadata += mesh_first_plan_stats_metadata(plan_stats);
-        metadata += ",\"planner_coverage_step_texels\":" + std::to_string(tuning_coverage_step_texels);
-        metadata += ",\"source_distance_policy\":\"" + std::string(profile_available ? "side_visible_pose_component_nearest_front_back_projection_pixel" : "camera_projection_pixel_dynamic") + "\"";
+        metadata += ",\"planner_coverage_step_texels\":" + std::to_string(tuning_brush_2_size_texels);
+        metadata += ",\"source_distance_policy\":\"" +
+                    std::string(research_force_paint_color
+                                    ? "research_constant_paint_color"
+                                    : (profile_available
+                                           ? "side_visible_pose_component_nearest_front_back_projection_pixel"
+                                           : "camera_projection_pixel_dynamic")) +
+                    "\"";
         metadata += ",\"source_distance_side_max_uv\":" + std::to_string(tuning_side_source_max_uv);
         metadata += ",\"source_distance_front_back_max_uv\":" + std::to_string(tuning_front_back_source_max_uv);
         metadata += ",\"source_distance_side_max_component\":" + std::to_string(clamp_range(tuning_side_source_max_uv * 500.0, 20.0, 80.0));
         metadata += ",\"source_projection_color_available\":" + std::string(json_bool(capture.capture_pixels_available));
         metadata += ",\"source_samples\":" + std::to_string(capture.samples.size());
+        metadata += ",\"source_samples_used\":" +
+                    std::to_string(research_force_paint_color ? 0 : plan_stats.enabled_samples);
+        metadata += ",\"research_constant_paint_color_assignments\":" +
+                    std::to_string(research_constant_paint_color_assignments);
         if (plan_stats.unsafe_enabled > 0)
         {
             return response_json(false,
@@ -9845,40 +11840,238 @@ namespace
                                                        metadata);
         }
 
-        sdk::FRuntimeBrushSettings brush{};
-        safe_copy(&brush,
+        sdk::FRuntimeBrushSettings base_brush{};
+        safe_copy(&base_brush,
                   reinterpret_cast<const void*>(ctx.component + sdk::FieldOffsets::RuntimePaintable_CurrentBrushSettings),
-                  sizeof(brush));
-        brush.Hardness = 1.0f;
-        brush.Opacity = 1.0f;
-        const double stroke_radius_texels = tuning_stroke_size_texels;
-        const double stroke_radius_uv = stroke_radius_texels / static_cast<double>(std::max(1, active_texture_size));
-        brush.Radius = static_cast<float>(stroke_radius_uv);
-        brush.Spacing = 1.0f;
-        brush.Falloff = sdk::EBrushFalloff::Spherical;
-        brush.BlendMode = sdk::EPaintBlendMode::Normal;
-        metadata += ",\"stroke_size_texels\":" + std::to_string(tuning_stroke_size_texels);
-        metadata += ",\"stroke_radius_texels\":" + std::to_string(stroke_radius_texels);
-        metadata += ",\"stroke_radius_uv\":" + std::to_string(stroke_radius_uv);
+                  sizeof(base_brush));
+        base_brush.Hardness = 1.0f;
+        base_brush.Opacity = 1.0f;
+        base_brush.Spacing = 1.0f;
+        base_brush.Falloff = sdk::EBrushFalloff::Spherical;
+        base_brush.BlendMode = sdk::EPaintBlendMode::Normal;
+        if (normal_paint_requires_packed &&
+            selected_mesh.source != "runtime_paint_get_initialized_paint_mesh")
+        {
+            return response_json(false,
+                                 "packed_radius_calibration_mesh_source_untrusted",
+                                 0,
+                                 1,
+                                 "packed radius calibration requires the initialized paint mesh",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        const bool uniform_packed_radius_calibration_required =
+            normal_paint_requires_packed && !research_triangle_world_radius;
+        const auto packed_radius_calibration =
+            uniform_packed_radius_calibration_required
+                ? mesh_first_resolve_packed_radius_calibration(selected_mesh.mesh,
+                                                               runtime_triangle_cache.triangles)
+                : MeshFirstPackedRadiusCalibration{};
+        if (uniform_packed_radius_calibration_required && !packed_radius_calibration.ok)
+        {
+            return response_json(false,
+                                 "packed_radius_calibration_failed",
+                                 0,
+                                 1,
+                                 "packed mesh radius calibration failed: " +
+                                     packed_radius_calibration.failure,
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        const bool research_radius_override_requested =
+            research_artifacts && research_packed_radius_scale_override != 0.0;
+        if (research_radius_override_requested &&
+            (!std::isfinite(research_packed_radius_scale_override) ||
+             research_packed_radius_scale_override < 0.5 ||
+             research_packed_radius_scale_override > 4.0))
+        {
+            return response_json(false,
+                                 "research_packed_radius_scale_invalid",
+                                 0,
+                                 1,
+                                 "research packed radius scale must be from 0.5 through 4.0",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        const double packed_mesh_radius_scale =
+            uniform_packed_radius_calibration_required
+                ? (research_radius_override_requested
+                       ? research_packed_radius_scale_override
+                       : packed_radius_calibration.scale)
+                : 1.0;
+        const double packed_wire_radius_scale = packed_mesh_radius_scale;
+        metadata += ",\"packed_mesh_radius_calibration_required\":" +
+                    std::string(json_bool(uniform_packed_radius_calibration_required));
+        metadata += ",\"packed_mesh_radius_calibration_ok\":" +
+                    std::string(json_bool(packed_radius_calibration.ok));
+        metadata += ",\"packed_mesh_radius_calibration_failure\":\"" +
+                    json_escape(packed_radius_calibration.failure) + "\"";
+        metadata += ",\"packed_mesh_bounds_sphere_radius\":" +
+                    std::to_string(packed_radius_calibration.mesh_sphere_radius);
+        metadata += ",\"packed_mesh_bounds_diameter\":" +
+                    std::to_string(packed_radius_calibration.mesh_bounds_diameter);
+        metadata += ",\"packed_mesh_radius_calibration_triangles\":" +
+                    std::to_string(packed_radius_calibration.valid_triangles);
+        metadata += ",\"packed_mesh_radius_calibration_invalid_triangles\":" +
+                    std::to_string(packed_radius_calibration.invalid_triangles);
+        metadata += ",\"packed_mesh_radius_calibration_uv_area\":" +
+                    std::to_string(packed_radius_calibration.uv_area_sum);
+        metadata += ",\"packed_mesh_world_units_per_uv_weighted\":" +
+                    std::to_string(packed_radius_calibration.weighted_world_units_per_uv);
+        metadata += ",\"packed_mesh_radius_scale_raw_world\":" +
+                    std::to_string(packed_radius_calibration.raw_world_scale);
+        metadata += ",\"packed_mesh_radius_coverage_safety_factor\":" +
+                    std::to_string(runtime_contract::PackedMeshAnchorCoverageSafetyFactor);
+        metadata += ",\"packed_mesh_radius_scale_effective\":" +
+                    std::to_string(packed_wire_radius_scale);
+        metadata += ",\"packed_mesh_radius_scale_source\":\"" +
+                    std::string(!normal_paint_requires_packed
+                                    ? "not_applicable_direct_uv"
+                                    : (research_triangle_world_radius
+                                           ? "research_triangle_world_radius_uv_unscaled"
+                                           : (research_radius_override_requested
+                                                  ? "research_override"
+                                                  : "runtime_uv_area_weighted_mesh_calibration"))) +
+                    "\"";
+        metadata += ",\"packed_mesh_radius_scale_application\":\"packed_wire_encoder_only\"";
+        const double texture_size_double = static_cast<double>(std::max(1, active_texture_size));
+        const double brush_1_radius_uv =
+            tuning_brush_1_size_texels / texture_size_double;
+        const double brush_2_radius_uv =
+            tuning_brush_2_size_texels / texture_size_double;
+        sdk::FRuntimeBrushSettings brush_1 = base_brush;
+        sdk::FRuntimeBrushSettings brush_2 = base_brush;
+        brush_1.Radius = static_cast<float>(brush_1_radius_uv);
+        brush_2.Radius = static_cast<float>(brush_2_radius_uv);
+        metadata += ",\"brush_1_radius_texels\":" + std::to_string(tuning_brush_1_size_texels);
+        metadata += ",\"brush_1_radius_uv\":" + std::to_string(brush_1_radius_uv);
+        metadata += ",\"brush_2_radius_texels\":" + std::to_string(tuning_brush_2_size_texels);
+        metadata += ",\"brush_2_radius_uv\":" + std::to_string(brush_2_radius_uv);
+        metadata += ",\"brush_1_packed_radius_uv\":" +
+                    std::to_string(brush_1_radius_uv * packed_wire_radius_scale);
+        metadata += ",\"brush_2_packed_radius_uv\":" +
+                    std::to_string(brush_2_radius_uv * packed_wire_radius_scale);
+        metadata += ",\"stroke_size_texels\":" + std::to_string(tuning_brush_2_size_texels);
+        metadata += ",\"stroke_radius_texels\":" + std::to_string(tuning_brush_2_size_texels);
+        metadata += ",\"stroke_radius_uv\":" + std::to_string(brush_2_radius_uv);
 
         const bool any_fill_region = front_region_mode == MeshFirstRegionMode::Fill ||
                                      side_region_mode == MeshFirstRegionMode::Fill ||
                                      back_region_mode == MeshFirstRegionMode::Fill;
-        sdk::FRuntimeBrushSettings fill_brush = brush;
         const double fill_stroke_radius_texels =
-            any_fill_region ? clamp_range(std::max(tuning_stroke_size_texels * 4.0, 32.0),
-                                          tuning_stroke_size_texels,
+            any_fill_region ? clamp_range(std::max(tuning_brush_1_size_texels * 4.0, 32.0),
+                                          tuning_brush_1_size_texels,
                                           96.0)
-                            : stroke_radius_texels;
-        const double fill_stroke_radius_uv = fill_stroke_radius_texels / static_cast<double>(std::max(1, active_texture_size));
-        const double fill_cell_uv = std::max(fill_stroke_radius_uv * 0.75, stroke_radius_uv);
+                            : tuning_brush_1_size_texels;
+        const double fill_stroke_radius_uv =
+            fill_stroke_radius_texels / texture_size_double;
+        const double fill_cell_uv = std::max(fill_stroke_radius_uv * 0.75, brush_2_radius_uv);
+        sdk::FRuntimeBrushSettings fill_brush = brush_1;
         fill_brush.Radius = static_cast<float>(fill_stroke_radius_uv);
+        const double maximum_packed_radius_uv =
+            std::max({brush_1_radius_uv, brush_2_radius_uv, fill_stroke_radius_uv}) *
+            packed_wire_radius_scale;
+        if (normal_paint_requires_packed &&
+            (!std::isfinite(maximum_packed_radius_uv) ||
+             maximum_packed_radius_uv <= 0.0 || maximum_packed_radius_uv > 1.0))
+        {
+            return response_json(false,
+                                 "packed_radius_calibration_invalid_radius",
+                                 0,
+                                 1,
+                                 "calibrated packed brush radius is outside the native normalized range",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        metadata += ",\"packed_mesh_maximum_radius_uv\":" +
+                    std::to_string(maximum_packed_radius_uv);
+        metadata += ",\"fill_stroke_radius_source\":\"brush_1_x4\"";
         metadata += ",\"fill_stroke_radius_texels\":" + std::to_string(fill_stroke_radius_texels);
         metadata += ",\"fill_stroke_radius_uv\":" + std::to_string(fill_stroke_radius_uv);
+        metadata += ",\"fill_stroke_packed_radius_uv\":" +
+                    std::to_string(fill_stroke_radius_uv * packed_wire_radius_scale);
         metadata += ",\"fill_stroke_coarse_cell_uv\":" + std::to_string(fill_cell_uv);
 
+        sdk::FVector scanline_world_up{0.0, 0.0, 1.0};
+        auto scanline_camera_right = sdk_vec_normalize(sdk_vec_cross(scanline_world_up, camera_direction));
+        bool scanline_camera_right_available = sdk_vec_len(scanline_camera_right) > 0.000001;
+        if (!scanline_camera_right_available)
+        {
+            scanline_world_up = {0.0, 1.0, 0.0};
+            scanline_camera_right = sdk_vec_normalize(sdk_vec_cross(scanline_world_up, camera_direction));
+            scanline_camera_right_available = sdk_vec_len(scanline_camera_right) > 0.000001;
+        }
+        const auto contract_region = [](MeshFirstRegion region) {
+            if (region == MeshFirstRegion::Back)
+                return runtime_contract::ReplayRegion::Back;
+            if (region == MeshFirstRegion::Side)
+                return runtime_contract::ReplayRegion::Side;
+            return runtime_contract::ReplayRegion::Front;
+        };
+        const auto contract_mode = [](MeshFirstRegionMode mode) {
+            if (mode == MeshFirstRegionMode::Fill)
+                return runtime_contract::ReplayRegionMode::Fill;
+            if (mode == MeshFirstRegionMode::Skip)
+                return runtime_contract::ReplayRegionMode::Skip;
+            return runtime_contract::ReplayRegionMode::Paint;
+        };
+        std::vector<runtime_contract::TwoBrushReplayCandidate> replay_candidates{};
+        replay_candidates.reserve(plan_samples.size());
+        double replay_reference_z_min = 0.0;
+        double replay_reference_z_max = 0.0;
+        bool replay_reference_z_bounds_available = false;
+        for (std::size_t sample_index = 0; sample_index < plan_samples.size(); ++sample_index)
+        {
+            const auto& sample = plan_samples[sample_index];
+            const auto mode = mesh_first_region_mode_for_sample(sample.region,
+                                                                 front_region_mode,
+                                                                 side_region_mode,
+                                                                 back_region_mode);
+            const double horizontal = scanline_camera_right_available
+                                          ? sdk_vec_dot(sdk_vec_sub(sample.world_position,
+                                                                    center_ray.location),
+                                                        scanline_camera_right)
+                                          : sample.local_position.X;
+            replay_candidates.push_back(
+                {sample_index,
+                 contract_region(sample.region),
+                 contract_mode(mode),
+                 sample.uv_island,
+                 sample.u,
+                 sample.v,
+                 sample.reference_position_available,
+                 sample.reference_position.Z,
+                 sample.local_position.Z,
+                 horizontal,
+                 sample_index});
+            if (mode != MeshFirstRegionMode::Skip)
+            {
+                const double reference_z = sample.reference_position_available
+                                               ? sample.reference_position.Z
+                                               : sample.local_position.Z;
+                if (!replay_reference_z_bounds_available)
+                {
+                    replay_reference_z_min = reference_z;
+                    replay_reference_z_max = reference_z;
+                    replay_reference_z_bounds_available = true;
+                }
+                else
+                {
+                    replay_reference_z_min = std::min(replay_reference_z_min, reference_z);
+                    replay_reference_z_max = std::max(replay_reference_z_max, reference_z);
+                }
+            }
+        }
+        const auto replay_spatial_sort_started = std::chrono::steady_clock::now();
+        const auto replay_plan = runtime_contract::build_two_brush_replay_plan(
+            replay_candidates,
+            active_texture_size,
+            tuning_brush_1_size_texels,
+            tuning_brush_2_size_texels,
+            fill_stroke_radius_texels);
+        const double replay_spatial_sort_elapsed_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - replay_spatial_sort_started)
+                .count();
+
         std::vector<sdk::FPaintStroke> strokes{};
-        strokes.reserve(plan_samples.size());
+        strokes.reserve(replay_plan.entries.size());
         const bool use_mesh_anchors = runtime_triangle_cache.ok && runtime_uses_profile_component_world;
         const std::string replay_anchor_policy =
             use_mesh_anchors
@@ -9890,14 +12083,14 @@ namespace
         int replay_back = 0;
         int replay_paint = 0;
         int replay_fill = 0;
+        int replay_coarse_paint = 0;
+        int replay_fine_paint = 0;
         int replay_front_paint = 0;
         int replay_side_paint = 0;
         int replay_back_paint = 0;
         int replay_front_fill = 0;
         int replay_side_fill = 0;
         int replay_back_fill = 0;
-        int replay_fill_candidates = 0;
-        int replay_fill_coarse_skipped = 0;
         int replay_world_anchors = 0;
         int replay_local_anchors = 0;
         int replay_triangle_anchors = 0;
@@ -9913,8 +12106,10 @@ namespace
                     std::string(!any_paint_region
                                     ? "fill_material_only"
                                     : (!tuning_auto_material
-                                    ? "manual_tuning"
-                                    : (material_properties.ok ? "dominant_paint_material_patterns" : "source_samples_fallback"))) +
+                                           ? "manual_tuning"
+                                           : (material_properties.ok
+                                                  ? "dominant_paint_material_patterns"
+                                                  : "source_samples_fallback"))) +
                     "\"";
         metadata += ",\"material_properties_auto_ok\":" + std::string(json_bool(material_properties.ok));
         metadata += ",\"material_properties_failure\":\"" + json_escape(material_properties.failure) + "\"";
@@ -9925,166 +12120,213 @@ namespace
         metadata += ",\"material_properties_roughness\":" + std::to_string(material_properties.roughness);
         int material_properties_auto_samples = 0;
         int material_properties_source_sample_fallbacks = 0;
-        std::unordered_set<std::uint64_t> fill_cells{};
-        const auto fill_cell_key = [&](const MeshFirstPlanSample& sample) -> std::uint64_t {
-            const int region = mesh_first_region_code(sample.region) & 0xFF;
-            const int island = (sample.uv_island + 1) & 0xFFFF;
-            const int u_cell = static_cast<int>(std::floor(clamp01(sample.u) / std::max(fill_cell_uv, 0.000001))) & 0xFFFFF;
-            const int v_cell = static_cast<int>(std::floor(clamp01(sample.v) / std::max(fill_cell_uv, 0.000001))) & 0xFFFFF;
-            return (static_cast<std::uint64_t>(region) << 56) |
-                   (static_cast<std::uint64_t>(island) << 40) |
-                   (static_cast<std::uint64_t>(u_cell) << 20) |
-                   static_cast<std::uint64_t>(v_cell);
-        };
-        const MeshFirstRegion replay_region_order[]{MeshFirstRegion::Back, MeshFirstRegion::Side, MeshFirstRegion::Front};
-        const MeshFirstRegionMode replay_mode_order[]{MeshFirstRegionMode::Fill, MeshFirstRegionMode::Paint};
-        metadata += ",\"replay_pass_order\":\"fill_then_paint\"";
-        metadata += ",\"replay_region_order\":\"back,side,front\"";
-        for (const auto target_mode : replay_mode_order)
+        int replay_spatial_sort_partitions = 0;
+        int replay_spatial_order_violations = 0;
+        int replay_triangle_world_radius_derived = 0;
+        double replay_triangle_world_scale_sum = 0.0;
+        double replay_triangle_world_scale_min = std::numeric_limits<double>::infinity();
+        double replay_triangle_world_scale_max = 0.0;
+        runtime_contract::ReplayPass previous_pass = runtime_contract::ReplayPass::Fill;
+        runtime_contract::ReplayRegion previous_region = runtime_contract::ReplayRegion::Front;
+        runtime_contract::SpatialScanlineKey previous_spatial_key{};
+        bool have_previous_partition_entry = false;
+        for (const auto& entry : replay_plan.entries)
         {
-            for (const auto target_region : replay_region_order)
+            if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
             {
-                const auto region_mode = mesh_first_region_mode_for_sample(target_region,
-                                                                           front_region_mode,
-                                                                           side_region_mode,
-                                                                           back_region_mode);
-                if (region_mode == MeshFirstRegionMode::Skip || region_mode != target_mode)
+                return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+            }
+            if (entry.sample_index >= plan_samples.size())
+            {
+                return response_json(false,
+                                     "planner_replay_index_invalid",
+                                     0,
+                                     1,
+                                     "two-brush planner returned an invalid sample index",
+                                     metadata + ",\"replay_blocked\":true");
+            }
+            if (!have_previous_partition_entry ||
+                entry.pass != previous_pass || entry.region != previous_region)
+            {
+                ++replay_spatial_sort_partitions;
+                have_previous_partition_entry = true;
+            }
+            else if (runtime_contract::spatial_scanline_less(entry.spatial_key,
+                                                             previous_spatial_key))
+            {
+                ++replay_spatial_order_violations;
+            }
+            previous_pass = entry.pass;
+            previous_region = entry.region;
+            previous_spatial_key = entry.spatial_key;
+
+            const auto& sample = plan_samples[entry.sample_index];
+            const bool fill_mode = entry.pass == runtime_contract::ReplayPass::Fill;
+            sdk::FPaintChannelData channel{};
+            if (fill_mode)
+            {
+                channel = sdk_make_channel(sdk_srgb_to_linear_unit(fill_color_r),
+                                           sdk_srgb_to_linear_unit(fill_color_g),
+                                           sdk_srgb_to_linear_unit(fill_color_b),
+                                           fill_metallic,
+                                           fill_roughness,
+                                           sdk::EPaintChannelApplyMode::Override);
+            }
+            else
+            {
+                double stroke_metallic = tuning_metallic;
+                double stroke_roughness = tuning_roughness;
+                if (tuning_auto_material)
                 {
-                    continue;
-                }
-                for (const auto& sample : plan_samples)
-                {
-                    if (sample.region != target_region)
+                    if (material_properties.ok)
                     {
-                        continue;
-                    }
-                    sdk::FPaintChannelData channel{};
-                    const bool fill_mode = target_mode == MeshFirstRegionMode::Fill;
-                    if (fill_mode)
-                    {
-                        ++replay_fill_candidates;
-                        if (!fill_cells.insert(fill_cell_key(sample)).second)
-                        {
-                            ++replay_fill_coarse_skipped;
-                            continue;
-                        }
-                        channel = sdk_make_channel(sdk_srgb_to_linear_unit(fill_color_r),
-                                                   sdk_srgb_to_linear_unit(fill_color_g),
-                                                   sdk_srgb_to_linear_unit(fill_color_b),
-                                                   fill_metallic,
-                                                   fill_roughness,
-                                                   sdk::EPaintChannelApplyMode::Override);
+                        stroke_metallic = material_properties.metallic;
+                        stroke_roughness = material_properties.roughness;
+                        ++material_properties_auto_samples;
                     }
                     else
                     {
-                        double stroke_metallic = tuning_metallic;
-                        double stroke_roughness = tuning_roughness;
-                        if (tuning_auto_material)
-                        {
-                            if (material_properties.ok)
-                            {
-                                stroke_metallic = material_properties.metallic;
-                                stroke_roughness = material_properties.roughness;
-                                ++material_properties_auto_samples;
-                            }
-                            else
-                            {
-                                stroke_metallic = clamp01(sample.metallic);
-                                stroke_roughness = clamp01(sample.roughness);
-                                ++material_properties_source_sample_fallbacks;
-                            }
-                        }
-                        channel = sdk_make_channel(sdk_srgb_to_linear_unit(sample.r),
-                                                   sdk_srgb_to_linear_unit(sample.g),
-                                                   sdk_srgb_to_linear_unit(sample.b),
-                                                   stroke_metallic,
-                                                   stroke_roughness,
-                                                   sdk::EPaintChannelApplyMode::Override);
-                    }
-                    const auto& stroke_brush = fill_mode ? fill_brush : brush;
-                    auto stroke = use_mesh_anchors
-                                      ? sdk_make_mesh_anchor_stroke(sample.u,
-                                                                    sample.v,
-                                                                    channel,
-                                                                    stroke_brush,
-                                                                    paint_target_channel,
-                                                                    sample.world_position,
-                                                                    sample.local_position,
-                                                                    sample.triangle_index,
-                                                                    sample.barycentric_a,
-                                                                    sample.barycentric_b,
-                                                                    sample.barycentric_c)
-                                      : sdk_make_uv_stroke(sample.u,
-                                                           sample.v,
-                                                           channel,
-                                                           stroke_brush,
-                                                           paint_target_channel);
-                    if (stroke.bHasWorldPosition)
-                    {
-                        ++replay_world_anchors;
-                    }
-                    if (stroke.bHasLocalPosition)
-                    {
-                        ++replay_local_anchors;
-                    }
-                    if (stroke.bHasSkeletalTriangleAnchor)
-                    {
-                        ++replay_triangle_anchors;
-                    }
-                    strokes.push_back(stroke);
-                    if (fill_mode)
-                    {
-                        ++replay_fill;
-                    }
-                    else
-                    {
-                        ++replay_paint;
-                    }
-                    if (sample.region == MeshFirstRegion::Front)
-                    {
-                        ++replay_front;
-                        if (fill_mode)
-                        {
-                            ++replay_front_fill;
-                        }
-                        else
-                        {
-                            ++replay_front_paint;
-                        }
-                    }
-                    else if (sample.region == MeshFirstRegion::Side)
-                    {
-                        ++replay_side;
-                        if (fill_mode)
-                        {
-                            ++replay_side_fill;
-                        }
-                        else
-                        {
-                            ++replay_side_paint;
-                        }
-                    }
-                    else
-                    {
-                        ++replay_back;
-                        if (fill_mode)
-                        {
-                            ++replay_back_fill;
-                        }
-                        else
-                        {
-                            ++replay_back_paint;
-                        }
+                        stroke_metallic = clamp01(sample.metallic);
+                        stroke_roughness = clamp01(sample.roughness);
+                        ++material_properties_source_sample_fallbacks;
                     }
                 }
+                channel = sdk_make_channel(sdk_srgb_to_linear_unit(sample.r),
+                                           sdk_srgb_to_linear_unit(sample.g),
+                                           sdk_srgb_to_linear_unit(sample.b),
+                                           stroke_metallic,
+                                           stroke_roughness,
+                                           sdk::EPaintChannelApplyMode::Override);
+            }
+            const auto& stroke_brush = fill_mode
+                                           ? fill_brush
+                                           : (entry.pass == runtime_contract::ReplayPass::CoarsePaint
+                                                  ? brush_1
+                                                  : brush_2);
+            auto stroke = use_mesh_anchors
+                              ? sdk_make_mesh_anchor_stroke(sample.u,
+                                                            sample.v,
+                                                            channel,
+                                                            stroke_brush,
+                                                            paint_target_channel,
+                                                            sample.world_position,
+                                                            sample.local_position,
+                                                            sample.triangle_index,
+                                                            sample.barycentric_a,
+                                                            sample.barycentric_b,
+                                                            sample.barycentric_c)
+                              : sdk_make_uv_stroke(sample.u,
+                                                   sample.v,
+                                                   channel,
+                                                   stroke_brush,
+                                                   paint_target_channel);
+            if (research_triangle_world_radius && stroke.bHasSkeletalTriangleAnchor)
+            {
+                if (sample.triangle_index < 0 ||
+                    sample.triangle_index >= static_cast<int>(runtime_triangle_cache.triangles.size()))
+                {
+                    return response_json(false,
+                                         "triangle_world_radius_index_invalid",
+                                         0,
+                                         1,
+                                         "triangle-derived packed world radius could not resolve the anchor triangle",
+                                         metadata + ",\"replay_blocked\":true");
+                }
+                double world_units_per_uv = 0.0;
+                if (!mesh_first_triangle_max_units_per_uv(
+                        runtime_triangle_cache.triangles[static_cast<std::size_t>(sample.triangle_index)],
+                        true,
+                        world_units_per_uv))
+                {
+                    return response_json(false,
+                                         "triangle_world_radius_scale_invalid",
+                                         0,
+                                         1,
+                                         "triangle-derived packed world radius found a degenerate UV-to-world mapping",
+                                         metadata + ",\"replay_blocked\":true");
+                }
+                stroke.EffectiveBrushWorldRadius = static_cast<float>(
+                    world_units_per_uv * static_cast<double>(stroke.BrushSettings.Radius));
+                ++replay_triangle_world_radius_derived;
+                replay_triangle_world_scale_sum += world_units_per_uv;
+                replay_triangle_world_scale_min =
+                    std::min(replay_triangle_world_scale_min, world_units_per_uv);
+                replay_triangle_world_scale_max =
+                    std::max(replay_triangle_world_scale_max, world_units_per_uv);
+            }
+            if (stroke.bHasWorldPosition)
+                ++replay_world_anchors;
+            if (stroke.bHasLocalPosition)
+                ++replay_local_anchors;
+            if (stroke.bHasSkeletalTriangleAnchor)
+                ++replay_triangle_anchors;
+            strokes.push_back(std::move(stroke));
+
+            if (fill_mode)
+                ++replay_fill;
+            else
+                ++replay_paint;
+            if (entry.pass == runtime_contract::ReplayPass::CoarsePaint)
+                ++replay_coarse_paint;
+            else if (entry.pass == runtime_contract::ReplayPass::FinePaint)
+                ++replay_fine_paint;
+            if (sample.region == MeshFirstRegion::Front)
+            {
+                ++replay_front;
+                fill_mode ? ++replay_front_fill : ++replay_front_paint;
+            }
+            else if (sample.region == MeshFirstRegion::Side)
+            {
+                ++replay_side;
+                fill_mode ? ++replay_side_fill : ++replay_side_paint;
+            }
+            else
+            {
+                ++replay_back;
+                fill_mode ? ++replay_back_fill : ++replay_back_paint;
             }
         }
+        metadata += ",\"replay_pass_order\":\"fill,coarse_paint,fine_paint\"";
+        metadata += ",\"replay_region_order\":\"back,side,front\"";
+        metadata += ",\"replay_fill_end\":" + std::to_string(replay_plan.fill_end);
+        metadata += ",\"replay_coarse_end\":" + std::to_string(replay_plan.coarse_end);
+        metadata += ",\"replay_fine_begin\":" + std::to_string(replay_plan.coarse_end);
+        metadata += ",\"replay_spatial_order\":\"profile_reference_z_desc_rows_camera_right_asc\"";
+        metadata += ",\"replay_spatial_reference_z_min\":" + std::to_string(replay_reference_z_min);
+        metadata += ",\"replay_spatial_reference_z_max\":" + std::to_string(replay_reference_z_max);
+        metadata += ",\"replay_spatial_reference_position_fallback_used\":" +
+                    std::string(json_bool(replay_plan.reference_position_fallback_used));
+        metadata += ",\"replay_spatial_reference_position_fallback_candidates\":" +
+                    std::to_string(replay_plan.reference_position_fallback_candidates);
+        metadata += ",\"replay_spatial_fallback_order\":\"runtime_local_z_desc_rows\"";
+        metadata += ",\"replay_spatial_camera_right_available\":" +
+                    std::string(json_bool(scanline_camera_right_available));
+        metadata += ",\"replay_spatial_sort_partitions\":" + std::to_string(replay_spatial_sort_partitions);
+        metadata += ",\"replay_spatial_order_violations\":" + std::to_string(replay_spatial_order_violations);
+        metadata += ",\"replay_spatial_sort_elapsed_ms\":" + std::to_string(replay_spatial_sort_elapsed_ms);
         metadata += ",\"material_properties_auto_samples\":" + std::to_string(material_properties_auto_samples);
         metadata += ",\"material_properties_source_sample_fallbacks\":" + std::to_string(material_properties_source_sample_fallbacks);
+        metadata += ",\"replay_triangle_world_radius_derived\":" +
+                    std::to_string(replay_triangle_world_radius_derived);
+        metadata += ",\"replay_triangle_world_units_per_uv_min\":" +
+                    std::to_string(replay_triangle_world_radius_derived > 0
+                                       ? replay_triangle_world_scale_min
+                                       : 0.0);
+        metadata += ",\"replay_triangle_world_units_per_uv_avg\":" +
+                    std::to_string(replay_triangle_world_radius_derived > 0
+                                       ? replay_triangle_world_scale_sum /
+                                             static_cast<double>(replay_triangle_world_radius_derived)
+                                       : 0.0);
+        metadata += ",\"replay_triangle_world_units_per_uv_max\":" +
+                    std::to_string(replay_triangle_world_scale_max);
         metadata += ",\"replay_strokes_paint\":" + std::to_string(replay_paint);
         metadata += ",\"replay_strokes_fill\":" + std::to_string(replay_fill);
-        metadata += ",\"replay_strokes_fill_candidates\":" + std::to_string(replay_fill_candidates);
-        metadata += ",\"replay_strokes_fill_coarse_skipped\":" + std::to_string(replay_fill_coarse_skipped);
+        metadata += ",\"replay_strokes_coarse_paint\":" + std::to_string(replay_coarse_paint);
+        metadata += ",\"replay_strokes_fine_paint\":" + std::to_string(replay_fine_paint);
+        metadata += ",\"replay_strokes_fill_candidates\":" + std::to_string(replay_plan.fill_candidates);
+        metadata += ",\"replay_strokes_fill_coarse_skipped\":" + std::to_string(replay_plan.fill_deduplicated);
+        metadata += ",\"replay_strokes_coarse_paint_candidates\":" + std::to_string(replay_plan.coarse_paint_candidates);
+        metadata += ",\"replay_strokes_coarse_paint_deduplicated\":" + std::to_string(replay_plan.coarse_paint_deduplicated);
         metadata += ",\"replay_strokes_front_paint\":" + std::to_string(replay_front_paint);
         metadata += ",\"replay_strokes_side_paint\":" + std::to_string(replay_side_paint);
         metadata += ",\"replay_strokes_back_paint\":" + std::to_string(replay_back_paint);
@@ -10093,6 +12335,36 @@ namespace
         metadata += ",\"replay_strokes_back_fill\":" + std::to_string(replay_back_fill);
         metadata += ",\"planner_strokes_paint\":" + std::to_string(replay_paint);
         metadata += ",\"planner_strokes_fill\":" + std::to_string(replay_fill);
+        const auto research_strokes_before_limit = strokes.size();
+        metadata += ",\"research_strokes_before_limit\":" + std::to_string(research_strokes_before_limit);
+        if (research_stroke_limit > 0 && research_strokes_before_limit > static_cast<std::size_t>(research_stroke_limit))
+        {
+            strokes.resize(static_cast<std::size_t>(research_stroke_limit));
+        }
+        metadata += ",\"research_strokes_after_limit\":" + std::to_string(strokes.size());
+        metadata += ",\"research_stroke_limit_applied\":" +
+                    std::string(json_bool(research_stroke_limit > 0 &&
+                                          research_strokes_before_limit > static_cast<std::size_t>(research_stroke_limit)));
+        const auto effective_fill_end = std::min(replay_plan.fill_end, strokes.size());
+        const auto effective_coarse_end = std::min(replay_plan.coarse_end, strokes.size());
+        metadata += ",\"replay_effective_fill_end\":" + std::to_string(effective_fill_end);
+        metadata += ",\"replay_effective_coarse_end\":" + std::to_string(effective_coarse_end);
+        metadata += ",\"replay_effective_fine_begin\":" + std::to_string(effective_coarse_end);
+        const int effective_replay_server_batch_limit =
+            normal_paint_requires_packed
+                ? requested_pacing_decision.remote_batch_limit
+                : tuning_server_batch_limit;
+        metadata += ",\"replay_triangle_world_radius_normalization\":\"" +
+                    std::string(research_triangle_world_radius
+                                    ? "max_per_actual_encoder_slice"
+                                    : "not_requested") +
+                    "\"";
+        if (research_artifacts)
+        {
+            metadata += ",\"research_stroke_plan_digest_schema\":\"fnv1a64_canonical_fpaintstroke_v1\"";
+            metadata += ",\"research_stroke_plan_digest\":\"" +
+                        std::to_string(mesh_first_hash_stroke_plan(strokes)) + "\"";
+        }
         if (strokes.empty())
         {
             return response_json(false,
@@ -10116,6 +12388,19 @@ namespace
         metadata += ",\"first_stroke_barycentric_y\":" + std::to_string(first_stroke.SkeletalTriangleBarycentric.Y);
         metadata += ",\"first_stroke_barycentric_z\":" + std::to_string(first_stroke.SkeletalTriangleBarycentric.Z);
         metadata += ",\"first_stroke_brush_radius\":" + std::to_string(first_stroke.BrushSettings.Radius);
+        float first_stroke_packed_wire_radius = 0.0f;
+        const bool first_stroke_packed_wire_radius_available =
+            normal_paint_requires_packed &&
+            runtime_contract::resolve_packed_wire_brush_radius(
+                first_stroke.BrushSettings.Radius,
+                packed_wire_radius_scale,
+                first_stroke_packed_wire_radius);
+        metadata += ",\"first_stroke_packed_wire_brush_radius_available\":" +
+                    std::string(json_bool(first_stroke_packed_wire_radius_available));
+        metadata += ",\"first_stroke_packed_wire_brush_radius\":" +
+                    std::to_string(first_stroke_packed_wire_radius);
+        metadata += ",\"first_stroke_effective_world_radius\":" +
+                    std::to_string(first_stroke.EffectiveBrushWorldRadius);
         metadata += ",\"first_stroke_brush_spacing\":" + std::to_string(first_stroke.BrushSettings.Spacing);
         metadata += ",\"first_stroke_albedo_r\":" + std::to_string(first_stroke.ChannelData.AlbedoColor.R);
         metadata += ",\"first_stroke_albedo_g\":" + std::to_string(first_stroke.ChannelData.AlbedoColor.G);
@@ -10131,23 +12416,81 @@ namespace
         metadata += ",\"planner_strokes_side\":" + std::to_string(replay_side);
         metadata += ",\"planner_strokes_back\":" + std::to_string(replay_back);
         metadata += ",\"planner_strokes_total\":" + std::to_string(strokes.size());
-        const int effective_replay_server_batch_limit =
-            normal_paint_requires_packed ? packed_server_batch_limit : tuning_server_batch_limit;
-        const int effective_server_batch_delay_ms =
-            normal_paint_requires_packed ? packed_server_batch_seed_delay_ms
-                                         : std::max(PackedReplicationMinPacingMs, tuning_server_batch_delay_ms);
-        const int estimated_batches = (static_cast<int>(strokes.size()) + std::max(1, effective_replay_server_batch_limit) - 1) /
-                                      std::max(1, effective_replay_server_batch_limit);
-        const int estimated_replay_ms = std::max(0, estimated_batches - 1) * effective_server_batch_delay_ms;
+        const int effective_server_batch_pacing_ms =
+            normal_paint_requires_packed ? packed_server_batch_seed_pacing_ms
+                                         : std::max(PackedReplicationMinPacingMs, tuning_server_batch_pacing_ms);
+        const int estimated_batch_limit = std::max(1, effective_replay_server_batch_limit);
+        const auto estimated_calls_for_window = [&](std::size_t begin, std::size_t end) {
+            const auto clamped_begin = std::min(begin, strokes.size());
+            const auto clamped_end = std::min(std::max(begin, end), strokes.size());
+            const auto count = static_cast<int>(clamped_end - clamped_begin);
+            return count > 0
+                       ? (count + estimated_batch_limit - 1) / estimated_batch_limit
+                       : 0;
+        };
+        const int estimated_batches =
+            estimated_calls_for_window(0, effective_fill_end) +
+            estimated_calls_for_window(effective_fill_end, effective_coarse_end) +
+            estimated_calls_for_window(effective_coarse_end, strokes.size());
+        const int estimated_replay_ms = std::max(0, estimated_batches - 1) * effective_server_batch_pacing_ms;
         metadata += ",\"server_batch_estimated_calls\":" + std::to_string(estimated_batches);
         metadata += ",\"estimated_replay_ms\":" + std::to_string(estimated_replay_ms);
-        metadata += ",\"server_batch_delay_requested_ms\":" + std::to_string(tuning_server_batch_delay_ms);
-        metadata += ",\"server_batch_delay_effective_ms\":" + std::to_string(effective_server_batch_delay_ms);
+        metadata += ",\"server_batch_pacing_requested_ms\":" + std::to_string(tuning_server_batch_pacing_ms);
+        metadata += ",\"server_batch_pacing_contract_estimate_ms\":" +
+                    std::to_string(effective_server_batch_pacing_ms);
         metadata += ",\"skeletal_triangle_anchor_used\":" + std::string(json_bool(replay_triangle_anchors > 0));
         metadata += ",\"replay_anchor_mode\":\"" + std::string(use_mesh_anchors ? "skeletal_triangle" : "uv_only") + "\"";
         metadata += ",\"replay_world_anchors\":" + std::to_string(replay_world_anchors);
         metadata += ",\"replay_local_anchors\":" + std::to_string(replay_local_anchors);
         metadata += ",\"replay_triangle_anchors\":" + std::to_string(replay_triangle_anchors);
+        metadata += ",\"mesh_anchor_effective_world_radius_policy\":\"" +
+                    std::string(normal_paint_requires_packed
+                                    ? (research_triangle_world_radius
+                                           ? "research_triangle_jacobian_batch_max"
+                                           : "game_derived_nonpositive_sentinel")
+                                    : "not_applicable_nonpacked_route") +
+                    "\"";
+        metadata += ",\"mesh_anchor_effective_subdivision_policy\":\"" +
+                    std::string(normal_paint_requires_packed
+                                    ? "game_preflight_nonpositive_sentinels"
+                                    : "not_applicable_nonpacked_route") +
+                    "\"";
+        const auto append_pass_brush_metadata = [&](const char* pass_name,
+                                                     std::size_t pass_begin,
+                                                     std::size_t pass_end) {
+            const std::string key = std::string("replay_") + pass_name + "_first";
+            const bool available = pass_begin < pass_end && pass_begin < strokes.size();
+            metadata += ",\"" + key + "_available\":" + std::string(json_bool(available));
+            if (!available)
+            {
+                return;
+            }
+            const auto& stroke = strokes[pass_begin];
+            metadata += ",\"" + key + "_brush_radius\":" +
+                        std::to_string(stroke.BrushSettings.Radius);
+            float packed_wire_brush_radius = 0.0f;
+            const bool packed_wire_brush_radius_available =
+                normal_paint_requires_packed &&
+                runtime_contract::resolve_packed_wire_brush_radius(
+                    stroke.BrushSettings.Radius,
+                    packed_wire_radius_scale,
+                    packed_wire_brush_radius);
+            metadata += ",\"" + key + "_packed_wire_brush_radius_available\":" +
+                        std::string(json_bool(packed_wire_brush_radius_available));
+            metadata += ",\"" + key + "_packed_wire_brush_radius\":" +
+                        std::to_string(packed_wire_brush_radius);
+            metadata += ",\"" + key + "_effective_world_radius\":" +
+                        std::to_string(stroke.EffectiveBrushWorldRadius);
+            metadata += ",\"" + key + "_effective_subdivision_level\":" +
+                        std::to_string(stroke.EffectiveSubdivisionLevel);
+            metadata += ",\"" + key + "_effective_subdivision_pixel_size\":" +
+                        std::to_string(stroke.EffectiveSubdivisionPixelSize);
+            metadata += ",\"" + key + "_effective_template_resolution\":" +
+                        std::to_string(stroke.EffectiveTemplateResolution);
+        };
+        append_pass_brush_metadata("fill", 0, effective_fill_end);
+        append_pass_brush_metadata("coarse_paint", effective_fill_end, effective_coarse_end);
+        append_pass_brush_metadata("fine_paint", effective_coarse_end, strokes.size());
         const bool packed_batch_compatible = sdk_strokes_are_packed_compatible(strokes);
         const bool packed_component_available = ctx.server_packed_paint_batch_function != 0;
         const bool packed_relay_available = ctx.server_relay_packed_stroke_batch_function != 0 && live_uobject(ctx.relay_component);
@@ -10192,6 +12535,7 @@ namespace
             }
         }
         metadata += ",\"server_batch_rpc\":\"" + std::string(normal_paint_requires_packed ? "ServerPackedPaintBatch" : "none") + "\"";
+        metadata += ",\"server_call_completion_semantics\":\"process_event_returned_not_server_ack\"";
         metadata += ",\"server_paint_batch_used\":" + std::string(json_bool(normal_paint_requires_packed));
         metadata += ",\"server_paint_batch_single_stroke_mode\":" +
                     std::string(json_bool(normal_paint_requires_packed && effective_replay_server_batch_limit <= 1));
@@ -10206,9 +12550,134 @@ namespace
         metadata += ",\"server_packed_source_id_failure\":\"" + json_escape(packed_source_id_failure) + "\"";
         metadata += ",\"server_packed_batch_limit_cap\":" + std::to_string(PackedReplicationBatchSize);
         metadata += ",\"server_batch_limit_requested\":" + std::to_string(tuning_server_batch_limit);
-        metadata += ",\"server_batch_limit_ignored_for_packed\":" + std::string(json_bool(normal_paint_requires_packed));
-        metadata += ",\"server_batch_limit_effective\":" + std::to_string(effective_replay_server_batch_limit);
+        metadata += ",\"server_batch_limit_ignored_for_packed\":false";
+        metadata += ",\"server_batch_limit_contract_estimate\":" +
+                    std::to_string(effective_replay_server_batch_limit);
+        metadata += ",\"internal_no_resend_max_calls_per_tick\":" +
+                    std::to_string(use_internal_no_resend_local_apply ? InternalNoResendMaxCallsPerTick : 0);
         metadata += ",\"server_packed_paint_batch_ignored\":\"" + json_escape(packed_ignored_reason) + "\"";
+        InternalNoResendRoute no_resend_route{};
+        if (use_internal_no_resend_local_apply)
+        {
+            no_resend_route = resolve_internal_no_resend_route(ref, ctx.local_paint_at_uv_function);
+            const auto module = main_module_range();
+            const auto rva = [&](std::uintptr_t address) -> std::uintptr_t {
+                return module.base && address >= module.base && address < module.base + module.size
+                           ? address - module.base
+                           : 0;
+            };
+            metadata += ",\"no_resend_resolver_status\":\"" + json_escape(no_resend_route.status) + "\"";
+            metadata += ",\"no_resend_resolver_failure\":\"" + json_escape(no_resend_route.failure) + "\"";
+            metadata += ",\"no_resend_thunk_rva\":\"" + hex_address(rva(no_resend_route.thunk)) + "\"";
+            metadata += ",\"no_resend_impl_rva\":\"" + hex_address(rva(no_resend_route.impl)) + "\"";
+            metadata += ",\"no_resend_ctor_rva\":\"" +
+                        hex_address(rva(no_resend_route.stroke_constructor)) + "\"";
+            metadata += ",\"no_resend_common_rva\":\"" + hex_address(rva(no_resend_route.common)) + "\"";
+            metadata += ",\"local_apply_route\":\"internal_common_no_resend\"";
+            metadata += ",\"per_call_no_resend\":true";
+            metadata += ",\"global_property_mutation\":false";
+            metadata += ",\"local_apply_postcondition\":\"internal_common_postdispatch_counter_advanced_once\"";
+            metadata += ",\"local_apply_completion_semantics\":\"common_returned_after_nonempty_geometry_and_postdispatch_increment;channel_write_pixel_change_and_render_completion_not_verified\"";
+            if (!no_resend_route.resolved)
+            {
+                return response_json(false,
+                                     "mesh_internal_no_resend_resolver_failed",
+                                     0,
+                                     1,
+                                     "internal no-resend route validation failed for this game build: " + no_resend_route.failure,
+                                     metadata + ",\"replay_blocked\":true");
+            }
+        }
+        LocalPackedQueueRoute local_packed_queue_route{};
+        sdk::FGuid local_packed_queue_source_id{};
+        if (use_packed_local_queue)
+        {
+            const auto multicast_packed_function = ref.find_function(ctx.component, "MulticastPackedPaintBatch");
+            local_packed_queue_route = resolve_local_packed_queue_route(ref,
+                                                                        ctx.component,
+                                                                        multicast_packed_function);
+            local_packed_queue_source_id = packed_source_id;
+            local_packed_queue_source_id.A ^= 0x80000000u;
+            if (sdk_guid_is_zero(local_packed_queue_source_id))
+            {
+                local_packed_queue_source_id.D ^= 0x00000001u;
+            }
+            const auto module = main_module_range();
+            const auto rva = [&](std::uintptr_t address) -> std::uintptr_t {
+                return module.base && address >= module.base && address < module.base + module.size
+                           ? address - module.base
+                           : 0;
+            };
+            metadata += ",\"local_packed_queue_resolver_status\":\"" +
+                        json_escape(local_packed_queue_route.status) + "\"";
+            metadata += ",\"local_packed_queue_resolver_failure\":\"" +
+                        json_escape(local_packed_queue_route.failure) + "\"";
+            metadata += ",\"local_packed_queue_thunk_rva\":\"" +
+                        hex_address(rva(local_packed_queue_route.thunk)) + "\"";
+            metadata += ",\"local_packed_queue_implementation_rva\":\"" +
+                        hex_address(rva(local_packed_queue_route.implementation)) + "\"";
+            metadata += ",\"local_packed_queue_decoder_rva\":\"" +
+                        hex_address(rva(local_packed_queue_route.decoder)) + "\"";
+            metadata += ",\"local_packed_queue_enqueue_inner_rva\":\"" +
+                        hex_address(rva(local_packed_queue_route.enqueue_inner)) + "\"";
+            metadata += ",\"local_packed_queue_manager_enqueue_rva\":\"" +
+                        hex_address(rva(local_packed_queue_route.manager_enqueue)) + "\"";
+            metadata += ",\"local_packed_queue_component_context_resolver_rva\":\"" +
+                        hex_address(rva(local_packed_queue_route.component_context_resolver)) + "\"";
+            metadata += ",\"local_packed_queue_manager_resolver_rva\":\"" +
+                        hex_address(rva(local_packed_queue_route.manager_resolver)) + "\"";
+            metadata += ",\"local_packed_queue_source_policy\":\"component_source_high_bit_flipped_nonself\"";
+            metadata += ",\"local_packed_queue_process_event_used\":false";
+            metadata += ",\"local_packed_queue_network_send_expected\":false";
+            metadata += ",\"local_packed_queue_remote_backoff_policy\":\"ignore_painter_local_receiver_backlog\"";
+            metadata += ",\"local_apply_route\":\"native_packed_receiver_queue\"";
+            metadata += ",\"local_apply_completion_semantics\":\"receiver_returned_and_exact_queue_delta_observed;pixel_completion_not_verified\"";
+            if (!local_packed_queue_route.resolved)
+            {
+                return response_json(false,
+                                     "mesh_local_packed_queue_resolver_failed",
+                                     0,
+                                     1,
+                                     "local packed receiver route validation failed for this game build: " +
+                                         local_packed_queue_route.failure,
+                                     metadata + ",\"replay_blocked\":true");
+            }
+        }
+        std::uintptr_t replication_manager = ref.find_first_instance("RuntimePaintReplicationManager");
+        if (use_packed_local_queue)
+        {
+            bool manager_resolver_exception = false;
+            std::string manager_resolver_failure{};
+            const auto exact_manager = sdk_resolve_local_packed_queue_manager(
+                ctx.component,
+                local_packed_queue_route.component_context_resolver,
+                local_packed_queue_route.manager_resolver,
+                manager_resolver_exception,
+                manager_resolver_failure);
+            const auto exact_manager_class = exact_manager ? ref.class_name(exact_manager) : std::string{};
+            const bool exact_manager_class_ok =
+                lower_copy(exact_manager_class).find("runtimepaintreplicationmanager") != std::string::npos;
+            metadata += ",\"local_packed_queue_exact_manager\":\"" + hex_address(exact_manager) + "\"";
+            metadata += ",\"local_packed_queue_exact_manager_class\":\"" +
+                        json_escape(exact_manager_class) + "\"";
+            metadata += ",\"local_packed_queue_exact_manager_class_ok\":" +
+                        std::string(json_bool(exact_manager_class_ok));
+            metadata += ",\"local_packed_queue_manager_resolver_exception\":" +
+                        std::string(json_bool(manager_resolver_exception));
+            metadata += ",\"local_packed_queue_manager_resolver_failure\":\"" +
+                        json_escape(manager_resolver_failure) + "\"";
+            if (!exact_manager || !exact_manager_class_ok)
+            {
+                return response_json(false,
+                                     "mesh_local_packed_queue_manager_resolver_failed",
+                                     0,
+                                     1,
+                                     "the paint component's exact replication manager could not be resolved safely: " +
+                                         manager_resolver_failure,
+                                     metadata + ",\"replay_blocked\":true");
+            }
+            replication_manager = exact_manager;
+        }
         if (normal_paint_requires_packed && !packed_component_available)
         {
             return response_json(false,
@@ -10236,7 +12705,6 @@ namespace
                                  "ServerPackedPaintBatch source id is unavailable: " + packed_source_id_failure,
                                  metadata + ",\"replay_blocked\":true");
         }
-        const auto replication_manager = ref.find_first_instance("RuntimePaintReplicationManager");
         const bool fast_apply_component_strokes = false;
         const bool fast_apply_manager_strokes = false;
         const bool fast_apply_manager_writes = false;
@@ -10254,25 +12722,56 @@ namespace
             metadata += ",\"local_texture_import_required\":true";
             metadata += ",\"authoritative_replay\":\"local_texture_preview_only\"";
         }
-        else
+        else if (local_visual_sync_requested)
         {
-            metadata += ",\"local_paint_rpc\":\"PaintAtUVWithBrush\"";
-            metadata += ",\"local_paint_available\":" + std::string(json_bool(ctx.local_paint_at_uv_function != 0));
-            metadata += ",\"local_visual_sync_mode\":\"paint_at_uv_with_brush_lockstep\"";
-            metadata += ",\"local_batch_strategy\":\"single_stroke_lockstep\"";
+            metadata += ",\"local_paint_rpc\":\"" +
+                        std::string(use_packed_local_queue
+                                        ? "native_packed_receiver_queue"
+                                        : (use_internal_no_resend_local_apply
+                                        ? "internal_common_no_resend"
+                                        : "PaintAtUVWithBrush")) + "\"";
+            metadata += ",\"local_paint_available\":" +
+                        std::string(json_bool(use_packed_local_queue
+                                                  ? local_packed_queue_route.resolved
+                                                  : ctx.local_paint_at_uv_function != 0));
+            metadata += ",\"local_visual_sync_mode\":\"" +
+                        std::string(use_packed_local_queue
+                                        ? "native_packed_receiver_queue"
+                                        : (use_internal_no_resend_local_apply
+                                        ? "internal_common_no_resend_lockstep"
+                                        : (use_packed_server_batch
+                                        ? "paint_at_uv_with_brush_lockstep"
+                                        : "paint_at_uv_with_brush_native_replication"))) + "\"";
+            metadata += ",\"local_batch_strategy\":\"" +
+                        std::string(use_packed_local_queue
+                                        ? "packed_receiver_same_limit_and_pacing"
+                                        : (use_internal_no_resend_local_apply
+                                        ? "single_stroke_internal_no_resend_lockstep"
+                                        : (use_packed_server_batch ? "single_stroke_lockstep" : "single_stroke_local_only"))) + "\"";
             metadata += ",\"local_paint_target_channel\":\"all\"";
             metadata += ",\"local_visual_sync_required\":true";
-            metadata += ",\"local_visual_sync_after_server_success\":true";
-            metadata += ",\"local_visual_sync_after_each_server_stroke\":true";
-            metadata += ",\"local_visual_sync_lockstep_with_server_batch\":true";
+            metadata += ",\"local_visual_sync_after_server_success\":" + std::string(json_bool(use_packed_server_batch));
+            metadata += ",\"local_visual_sync_after_each_server_stroke\":" +
+                        std::string(json_bool(use_packed_server_batch && !use_packed_local_queue));
+            metadata += ",\"local_visual_sync_after_each_server_batch\":" +
+                        std::string(json_bool(use_packed_server_batch && use_packed_local_queue));
+            metadata += ",\"local_visual_sync_lockstep_with_server_batch\":" + std::string(json_bool(use_packed_server_batch));
             metadata += ",\"local_texture_import_required\":false";
             metadata += ",\"authoritative_replay\":\"" +
-                        std::string(use_packed_server_batch
+                        std::string(use_packed_local_queue
+                                        ? (research_artifacts
+                                               ? "research_server_packed_with_native_local_receiver_queue"
+                                               : "server_packed_with_native_local_receiver_queue")
+                                        : (use_internal_no_resend_local_apply
+                                        ? "server_packed_with_internal_no_resend_local_lockstep"
+                                        : (use_packed_server_batch
                                         ? (use_packed_relay_route
                                                ? "server_relay_packed_replay_with_local_lockstep"
                                                : "server_packed_replay_with_local_lockstep")
-                                        : "blocked") + "\"";
-            if (!ctx.local_paint_at_uv_function)
+                                        : (research_local_only
+                                               ? "research_local_paint_native_replication_only"
+                                               : "blocked")))) + "\"";
+            if (!use_packed_local_queue && !ctx.local_paint_at_uv_function)
             {
                 return response_json(false,
                                      "mesh_local_visual_sync_unavailable",
@@ -10281,6 +12780,20 @@ namespace
                                      "PaintAtUVWithBrush is unavailable; local stroke sync cannot run",
                                      metadata + ",\"replay_blocked\":true");
             }
+        }
+        else
+        {
+            metadata += ",\"local_paint_rpc\":\"none\"";
+            metadata += ",\"local_paint_available\":" + std::string(json_bool(ctx.local_paint_at_uv_function != 0));
+            metadata += ",\"local_visual_sync_mode\":\"research_packed_only\"";
+            metadata += ",\"local_batch_strategy\":\"disabled\"";
+            metadata += ",\"local_paint_target_channel\":\"none\"";
+            metadata += ",\"local_visual_sync_required\":false";
+            metadata += ",\"local_visual_sync_after_server_success\":false";
+            metadata += ",\"local_visual_sync_after_each_server_stroke\":false";
+            metadata += ",\"local_visual_sync_lockstep_with_server_batch\":false";
+            metadata += ",\"local_texture_import_required\":false";
+            metadata += ",\"authoritative_replay\":\"research_server_packed_only\"";
         }
         metadata += ",\"server_texture_sync_mode\":\"disabled\"";
         metadata += ",\"post_import_texture_sync_enabled\":" + std::string(json_bool(MeshFirstPostImportTextureSyncEnabled));
@@ -10318,7 +12831,14 @@ namespace
         const std::vector<const char*> component_paint_replication_candidates{
             "ServerPackedPaintBatch",
             "MulticastPackedPaintBatch",
+            "MulticastPaintBatchToOthers",
             "MulticastPackedPaintBatchToOthers",
+            "PaintAtUV",
+            "PaintAtUVWithBrush",
+            "PaintStrokeUV",
+            "SendPaintToServer",
+            "FlushRecordedStrokesToServer",
+            "ClearRecordedStrokes",
         };
         const std::vector<const char*> relay_paint_replication_candidates{
             "ServerRelayCompactPaint",
@@ -10326,6 +12846,14 @@ namespace
             "ServerRelayPackedStrokeBatch",
         };
         const std::vector<const char*> paint_replication_property_candidates{
+            "bAutoRecordStrokes",
+            "bAutoFlushStrokes",
+            "bAsyncPrepareReplicatedPaint",
+            "bCacheRecordingEnabled",
+            "bPoseIndependentSkeletalPainting",
+            "bUpdateOnlyPaintArea",
+            "bInBrushStroke",
+            "bDisablePaintingStartupSlowdown",
             "bUseCompactPaintReplication",
             "bUseExperimentalPackedPaintReplication",
             "MaxOutgoingStrokesPerBatch",
@@ -10421,7 +12949,38 @@ namespace
             metadata += ",\"albedo_export_before_failure\":\"" + json_escape(albedo_before.failure) + "\"";
         }
 
-        const auto replication_before = mesh_first_capture_replication_snapshot(ref, ctx.component);
+        const auto replication_before = mesh_first_capture_replication_snapshot(ref,
+                                                                                ctx.component,
+                                                                                replication_manager);
+        if (use_packed_local_queue &&
+            (replication_before.manager != replication_manager ||
+             !replication_before.manager_available ||
+             !replication_before.manager_component_queued_count_available ||
+             replication_before.manager_component_queued_count < 0))
+        {
+            metadata += mesh_first_replication_snapshot_metadata("mesh_rep_before", replication_before);
+            return response_json(false,
+                                 "mesh_local_packed_queue_preflight_failed",
+                                 0,
+                                 1,
+                                 "the exact local receiver queue could not be measured before any server batch was submitted",
+                                 metadata +
+                                     ",\"local_packed_queue_preflight_failure\":\"exact_component_queue_probe_unavailable\"" +
+                                     ",\"replay_blocked\":true");
+        }
+        if (use_packed_local_queue &&
+            replication_before.manager_component_queued_count != 0)
+        {
+            metadata += mesh_first_replication_snapshot_metadata("mesh_rep_before", replication_before);
+            return response_json(false,
+                                 "mesh_local_packed_queue_still_draining",
+                                 0,
+                                 1,
+                                 "a previous local paint queue is still rendering",
+                                 metadata +
+                                     ",\"local_packed_queue_preflight_failure\":\"component_queue_not_empty\"" +
+                                     ",\"replay_blocked\":true");
+        }
 
         if (preview_only)
         {
@@ -10497,11 +13056,32 @@ namespace
             async_job->controller = ctx.controller;
             async_job->pawn = ctx.pawn;
             async_job->component = ctx.component;
+            async_job->component_class = safe_read<std::uintptr_t>(ctx.component + OffClass);
+            async_job->component_outer = safe_read<std::uintptr_t>(ctx.component + OffOuter);
             async_job->relay_component = ctx.relay_component;
             async_job->k2_get_pawn_function = ctx.k2_get_pawn_function;
             async_job->server_packed_paint_batch_function = ctx.server_packed_paint_batch_function;
             async_job->server_relay_packed_stroke_batch_function = ctx.server_relay_packed_stroke_batch_function;
             async_job->local_paint_at_uv_function = ctx.local_paint_at_uv_function;
+            async_job->local_packed_queue_enabled = use_packed_local_queue;
+            async_job->local_packed_queue_resolver_status = local_packed_queue_route.status;
+            async_job->local_packed_queue_resolver_failure = local_packed_queue_route.failure;
+            async_job->local_packed_queue_thunk = local_packed_queue_route.thunk;
+            async_job->local_packed_queue_implementation = local_packed_queue_route.implementation;
+            async_job->local_packed_queue_decoder = local_packed_queue_route.decoder;
+            async_job->local_packed_queue_enqueue_inner = local_packed_queue_route.enqueue_inner;
+            async_job->local_packed_queue_manager_enqueue = local_packed_queue_route.manager_enqueue;
+            async_job->local_packed_queue_component_context_resolver =
+                local_packed_queue_route.component_context_resolver;
+            async_job->local_packed_queue_manager_resolver = local_packed_queue_route.manager_resolver;
+            async_job->local_packed_queue_source_id = local_packed_queue_source_id;
+            async_job->internal_no_resend_local_apply_enabled = use_internal_no_resend_local_apply;
+            async_job->no_resend_resolver_status = no_resend_route.status;
+            async_job->no_resend_resolver_failure = no_resend_route.failure;
+            async_job->no_resend_thunk = no_resend_route.thunk;
+            async_job->no_resend_impl = no_resend_route.impl;
+            async_job->no_resend_stroke_constructor = no_resend_route.stroke_constructor;
+            async_job->no_resend_common = no_resend_route.common;
             async_job->replication_manager = replication_manager;
             async_job->replication_recorded_count_function = ref.find_function(ctx.component, "GetRecordedStrokeCount");
             async_job->replication_queued_count_function = live_uobject(replication_manager)
@@ -10516,12 +13096,45 @@ namespace
             async_job->server_packed_paint_batch_enabled = use_packed_server_batch;
             async_job->server_packed_paint_batch_use_relay = use_packed_relay_route;
             async_job->server_packed_paint_source_id = packed_source_id;
-            async_job->server_batch_rpc = "ServerPackedPaintBatch";
-            async_job->local_visual_sync_enabled = true;
+            async_job->server_batch_rpc = use_packed_server_batch ? "ServerPackedPaintBatch" : "none";
+            async_job->packed_wire_radius_scale = packed_wire_radius_scale;
+            async_job->local_visual_sync_enabled = local_visual_sync_requested;
             async_job->strokes = std::move(strokes);
-            async_job->metadata = metadata + ",\"server_batch_schedule\":\"timer_drained\"";
+            async_job->initial_stroke_count = static_cast<int>(async_job->strokes.size());
+            if (async_job->internal_no_resend_local_apply_enabled)
+            {
+                for (std::size_t index = 0; index < async_job->strokes.size(); ++index)
+                {
+                    const auto& stroke = async_job->strokes[index];
+                    const auto brush_texture = reinterpret_cast<std::uintptr_t>(stroke.BrushSettings.BrushTexture);
+                    const int target_channel = static_cast<int>(stroke.TargetChannel);
+                    auto descriptor = std::find_if(
+                        async_job->internal_no_resend_preflight_descriptors.begin(),
+                        async_job->internal_no_resend_preflight_descriptors.end(),
+                        [&](const InternalNoResendPreflightDescriptor& candidate) {
+                            return candidate.brush_texture == brush_texture && candidate.target_channel == target_channel;
+                        });
+                    if (descriptor == async_job->internal_no_resend_preflight_descriptors.end())
+                    {
+                        async_job->internal_no_resend_preflight_descriptors.push_back(
+                            {brush_texture, target_channel, index, 1});
+                    }
+                    else
+                    {
+                        ++descriptor->covered_strokes;
+                    }
+                }
+            }
+            async_job->metadata = metadata +
+                                  std::string(use_packed_local_queue
+                                                  ? ",\"server_batch_schedule\":\"same_pacing_packed_lanes\""
+                                                  : ",\"server_batch_schedule\":\"independent_lanes\"");
             async_job->albedo_before = albedo_before;
             async_job->replication_before = replication_before;
+            async_job->local_packed_queue_initial_queue =
+                replication_before.manager_component_queued_count_available
+                    ? replication_before.manager_component_queued_count
+                    : -1;
             async_job->replication_component_max_replicated_strokes_per_tick =
                 replication_before.component_max_replicated_strokes_per_tick;
             async_job->replication_component_use_compact_replication =
@@ -10538,45 +13151,107 @@ namespace
                 replication_before.manager_max_outgoing_network_batches_per_second;
             async_job->replication_manager_coalesce_outgoing_strokes =
                 replication_before.manager_coalesce_outgoing_strokes;
+            const int observed_max_replicated_strokes =
+                replication_before.manager_max_replicated_strokes_per_tick > 0
+                    ? replication_before.manager_max_replicated_strokes_per_tick
+                    : replication_before.component_max_replicated_strokes_per_tick;
+            const auto effective_pacing_decision = runtime_contract::resolve_pacing(
+                tuning_server_batch_limit,
+                tuning_server_batch_pacing_ms,
+                replication_before.manager_max_outgoing_strokes_per_batch,
+                replication_before.manager_max_outgoing_network_batches_per_second,
+                observed_max_replicated_strokes,
+                replication_before.manager_max_render_target_writes_per_frame);
+            async_job->pacing_used_contract_fallback = effective_pacing_decision.used_contract_fallback;
+            async_job->pacing_source = effective_pacing_decision.used_contract_fallback
+                                           ? "shipping_contract_fallback"
+                                           : "game_limits";
+            async_job->pacing_fallback_reason = effective_pacing_decision.used_contract_fallback
+                                                    ? "game_limit_property_unavailable"
+                                                    : "";
+            async_job->metadata += ",\"replication_pacing_control\":\"batch_sliders\"";
+            async_job->metadata += ",\"replication_pacing_source\":\"" +
+                                   async_job->pacing_source + "\"";
+            async_job->metadata += ",\"replication_pacing_used_contract_fallback\":" +
+                                   std::string(json_bool(effective_pacing_decision.used_contract_fallback));
+            async_job->metadata += ",\"replication_pacing_fallback_reason\":\"" +
+                                   async_job->pacing_fallback_reason + "\"";
+            async_job->server_batch_limit = effective_pacing_decision.remote_batch_limit;
+            async_job->server_batch_delay_ms = effective_pacing_decision.remote_delay_ms;
+            async_job->local_visual_sync_batch_limit = use_packed_local_queue
+                                                           ? effective_pacing_decision.remote_batch_limit
+                                                           : effective_pacing_decision.local_batch_limit;
+            async_job->local_visual_sync_delay_ms = use_packed_local_queue
+                                                        ? effective_pacing_decision.remote_delay_ms
+                                                        : effective_pacing_decision.local_delay_ms;
+            // This lane invokes the local anti-echo common routine, not the
+            // receiver's replicated-paint queue.  Track channel fan-out, but
+            // use the measured CPU budget as the hard yield condition rather
+            // than treating the receiver write-limit property as stroke units.
+            async_job->local_render_target_write_budget =
+                std::max(1, effective_pacing_decision.local_batch_limit) *
+                runtime_contract::paint_channel_write_cost(static_cast<int>(sdk::EPaintChannel::All));
             async_job->replication_pacing_enabled = normal_paint_requires_packed;
-            async_job->replication_pacing_requested_batch_limit = effective_replay_server_batch_limit;
-            async_job->replication_pacing_requested_delay_ms = effective_server_batch_delay_ms;
+            async_job->replication_pacing_requested_batch_limit = tuning_server_batch_limit;
+            async_job->replication_pacing_requested_delay_ms = tuning_server_batch_pacing_ms;
             mesh_first_update_replication_pacing_model(async_job, replication_before);
             if (async_job->replication_pacing_enabled)
             {
                 mesh_first_update_replication_pacing_resolved_batch(async_job, replication_before);
                 mesh_first_set_replication_pacing_effective(async_job,
                                                   mesh_first_replication_pacing_resolved_batch(async_job),
-                                                  effective_server_batch_delay_ms);
+                                                  effective_pacing_decision.remote_delay_ms);
                 const auto initial_level =
                     mesh_first_replication_pacing_queue_gate_pressure_level(async_job, replication_before);
                 async_job->replication_pacing_pressure_level = mesh_first_replication_pacing_pressure_level_name(initial_level);
             }
             else
             {
-                async_job->replication_pacing_resolved_batch_limit = effective_replay_server_batch_limit;
-                mesh_first_set_replication_pacing_effective(async_job, effective_replay_server_batch_limit, effective_server_batch_delay_ms);
+                async_job->replication_pacing_resolved_batch_limit = effective_pacing_decision.remote_batch_limit;
+                mesh_first_set_replication_pacing_effective(async_job,
+                                                  effective_pacing_decision.remote_batch_limit,
+                                                  effective_pacing_decision.remote_delay_ms);
                 async_job->replication_pacing_pressure_level = "disabled";
             }
+            async_job->metadata += ",\"server_batch_limit_effective\":" +
+                                   std::to_string(async_job->server_batch_limit);
+            async_job->metadata += ",\"server_batch_pacing_effective_ms\":" +
+                                   std::to_string(async_job->server_batch_delay_ms);
             async_job->server_texture_sync_poll_ms = MeshFirstServerTextureSyncPollMs;
             async_job->server_texture_sync_max_polls = MeshFirstServerTextureSyncMaxPolls;
             async_job->texture_size = active_texture_size;
             async_job->replay_front = replay_front;
             async_job->replay_side = replay_side;
             async_job->replay_back = replay_back;
+            async_job->replay_fill_end = effective_fill_end;
+            async_job->replay_coarse_end = effective_coarse_end;
             async_job->started = std::chrono::steady_clock::now();
-            async_job->phase = MeshFirstBatchPhase::ServerBatch;
+            async_job->phase = async_job->internal_no_resend_local_apply_enabled
+                                   ? MeshFirstBatchPhase::Preflight
+                                   : MeshFirstBatchPhase::ServerBatch;
             {
                 std::lock_guard<std::mutex> lock(g_mesh_first_batch_mutex);
+                if (!g_accepting_bridge_commands.load(std::memory_order_acquire) &&
+                    queued_paint_cancel_reason(queued_job) == PaintCancelReason::None)
+                {
+                    request_queued_paint_cancel(queued_job, "bridge_stopping");
+                }
+                if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+                {
+                    return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+                }
                 g_mesh_first_batch_job = async_job;
+                queued_job->state.store(static_cast<int>(PaintJobState::Async), std::memory_order_release);
             }
             write_bridge_progress("mesh_server_batch_begin",
-                                  "mesh-first " + async_job->server_batch_rpc + " stream prepared",
+                                  async_job->phase == MeshFirstBatchPhase::Preflight
+                                      ? "mesh-first local no-resend preflight prepared"
+                                      : "mesh-first " + async_job->server_batch_rpc + " stream prepared",
                                   0,
                                   static_cast<int>(async_job->strokes.size()),
                                   0.0,
                                   mesh_first_progress_extra(async_job,
-                                                            MeshFirstBatchPhase::ServerBatch,
+                                                            async_job->phase,
                                                             false,
                                                             "running"));
             post_paint_dispatch_message();
@@ -10623,6 +13298,12 @@ namespace
         {
             return false;
         }
+        if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+        {
+            complete_queued_paint_job(queued_job,
+                                      queued_paint_cancel_response(queued_job, "mesh_paint_cancelled"));
+            return true;
+        }
         const auto response = paint_mesh_first_on_game_thread(request, queued_job);
         if (!response.empty())
         {
@@ -10638,23 +13319,51 @@ namespace
         const int local_synced = job ? job->local_stroke_success : 0;
         const int local_total = job ? static_cast<int>(job->strokes.size()) : 0;
         const int server_sent = job ? job->server_strokes_sent : 0;
-        const int remaining_strokes = job ? std::max(0, local_total - server_sent) : 0;
+        const int submitted_strokes = mesh_first_completed_strokes(job);
+        const int rendered_strokes = mesh_first_rendered_strokes(job);
+        const int remaining_strokes = job ? std::max(0, local_total - submitted_strokes) : 0;
+        const int rendering_remaining_strokes =
+            std::max(0, submitted_strokes - rendered_strokes);
+        const int paint_strokes_remaining_total =
+            job ? std::max(0, local_total - rendered_strokes) : 0;
+        const bool cancel_after_submission = cancel_phase == "local_queue_drain";
+        const bool queued_rendering_drained =
+            cancel_after_submission && rendering_remaining_strokes == 0;
         const double local_elapsed_ms = job && job->local_sync_started ? job->local_visual_sync_elapsed_ms : -1.0;
+        const auto cancel_requested_tick_ms =
+            job && job->queued ? job->queued->cancel_requested_tick_ms.load(std::memory_order_acquire) : 0;
+        const auto cancel_observed_after_ms = cancel_requested_tick_ms > 0
+                                                  ? std::max<std::uint64_t>(0, GetTickCount64() - cancel_requested_tick_ms)
+                                                  : 0;
         return response_json(false,
                              "mesh_paint_cancelled",
-                             server_sent,
+                             rendered_strokes,
                              1,
-                             "mesh-first paint cancelled: " + cancel_reason,
+                             queued_rendering_drained
+                                 ? "paint cancellation arrived after submission; the committed local queue drained"
+                                 : (cancel_after_submission
+                                        ? "paint cancellation stopped monitoring after submission; committed strokes may still render"
+                                        : "mesh-first paint cancelled: " + cancel_reason),
                              (job ? job->metadata : std::string{}) +
+                                 mesh_first_replay_pass_metadata(job) +
                                  ",\"cancelled\":true" +
                                  ",\"cancel_reason\":\"" + json_escape(cancel_reason) + "\"" +
                                  ",\"cancel_phase\":\"" + json_escape(cancel_phase.empty()
                                                                         ? std::string(job ? mesh_first_phase_name(job->phase) : "unknown")
                                                                         : cancel_phase) + "\"" +
+                                 ",\"cancel_requested_tick_ms\":" + std::to_string(cancel_requested_tick_ms) +
+                                 ",\"cancel_request_to_observe_ms\":" + std::to_string(cancel_observed_after_ms) +
                                  ",\"server_batch_calls\":" + std::to_string(job ? job->server_batch_calls : 0) +
                                  ",\"server_batch_success\":" + std::to_string(job ? job->server_batch_success : 0) +
                                  ",\"server_batch_failures\":" + std::to_string(job ? job->server_batch_failures : 0) +
                                  ",\"server_strokes_sent\":" + std::to_string(server_sent) +
+                                 ",\"paint_strokes_submitted\":" + std::to_string(submitted_strokes) +
+                                 ",\"paint_strokes_rendered\":" + std::to_string(rendered_strokes) +
+                                 ",\"paint_strokes_completed\":" + std::to_string(rendered_strokes) +
+                                 ",\"cancel_after_submission\":" +
+                                     std::string(json_bool(cancel_after_submission)) +
+                                 ",\"queued_rendering_drained\":" +
+                                     std::string(json_bool(queued_rendering_drained)) +
                                  ",\"server_batch_elapsed_ms\":" + std::to_string(job ? job->server_batch_elapsed_ms : -1.0) +
                                  ",\"server_elapsed_ms\":" + std::to_string(job ? job->server_batch_elapsed_ms : -1.0) +
                                  ",\"server_eta_ms\":0" +
@@ -10663,7 +13372,7 @@ namespace
                                  ",\"local_visual_sync_elapsed_ms\":" + std::to_string(local_elapsed_ms) +
                                      ",\"local_visual_sync_failure\":\"" + json_escape(job ? job->local_visual_sync_failure : std::string{}) + "\"" +
                                      ",\"local_batch_limit\":" + std::to_string(job ? job->local_visual_sync_batch_limit : 0) +
-                                     ",\"local_batch_delay_ms\":" + std::to_string(job ? job->local_visual_sync_delay_ms : 0) +
+                                     ",\"local_batch_pacing_ms\":" + std::to_string(job ? job->local_visual_sync_delay_ms : 0) +
                                      ",\"local_batch_calls\":" + std::to_string(job ? job->local_batch_calls : 0) +
                                  ",\"local_stroke_success\":" + std::to_string(local_synced) +
                                  ",\"local_stroke_failures\":" + std::to_string(job ? job->local_stroke_failures : 0) +
@@ -10674,77 +13383,46 @@ namespace
                                  mesh_first_replication_pacing_metadata(job) +
                                  ",\"paint_elapsed_ms\":" + std::to_string(job ? mesh_first_elapsed_ms(job) : -1.0) +
                                  ",\"paint_eta_ms\":0" +
-                                 ",\"remaining_strokes\":" + std::to_string(remaining_strokes));
+                                 mesh_first_internal_no_resend_metadata(job) +
+                                 mesh_first_interrupted_commit_metadata(job) +
+                                 ",\"remaining_strokes\":" + std::to_string(remaining_strokes) +
+                                 ",\"rendering_remaining_strokes\":" +
+                                     std::to_string(rendering_remaining_strokes) +
+                                 ",\"paint_strokes_remaining_total\":" +
+                                     std::to_string(paint_strokes_remaining_total));
     }
 
-    auto cancel_active_mesh_first_batch_job(const char* reason) -> int
+    auto active_mesh_first_batch_job() -> std::shared_ptr<MeshFirstServerBatchAsyncJob>
     {
-        std::shared_ptr<MeshFirstServerBatchAsyncJob> job{};
-        {
-            std::lock_guard<std::mutex> lock(g_mesh_first_batch_mutex);
-            job = g_mesh_first_batch_job;
-        }
-        if (!job)
-        {
-            return 0;
-        }
-        const std::string cancel_reason = reason && *reason ? reason : "cancelled";
-        job->cancel_reason = cancel_reason;
-        job->cancel_requested.store(true);
-        if (job->dispatch_timer_id)
-        {
-            KillTimer(nullptr, job->dispatch_timer_id);
-            job->dispatch_timer_id = 0;
-        }
-        job->next_dispatch_time = {};
-        post_paint_dispatch_message();
-        return 1;
+        std::lock_guard<std::mutex> lock(g_mesh_first_batch_mutex);
+        return g_mesh_first_batch_job;
     }
 
-    auto force_cancel_active_mesh_first_batch_job(const char* reason) -> int
+    auto wait_for_queued_paint_job_quiescent(const std::shared_ptr<QueuedPaintJob>& job,
+                                             std::chrono::milliseconds timeout) -> bool
     {
-        std::shared_ptr<MeshFirstServerBatchAsyncJob> job{};
-        {
-            std::lock_guard<std::mutex> lock(g_mesh_first_batch_mutex);
-            job = g_mesh_first_batch_job;
-        }
         if (!job)
         {
-            return 0;
+            return true;
         }
-        const std::string cancel_reason = reason && *reason ? reason : "cancelled";
-        const std::string cancel_phase = mesh_first_phase_name(job->phase);
-        const int remaining_strokes = mesh_first_remaining_strokes(job);
-        job->cancel_reason = cancel_reason;
-        job->cancel_requested.store(true);
-        if (job->dispatch_timer_id)
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline)
         {
-            KillTimer(nullptr, job->dispatch_timer_id);
-            job->dispatch_timer_id = 0;
+            const bool terminal =
+                job->state.load(std::memory_order_acquire) == static_cast<int>(PaintJobState::Terminal);
+            const auto async_job = active_mesh_first_batch_job();
+            const bool async_tick_active = async_job && async_job->queued == job && async_job->tick_in_progress.load();
+            if (terminal && !async_tick_active)
+            {
+                return true;
+            }
+            post_paint_dispatch_message();
+            Sleep(10);
         }
-        job->next_dispatch_time = {};
-        job->phase = MeshFirstBatchPhase::Cancelled;
-        if (job->server_batch_elapsed_ms < 0.0)
-        {
-            job->server_batch_elapsed_ms = mesh_first_elapsed_ms(job);
-        }
-        if (job->local_sync_started)
-        {
-            job->local_visual_sync_elapsed_ms = mesh_first_local_elapsed_ms(job);
-        }
-        write_bridge_progress("mesh_paint_cancelled",
-                              "mesh-first paint cancelled by shutdown",
-                              job->local_stroke_success,
-                              std::max(1, static_cast<int>(job->strokes.size())),
-                              mesh_first_elapsed_ms(job),
-                              mesh_first_progress_extra(job,
-                                                        MeshFirstBatchPhase::Cancelled,
-                                                        true,
-                                                        "cancelled",
-                                                        "\"remaining_strokes\":" + std::to_string(remaining_strokes) +
-                                                            ",\"cancel_phase\":\"" + json_escape(cancel_phase) + "\""));
-        complete_mesh_first_batch_job(job, mesh_first_cancel_response(job, cancel_reason, cancel_phase));
-        return 1;
+        const bool terminal =
+            job->state.load(std::memory_order_acquire) == static_cast<int>(PaintJobState::Terminal);
+        const auto async_job = active_mesh_first_batch_job();
+        return terminal && !(async_job && async_job->queued == job && async_job->tick_in_progress.load());
     }
 
     auto cancel_queued_paint_jobs(const char* reason) -> int
@@ -10754,18 +13432,38 @@ namespace
             std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
             jobs.swap(g_paint_jobs);
         }
-        const std::string cancel_reason = reason && *reason ? reason : "cancelled";
+        int cancelled = 0;
         for (const auto& job : jobs)
         {
-            complete_queued_paint_job(job,
-                                      response_json(false,
-                                                    "paint_cancelled",
-                                                    0,
-                                                    1,
-                                                    "paint cancelled: " + cancel_reason,
-                                                    "\"cancelled\":true,\"cancel_reason\":\"" + json_escape(cancel_reason) + "\""));
+            if (request_queued_paint_cancel(job, reason))
+            {
+                ++cancelled;
+            }
+            complete_queued_paint_job(job, queued_paint_cancel_response(job));
         }
-        return static_cast<int>(jobs.size());
+        return cancelled;
+    }
+
+    auto cancel_executing_paint_jobs(const char* reason) -> int
+    {
+        std::vector<std::shared_ptr<QueuedPaintJob>> jobs{};
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            jobs = g_executing_paint_jobs;
+        }
+        int cancelled = 0;
+        for (const auto& job : jobs)
+        {
+            if (request_queued_paint_cancel(job, reason))
+            {
+                ++cancelled;
+            }
+        }
+        if (cancelled > 0)
+        {
+            post_paint_dispatch_message();
+        }
+        return cancelled;
     }
 
     auto tick_mesh_first_batch_async_job() -> void
@@ -10783,6 +13481,15 @@ namespace
         {
             return;
         }
+        job->tick_entries.fetch_add(1);
+        if (job->tick_in_progress.exchange(true))
+        {
+            job->tick_reentrancy_suppressed.fetch_add(1);
+            job->last_reentrant_tick_thread_id.store(GetCurrentThreadId());
+            return;
+        }
+        job->last_tick_thread_id.store(GetCurrentThreadId());
+        MeshFirstTickScope tick_scope{job->tick_in_progress};
 
         auto clear_dispatch_timer = [&]() {
             if (job->dispatch_timer_id)
@@ -10794,28 +13501,37 @@ namespace
         clear_dispatch_timer();
 
         auto post_next_after = [&](int delay_ms) {
-            if (g_game_thread_id.load() || g_game_window.load())
+            const int safe_delay_ms = runtime_contract::recurring_scheduler_delay_ms(delay_ms);
+            const auto timer_id = SetTimer(nullptr,
+                                           0,
+                                           static_cast<UINT>(safe_delay_ms),
+                                           paint_dispatch_timer_proc);
+            if (timer_id)
             {
-                if (delay_ms <= 0)
-                {
-                    post_paint_dispatch_message();
-                    return;
-                }
-                const auto timer_id = SetTimer(nullptr,
-                                               0,
-                                               static_cast<UINT>(std::max(1, delay_ms)),
-                                               paint_dispatch_timer_proc);
-                if (timer_id)
-                {
-                    job->dispatch_timer_id = timer_id;
-                    return;
-                }
-                post_paint_dispatch_message();
+                job->dispatch_timer_id = timer_id;
+                return;
             }
+            job->phase = MeshFirstBatchPhase::Failed;
+            job->first_failure = "scheduler_timer_unavailable";
+            complete_mesh_first_batch_job(
+                job,
+                response_json(false,
+                              "mesh_scheduler_timer_failed",
+                              mesh_first_completed_strokes(job),
+                              1,
+                              "Paint scheduler could not create a delayed wakeup.",
+                              job->metadata +
+                                  ",\"first_failure\":\"scheduler_timer_unavailable\"" +
+                                  mesh_first_interrupted_commit_metadata(job) +
+                                  mesh_first_replication_pacing_metadata(job)));
         };
 
         auto elapsed_ms = [&]() {
             return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job->started).count();
+        };
+
+        auto progress_strokes = [&]() {
+            return mesh_first_rendered_strokes(job);
         };
 
         auto write_mesh_progress = [&](const std::string& stage,
@@ -10826,12 +13542,27 @@ namespace
                                        bool terminal,
                                        const char* result,
                                        const std::string& extra = "") {
+            const auto progress_now = std::chrono::steady_clock::now();
+            const bool same_phase = job->last_progress_phase_initialized &&
+                                    job->last_progress_phase == phase;
+            if (!terminal && same_phase &&
+                job->last_progress_write_at.time_since_epoch().count() != 0 &&
+                progress_now - job->last_progress_write_at <
+                    std::chrono::milliseconds(MeshFirstProgressMinIntervalMs))
+            {
+                ++job->progress_updates_suppressed;
+                return;
+            }
             write_bridge_progress(stage,
                                   message,
                                   step,
                                   std::max(1, total),
                                   elapsed_ms(),
                                   mesh_first_progress_extra(job, phase, terminal, result, extra));
+            job->last_progress_write_at = progress_now;
+            job->last_progress_phase = phase;
+            job->last_progress_phase_initialized = true;
+            ++job->progress_updates_written;
         };
 
         auto finish_cancelled = [&]() {
@@ -10846,10 +13577,11 @@ namespace
             {
                 job->local_visual_sync_elapsed_ms = mesh_first_local_elapsed_ms(job);
             }
-            const std::string cancel_reason = job->cancel_reason.empty() ? "cancelled" : job->cancel_reason;
+            const std::string cancel_reason =
+                paint_cancel_reason_name(queued_paint_cancel_reason(job->queued));
             write_mesh_progress("mesh_paint_cancelled",
                                 "mesh-first paint cancelled",
-                                job->local_stroke_success,
+                                progress_strokes(),
                                 static_cast<int>(job->strokes.size()),
                                 MeshFirstBatchPhase::Cancelled,
                                 true,
@@ -10873,16 +13605,24 @@ namespace
             }
             const double total_elapsed_ms = elapsed_ms();
             std::string metadata = job->metadata;
+            metadata += mesh_first_replay_pass_metadata(job);
             metadata += ",\"server_batch_calls\":" + std::to_string(job->server_batch_calls);
             metadata += ",\"server_batch_success\":" + std::to_string(job->server_batch_success);
             metadata += ",\"server_batch_failures\":" + std::to_string(job->server_batch_failures);
             metadata += ",\"server_strokes_sent\":" + std::to_string(job->server_strokes_sent);
+            metadata += ",\"server_call_completion_semantics\":\"process_event_returned_not_server_ack\"";
+            metadata += ",\"paint_strokes_submitted\":" +
+                        std::to_string(mesh_first_completed_strokes(job));
+            metadata += ",\"paint_strokes_rendered\":" +
+                        std::to_string(mesh_first_rendered_strokes(job));
+            metadata += ",\"paint_strokes_completed\":" +
+                        std::to_string(mesh_first_rendered_strokes(job));
             metadata += ",\"server_batch_elapsed_ms\":" + std::to_string(job->server_batch_elapsed_ms);
             metadata += ",\"server_elapsed_ms\":" + std::to_string(job->server_batch_elapsed_ms);
             metadata += ",\"server_eta_ms\":0";
             metadata += mesh_first_replication_pacing_metadata(job);
             metadata += ",\"local_batch_limit\":" + std::to_string(job->local_visual_sync_batch_limit);
-            metadata += ",\"local_batch_delay_ms\":" + std::to_string(job->local_visual_sync_delay_ms);
+            metadata += ",\"local_batch_pacing_ms\":" + std::to_string(job->local_visual_sync_delay_ms);
             metadata += ",\"local_batch_calls\":" + std::to_string(job->local_batch_calls);
             metadata += ",\"local_stroke_calls\":" + std::to_string(job->local_stroke_calls);
             metadata += ",\"local_stroke_success\":" + std::to_string(job->local_stroke_success);
@@ -10899,10 +13639,13 @@ namespace
             metadata += ",\"paint_elapsed_ms\":" + std::to_string(total_elapsed_ms);
             metadata += ",\"paint_eta_ms\":0";
             metadata += ",\"first_failure\":\"" + json_escape(failure) + "\"";
+            metadata += mesh_first_interrupted_commit_metadata(job);
+            metadata += mesh_first_internal_no_resend_metadata(job);
+            metadata += mesh_first_tick_diagnostics_metadata(job);
             metadata += mesh_first_replication_snapshot_metadata("mesh_rep_before", job->replication_before);
             write_mesh_progress("mesh_paint_failed",
                                 message,
-                                job->local_stroke_success,
+                                progress_strokes(),
                                 static_cast<int>(job->strokes.size()),
                                 MeshFirstBatchPhase::Failed,
                                 true,
@@ -10911,7 +13654,7 @@ namespace
             complete_mesh_first_batch_job(job,
                                           response_json(false,
                                                         stage.c_str(),
-                                                        job->server_strokes_sent,
+                                                        mesh_first_rendered_strokes(job),
                                                         1,
                                                         message,
                                                         metadata));
@@ -10933,10 +13676,25 @@ namespace
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job->server_texture_sync_started_at).count();
             }
             const double total_elapsed_ms = elapsed_ms();
+            const bool internal_no_resend_cpu_submission_ok =
+                !job->internal_no_resend_local_apply_enabled ||
+                (job->internal_no_resend_preflight_complete &&
+                 job->internal_no_resend_preflight_strokes_validated == static_cast<int>(job->strokes.size()) &&
+                 job->internal_no_resend_calls_validated == static_cast<int>(job->strokes.size()) &&
+                 job->internal_no_resend_call_exceptions == 0);
+            const bool local_packed_queue_drain_ok =
+                !job->local_packed_queue_enabled ||
+                (job->local_packed_queue_drain_started &&
+                 job->local_packed_queue_drained_strokes == static_cast<int>(job->strokes.size()) &&
+                 runtime_contract::receiver_queue_drain_complete(
+                     job->local_packed_queue_drain_current_queue,
+                     job->local_packed_queue_drain_zero_observations));
             const bool local_visual_sync_ok =
                 !job->local_visual_sync_enabled ||
                 (job->local_visual_sync_failure.empty() &&
-                 job->local_stroke_success == static_cast<int>(job->strokes.size()));
+                 job->local_stroke_success == static_cast<int>(job->strokes.size()) &&
+                 internal_no_resend_cpu_submission_ok &&
+                 local_packed_queue_drain_ok);
             const bool server_texture_sync_ok =
                 job->server_texture_sync_started &&
                 job->server_texture_sync_albedo_changed &&
@@ -10956,17 +13714,24 @@ namespace
                 (job->local_visual_sync_enabled ? local_visual_sync_ok : (local_texture_import_ok || server_texture_sync_ok));
             const bool paint_ok = local_visual_sync_ok && visual_sync_ok;
             std::string metadata = job->metadata;
+            metadata += mesh_first_replay_pass_metadata(job);
             metadata += ",\"server_only_replay_ok\":" + std::string(json_bool(server_only_replay_ok));
             metadata += ",\"server_batch_calls\":" + std::to_string(job->server_batch_calls);
             metadata += ",\"server_batch_success\":" + std::to_string(job->server_batch_success);
             metadata += ",\"server_batch_failures\":" + std::to_string(job->server_batch_failures);
             metadata += ",\"server_strokes_sent\":" + std::to_string(job->server_strokes_sent);
+            metadata += ",\"paint_strokes_submitted\":" +
+                        std::to_string(mesh_first_completed_strokes(job));
+            metadata += ",\"paint_strokes_rendered\":" +
+                        std::to_string(mesh_first_rendered_strokes(job));
+            metadata += ",\"paint_strokes_completed\":" +
+                        std::to_string(mesh_first_rendered_strokes(job));
             metadata += ",\"server_batch_elapsed_ms\":" + std::to_string(job->server_batch_elapsed_ms);
             metadata += ",\"server_elapsed_ms\":" + std::to_string(job->server_batch_elapsed_ms);
             metadata += ",\"server_eta_ms\":0";
             metadata += mesh_first_replication_pacing_metadata(job);
             metadata += ",\"local_batch_limit\":" + std::to_string(job->local_visual_sync_batch_limit);
-            metadata += ",\"local_batch_delay_ms\":" + std::to_string(job->local_visual_sync_delay_ms);
+            metadata += ",\"local_batch_pacing_ms\":" + std::to_string(job->local_visual_sync_delay_ms);
             metadata += ",\"local_batch_calls\":" + std::to_string(job->local_batch_calls);
             metadata += ",\"local_stroke_calls\":" + std::to_string(job->local_stroke_calls);
             metadata += ",\"local_stroke_success\":" + std::to_string(job->local_stroke_success);
@@ -10975,6 +13740,10 @@ namespace
             metadata += ",\"local_strokes_total\":" + std::to_string(job->strokes.size());
             metadata += ",\"local_visual_sync_used\":" + std::string(json_bool(job->local_visual_sync_enabled));
             metadata += ",\"local_visual_sync_ok\":" + std::string(json_bool(local_visual_sync_ok));
+            metadata += ",\"local_packed_queue_drain_ok\":" +
+                        std::string(json_bool(local_packed_queue_drain_ok));
+            metadata += ",\"local_apply_cpu_submission_ok\":" +
+                        std::string(json_bool(internal_no_resend_cpu_submission_ok));
             metadata += ",\"local_visual_sync_failure\":\"" + json_escape(job->local_visual_sync_failure) + "\"";
             metadata += ",\"local_visual_sync_started\":" + std::string(json_bool(job->local_sync_started));
             metadata += ",\"local_visual_sync_elapsed_ms\":" + std::to_string(job->local_sync_started ? job->local_visual_sync_elapsed_ms : -1.0);
@@ -11032,6 +13801,8 @@ namespace
             metadata += ",\"paint_elapsed_ms\":" + std::to_string(total_elapsed_ms);
             metadata += ",\"paint_eta_ms\":0";
             metadata += ",\"first_failure\":\"" + json_escape(job->first_failure) + "\"";
+            metadata += mesh_first_internal_no_resend_metadata(job);
+            metadata += mesh_first_tick_diagnostics_metadata(job);
             Reflection ref{};
             std::string init_failure{};
             if (job->albedo_before.ok && ref.init(init_failure))
@@ -11046,7 +13817,9 @@ namespace
                 {
                     metadata += ",\"albedo_export_after_failure\":\"" + json_escape(albedo_after.failure) + "\"";
                 }
-                const auto replication_after = mesh_first_capture_replication_snapshot(ref, job->component);
+                const auto replication_after = mesh_first_capture_replication_snapshot(ref,
+                                                                                       job->component,
+                                                                                       job->replication_manager);
                 metadata += mesh_first_replication_snapshot_metadata("mesh_rep_after", replication_after);
             }
             else
@@ -11070,11 +13843,11 @@ namespace
             complete_mesh_first_batch_job(job,
                                           response_json(paint_ok,
                                                         paint_ok ? "mesh_first_paint_done" : "mesh_local_visual_sync_failed",
-                                                        job->server_strokes_sent,
+                                                        mesh_first_completed_strokes(job),
                                                         paint_ok ? 0 : 1,
                                                         paint_ok
                                                             ? "Paint completed."
-                                                            : job->server_batch_rpc + " succeeded but local visual sync did not complete",
+                                                            : "Paint strokes were submitted, but local rendering did not complete. Do not retry automatically.",
                                                         metadata));
         };
 
@@ -11084,6 +13857,14 @@ namespace
                 finish_failed("mesh_paint_context_changed",
                               "Paint stopped because the game paint component is no longer available",
                               "paint_component_unavailable");
+                return false;
+            }
+            if (safe_read<std::uintptr_t>(job->component + OffClass) != job->component_class ||
+                safe_read<std::uintptr_t>(job->component + OffOuter) != job->component_outer)
+            {
+                finish_failed("mesh_paint_context_changed",
+                              "Paint stopped because the game paint component changed",
+                              "paint_component_identity_changed");
                 return false;
             }
             if (!live_uobject(job->controller) || !job->k2_get_pawn_function)
@@ -11104,6 +13885,13 @@ namespace
             {
                 return true;
             }
+            if (current_pawn != job->pawn)
+            {
+                finish_failed("mesh_paint_context_changed",
+                              "Paint stopped because the local pawn changed",
+                              "local_pawn_changed");
+                return false;
+            }
             return true;
         };
 
@@ -11116,7 +13904,12 @@ namespace
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (job->cancel_requested.load())
+        const auto active_cancel_reason = queued_paint_cancel_reason(job->queued);
+        const bool defer_user_cancel_until_receiver_drain =
+            active_cancel_reason == PaintCancelReason::UserRequest &&
+            job->phase == MeshFirstBatchPhase::LocalQueueDrain;
+        if (active_cancel_reason != PaintCancelReason::None &&
+            !defer_user_cancel_until_receiver_drain)
         {
             finish_cancelled();
             return;
@@ -11158,7 +13951,7 @@ namespace
                                       std::chrono::milliseconds(std::max(1, job->texture_sync_observer_wait_poll_ms));
             write_mesh_progress("mesh_texture_sync_observe",
                                 "Waiting for texture sync multicast observer",
-                                job->server_strokes_sent,
+                                mesh_first_completed_strokes(job),
                                 static_cast<int>(job->strokes.size()),
                                 MeshFirstBatchPhase::TextureSyncObserve,
                                 false,
@@ -11172,13 +13965,215 @@ namespace
             post_next_after(0);
         };
 
-        if (job->phase == MeshFirstBatchPhase::ServerBatch && job->offset >= job->strokes.size())
+        auto begin_local_queue_drain = [&]() {
+            const auto queue_snapshot = mesh_first_capture_cached_replication_snapshot(job);
+            if (queue_snapshot.manager != job->replication_manager ||
+                !queue_snapshot.manager_available ||
+                !queue_snapshot.manager_component_queued_count_available ||
+                queue_snapshot.manager_component_queued_count < 0)
+            {
+                finish_failed("mesh_local_packed_queue_drain_probe_failed",
+                              "The local paint queue could not be measured after submission.",
+                              queue_snapshot.failure.empty()
+                                  ? "exact_component_queue_probe_unavailable"
+                                  : queue_snapshot.failure);
+                return;
+            }
+            const auto drain_now = std::chrono::steady_clock::now();
+            job->phase = MeshFirstBatchPhase::LocalQueueDrain;
+            job->local_packed_queue_drain_started = true;
+            job->local_packed_queue_drain_started_at = drain_now;
+            job->local_packed_queue_drain_last_sample_at = drain_now;
+            job->local_packed_queue_drain_last_progress_at = drain_now;
+            job->local_packed_queue_drain_current_queue =
+                std::max(0, queue_snapshot.manager_component_queued_count);
+            job->local_packed_queue_drain_last_queue =
+                job->local_packed_queue_drain_current_queue;
+            job->local_packed_queue_drained_strokes =
+                runtime_contract::receiver_queue_rendered_strokes(
+                    job->local_packed_queue_strokes_submitted,
+                    job->local_packed_queue_drain_current_queue,
+                    job->local_packed_queue_drained_strokes);
+            job->local_packed_queue_drain_zero_observations =
+                job->local_packed_queue_drain_current_queue == 0 ? 1 : 0;
+            job->local_packed_queue_drain_strokes_per_ms =
+                job->replication_pacing_queue_drain_strokes_per_ms > 0.0 &&
+                        std::isfinite(job->replication_pacing_queue_drain_strokes_per_ms)
+                    ? job->replication_pacing_queue_drain_strokes_per_ms
+                    : -1.0;
+            job->replication_pacing_post_pressure = queue_snapshot;
+            write_mesh_progress("mesh_local_queue_drain",
+                                "Rendering queued local paint",
+                                job->local_packed_queue_drained_strokes,
+                                static_cast<int>(job->strokes.size()),
+                                MeshFirstBatchPhase::LocalQueueDrain,
+                                false,
+                                "running");
+            job->next_dispatch_time = drain_now +
+                                      std::chrono::milliseconds(
+                                          std::max(1, job->local_packed_queue_drain_poll_ms));
+            post_next_after(job->local_packed_queue_drain_poll_ms);
+        };
+
+        if (job->phase == MeshFirstBatchPhase::ServerBatch &&
+            (!job->server_packed_paint_batch_enabled || job->server_offset >= job->strokes.size()) &&
+            (!job->local_visual_sync_enabled || job->local_offset >= job->strokes.size()))
         {
             if (job->server_batch_elapsed_ms < 0.0)
             {
                 job->server_batch_elapsed_ms = elapsed_ms();
             }
-            finish_done();
+            if (job->local_packed_queue_enabled)
+            {
+                begin_local_queue_drain();
+            }
+            else
+            {
+                finish_done();
+            }
+            return;
+        }
+
+        if (job->phase == MeshFirstBatchPhase::LocalQueueDrain)
+        {
+            const auto queue_snapshot = mesh_first_capture_cached_replication_snapshot(job);
+            if (queue_snapshot.manager != job->replication_manager ||
+                !queue_snapshot.manager_available ||
+                !queue_snapshot.manager_component_queued_count_available ||
+                queue_snapshot.manager_component_queued_count < 0)
+            {
+                finish_failed("mesh_local_packed_queue_drain_probe_failed",
+                              "The local paint queue could not be measured while rendering.",
+                              queue_snapshot.failure.empty()
+                                  ? "exact_component_queue_probe_unavailable"
+                                  : queue_snapshot.failure);
+                return;
+            }
+
+            const auto sample_now = std::chrono::steady_clock::now();
+            const int current_queue = std::max(0, queue_snapshot.manager_component_queued_count);
+            const int previous_queue = job->local_packed_queue_drain_last_queue;
+            if (previous_queue >= 0 && current_queue > previous_queue)
+            {
+                ++job->local_packed_queue_drain_queue_increase_observations;
+                job->local_packed_queue_drain_strokes_per_ms = -1.0;
+                job->local_packed_queue_drain_last_sample_at = sample_now;
+                job->local_packed_queue_drain_last_queue = current_queue;
+            }
+            else if (previous_queue > current_queue &&
+                job->local_packed_queue_drain_last_sample_at.time_since_epoch().count() != 0)
+            {
+                const double sample_ms = std::chrono::duration<double, std::milli>(
+                                             sample_now - job->local_packed_queue_drain_last_sample_at)
+                                             .count();
+                if (sample_ms > 0.0 && std::isfinite(sample_ms))
+                {
+                    const double sample_rate =
+                        static_cast<double>(job->local_packed_queue_drain_last_queue - current_queue) /
+                        sample_ms;
+                    if (sample_rate > 0.0 && std::isfinite(sample_rate))
+                    {
+                        job->local_packed_queue_drain_strokes_per_ms =
+                            job->local_packed_queue_drain_strokes_per_ms > 0.0 &&
+                                    std::isfinite(job->local_packed_queue_drain_strokes_per_ms)
+                                ? (job->local_packed_queue_drain_strokes_per_ms * 0.70) +
+                                      (sample_rate * 0.30)
+                                : sample_rate;
+                    }
+                }
+                job->local_packed_queue_drain_last_progress_at = sample_now;
+                job->local_packed_queue_drain_last_sample_at = sample_now;
+                job->local_packed_queue_drain_last_queue = current_queue;
+            }
+            else if (current_queue > 0)
+            {
+                ++job->local_packed_queue_drain_stall_observations;
+                const double stalled_ms =
+                    job->local_packed_queue_drain_last_progress_at.time_since_epoch().count() != 0
+                        ? std::chrono::duration<double, std::milli>(
+                              sample_now - job->local_packed_queue_drain_last_progress_at)
+                              .count()
+                        : 0.0;
+                if (runtime_contract::receiver_queue_idle_threshold_reached(
+                        current_queue,
+                        static_cast<std::uint64_t>(std::max(0.0, stalled_ms)),
+                        1000))
+                {
+                    // A previously learned rate must not keep promising an ETA
+                    // while the exact receiver cursor is stopped.
+                    job->local_packed_queue_drain_strokes_per_ms = -1.0;
+                }
+            }
+            job->local_packed_queue_drain_current_queue = current_queue;
+            job->local_packed_queue_drained_strokes =
+                runtime_contract::receiver_queue_rendered_strokes(
+                    job->local_packed_queue_strokes_submitted,
+                    current_queue,
+                    job->local_packed_queue_drained_strokes);
+            ++job->local_packed_queue_drain_polls;
+            job->local_packed_queue_drain_zero_observations =
+                current_queue == 0
+                    ? job->local_packed_queue_drain_zero_observations + 1
+                    : 0;
+            job->local_packed_queue_drain_elapsed_ms =
+                std::chrono::duration<double, std::milli>(
+                    sample_now - job->local_packed_queue_drain_started_at)
+                    .count();
+            job->replication_pacing_post_pressure = queue_snapshot;
+
+            if (runtime_contract::receiver_queue_drain_complete(
+                    current_queue,
+                    job->local_packed_queue_drain_zero_observations))
+            {
+                job->local_packed_queue_drained_strokes =
+                    static_cast<int>(job->strokes.size());
+                if (queued_paint_cancel_reason(job->queued) != PaintCancelReason::None)
+                {
+                    finish_cancelled();
+                }
+                else
+                {
+                    finish_done();
+                }
+                return;
+            }
+
+            const double idle_ms =
+                job->local_packed_queue_drain_last_progress_at.time_since_epoch().count() != 0
+                    ? std::chrono::duration<double, std::milli>(
+                          sample_now - job->local_packed_queue_drain_last_progress_at)
+                          .count()
+                    : 0.0;
+            if (runtime_contract::receiver_queue_idle_threshold_reached(
+                    current_queue,
+                    static_cast<std::uint64_t>(std::max(0.0, idle_ms)),
+                    static_cast<std::uint64_t>(
+                        std::max(1000, job->local_packed_queue_drain_idle_timeout_ms))))
+            {
+                if (queued_paint_cancel_reason(job->queued) != PaintCancelReason::None)
+                {
+                    finish_cancelled();
+                }
+                else
+                {
+                    finish_failed("mesh_local_packed_queue_drain_stalled",
+                                  "The local paint queue stopped making progress; submitted strokes may still render later.",
+                                  "receiver_queue_idle_timeout");
+                }
+                return;
+            }
+
+            write_mesh_progress("mesh_local_queue_drain",
+                                "Rendering queued local paint",
+                                job->local_packed_queue_drained_strokes,
+                                static_cast<int>(job->strokes.size()),
+                                MeshFirstBatchPhase::LocalQueueDrain,
+                                false,
+                                "running");
+            job->next_dispatch_time = sample_now +
+                                      std::chrono::milliseconds(
+                                          std::max(1, job->local_packed_queue_drain_poll_ms));
+            post_next_after(job->local_packed_queue_drain_poll_ms);
             return;
         }
 
@@ -11192,7 +14187,7 @@ namespace
             job->local_texture_import_started = true;
             write_mesh_progress("mesh_local_texture_import",
                                 "Importing local material preview texture",
-                                job->server_strokes_sent,
+                                mesh_first_completed_strokes(job),
                                 static_cast<int>(job->strokes.size()),
                                 MeshFirstBatchPhase::LocalTextureImport,
                                 false,
@@ -11276,7 +14271,7 @@ namespace
 
             write_mesh_progress("mesh_texture_sync_observe",
                                 "Waiting for texture sync multicast observer",
-                                job->server_strokes_sent,
+                                mesh_first_completed_strokes(job),
                                 static_cast<int>(job->strokes.size()),
                                 MeshFirstBatchPhase::TextureSyncObserve,
                                 false,
@@ -11325,7 +14320,7 @@ namespace
                 }
                 write_mesh_progress("mesh_server_texture_sync",
                                     "Requesting server texture sync",
-                                    job->server_strokes_sent,
+                                    mesh_first_completed_strokes(job),
                                     static_cast<int>(job->strokes.size()),
                                     MeshFirstBatchPhase::ServerTextureSync,
                                     false,
@@ -11367,7 +14362,7 @@ namespace
 
             write_mesh_progress("mesh_server_texture_sync",
                                 "Waiting for server texture sync",
-                                job->server_strokes_sent,
+                                mesh_first_completed_strokes(job),
                                 static_cast<int>(job->strokes.size()),
                                 MeshFirstBatchPhase::ServerTextureSync,
                                 false,
@@ -11380,10 +14375,695 @@ namespace
             return;
         }
 
+        if (job->phase == MeshFirstBatchPhase::Preflight)
+        {
+            constexpr std::size_t MaxDescriptorsPerTick = 64;
+            std::size_t validated_this_tick = 0;
+            while (job->internal_no_resend_preflight_next_descriptor <
+                       job->internal_no_resend_preflight_descriptors.size() &&
+                   validated_this_tick < MaxDescriptorsPerTick)
+            {
+                if (queued_paint_cancel_reason(job->queued) != PaintCancelReason::None)
+                {
+                    finish_cancelled();
+                    return;
+                }
+                const auto& descriptor = job->internal_no_resend_preflight_descriptors[
+                    job->internal_no_resend_preflight_next_descriptor];
+                std::string preflight_failure{};
+                if (!sdk_validate_internal_common_no_resend_preconditions(
+                        job->component,
+                        job->no_resend_stroke_constructor,
+                        job->no_resend_common,
+                        job->strokes[descriptor.representative_stroke],
+                        preflight_failure))
+                {
+                    job->internal_no_resend_preflight_failure = preflight_failure;
+                    job->local_visual_sync_failure = preflight_failure;
+                    finish_failed("mesh_local_visual_sync_preflight_failed",
+                                  "Local no-resend paint preflight failed before any packed RPC was submitted: " +
+                                      preflight_failure,
+                                  preflight_failure);
+                    return;
+                }
+                job->internal_no_resend_preflight_strokes_validated += descriptor.covered_strokes;
+                ++job->internal_no_resend_preflight_descriptors_validated;
+                ++job->internal_no_resend_preflight_next_descriptor;
+                ++validated_this_tick;
+            }
+            if (job->internal_no_resend_preflight_next_descriptor >=
+                job->internal_no_resend_preflight_descriptors.size())
+            {
+                job->internal_no_resend_preflight_complete = true;
+                job->phase = MeshFirstBatchPhase::ServerBatch;
+                job->next_dispatch_time = {};
+                write_mesh_progress("mesh_local_visual_sync_preflight",
+                                    "Local no-resend paint preflight complete",
+                                    mesh_first_completed_strokes(job),
+                                    static_cast<int>(job->strokes.size()),
+                                    MeshFirstBatchPhase::Preflight,
+                                    false,
+                                    "running");
+                post_next_after(0);
+                return;
+            }
+            job->next_dispatch_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+            write_mesh_progress("mesh_local_visual_sync_preflight",
+                                "Validating local no-resend paint descriptors",
+                                static_cast<int>(job->internal_no_resend_preflight_next_descriptor),
+                                static_cast<int>(job->internal_no_resend_preflight_descriptors.size()),
+                                MeshFirstBatchPhase::Preflight,
+                                false,
+                                "running");
+            post_next_after(1);
+            return;
+        }
+
+        // Packed replication and painter-local visual application have distinct
+        // game limits.  The former is limited by outgoing RPC capacity; the
+        // latter by no-resend calls/render-target work.  Keep their cursors and
+        // cadence independent so the remote sliders cannot force the local
+        // render-target lane into a network-shaped lockstep schedule.
+        if (job->phase == MeshFirstBatchPhase::ServerBatch)
+        {
+            if (job->internal_no_resend_local_apply_enabled &&
+                !job->internal_no_resend_preflight_complete)
+            {
+                finish_failed("mesh_local_visual_sync_preflight_incomplete",
+                              "Local no-resend preflight must complete before any packed RPC is submitted",
+                              "preflight_incomplete");
+                return;
+            }
+            if (job->local_packed_queue_enabled && job->server_offset != job->local_offset)
+            {
+                finish_failed("mesh_local_packed_queue_offset_diverged",
+                              "Packed server and local receiver offsets diverged; automatic retry is unsafe.",
+                              "local_packed_queue_offset_diverged");
+                return;
+            }
+
+            const auto lane_now = std::chrono::steady_clock::now();
+            const bool server_pending = job->server_packed_paint_batch_enabled &&
+                                        job->server_offset < job->strokes.size();
+            const bool local_pending = job->local_visual_sync_enabled &&
+                                       job->local_offset < job->strokes.size();
+            if (!server_pending && !local_pending)
+            {
+                if (job->server_batch_elapsed_ms < 0.0)
+                {
+                    job->server_batch_elapsed_ms = elapsed_ms();
+                }
+                if (job->local_packed_queue_enabled)
+                {
+                    begin_local_queue_drain();
+                }
+                else
+                {
+                    finish_done();
+                }
+                return;
+            }
+
+            const bool server_due = server_pending &&
+                                    (job->server_next_dispatch_time.time_since_epoch().count() == 0 ||
+                                     lane_now >= job->server_next_dispatch_time);
+            const bool local_due_by_time = local_pending &&
+                                           (job->local_next_dispatch_time.time_since_epoch().count() == 0 ||
+                                            lane_now >= job->local_next_dispatch_time);
+
+            if (server_due && job->local_packed_queue_enabled)
+            {
+                bool manager_resolver_exception = false;
+                std::string manager_resolver_failure{};
+                const auto current_exact_manager = sdk_resolve_local_packed_queue_manager(
+                    job->component,
+                    job->local_packed_queue_component_context_resolver,
+                    job->local_packed_queue_manager_resolver,
+                    manager_resolver_exception,
+                    manager_resolver_failure);
+                const bool manager_matches = runtime_contract::packed_manager_precommit_matches(
+                    job->replication_manager,
+                    current_exact_manager);
+                if (!manager_matches)
+                {
+                    job->metadata += ",\"local_packed_queue_precommit_expected_manager\":\"" +
+                                     hex_address(job->replication_manager) + "\"";
+                    job->metadata += ",\"local_packed_queue_precommit_resolved_manager\":\"" +
+                                     hex_address(current_exact_manager) + "\"";
+                    job->metadata += ",\"local_packed_queue_precommit_manager_match\":false";
+                    job->metadata += ",\"local_packed_queue_precommit_manager_resolver_exception\":" +
+                                     std::string(json_bool(manager_resolver_exception));
+                    job->metadata += ",\"local_packed_queue_precommit_manager_resolver_failure\":\"" +
+                                     json_escape(manager_resolver_failure) + "\"";
+                    job->local_visual_sync_failure = current_exact_manager
+                                                         ? "local_packed_queue_exact_manager_changed:expected=" +
+                                                               hex_address(job->replication_manager) +
+                                                               ",resolved=" + hex_address(current_exact_manager)
+                                                         : "local_packed_queue_exact_manager_unavailable:" +
+                                                               manager_resolver_failure;
+                    finish_failed("mesh_local_packed_queue_precommit_manager_failed",
+                                  "The paint component's exact replication manager changed or became unavailable before the next server batch; no new batch was submitted.",
+                                  job->local_visual_sync_failure);
+                    return;
+                }
+            }
+
+            auto capture_replication_pacing_pressure = [&]() -> MeshFirstReplicationSnapshot {
+                return mesh_first_capture_cached_replication_snapshot(job);
+            };
+
+            bool server_throttled = false;
+            if (server_due && job->replication_pacing_enabled)
+            {
+                job->replication_pacing_pre_pressure = capture_replication_pacing_pressure();
+                mesh_first_update_replication_pacing_model(job, job->replication_pacing_pre_pressure);
+                mesh_first_update_replication_pacing_resolved_batch(job, job->replication_pacing_pre_pressure);
+                mesh_first_set_replication_pacing_effective(job,
+                                                  mesh_first_replication_pacing_resolved_batch(job),
+                                                  mesh_first_replication_pacing_requested_delay(job));
+                const auto pressure_level =
+                    mesh_first_replication_pacing_queue_gate_pressure_level(job, job->replication_pacing_pre_pressure);
+                job->replication_pacing_pressure_level = mesh_first_replication_pacing_pressure_level_name(pressure_level);
+                // The exact local receiver queue is not evidence of the remote
+                // peer's EOS/game queue.  Let the game-owned receiver budget
+                // drain it asynchronously while preserving the requested
+                // packed server cadence and identical local batch boundaries.
+                // Applying the remote queue gate here would slow both lanes
+                // based solely on painter-local backlog.
+                if (!job->local_packed_queue_enabled &&
+                    !mesh_first_replication_pacing_queue_gate_open(job, job->replication_pacing_pre_pressure))
+                {
+                    server_throttled = true;
+                    ++job->replication_pacing_backoff_count;
+                    job->server_next_dispatch_time = lane_now +
+                                                     std::chrono::milliseconds(std::max(1, job->server_batch_delay_ms));
+                    if (job->local_packed_queue_enabled)
+                    {
+                        job->local_next_dispatch_time = job->server_next_dispatch_time;
+                    }
+                }
+            }
+
+            MeshFirstReplicationSnapshot paired_queue_before{};
+            std::int64_t paired_raw_i64_170_before{-1};
+            if (server_due && !server_throttled && job->local_packed_queue_enabled)
+            {
+                sdk::FGuid current_source_id{};
+                std::string current_source_failure{};
+                const bool source_available = sdk_read_component_packed_source_id(job->component,
+                                                                                   current_source_id,
+                                                                                   current_source_failure);
+                const bool source_matches = source_available &&
+                                            current_source_id.A == job->server_packed_paint_source_id.A &&
+                                            current_source_id.B == job->server_packed_paint_source_id.B &&
+                                            current_source_id.C == job->server_packed_paint_source_id.C &&
+                                            current_source_id.D == job->server_packed_paint_source_id.D;
+                if (!live_uobject_not_destroyed(job->replication_manager) ||
+                    !job->replication_component_queued_count_function ||
+                    !address_in_main_module_code(job->local_packed_queue_implementation) ||
+                    !source_matches)
+                {
+                    job->local_visual_sync_failure = !source_matches
+                                                         ? "local_packed_queue_source_identity_changed:" +
+                                                               current_source_failure
+                                                         : "local_packed_queue_precommit_route_unavailable";
+                    finish_failed("mesh_local_packed_queue_precommit_failed",
+                                  "The paired local receiver route changed before the next server batch; no new batch was submitted.",
+                                  job->local_visual_sync_failure);
+                    return;
+                }
+                paired_queue_before = capture_replication_pacing_pressure();
+                if (paired_queue_before.manager != job->replication_manager ||
+                    !paired_queue_before.manager_available ||
+                    !paired_queue_before.manager_component_queued_count_available ||
+                    paired_queue_before.manager_component_queued_count < 0)
+                {
+                    job->local_visual_sync_failure = "local_packed_queue_precommit_probe_unavailable";
+                    finish_failed("mesh_local_packed_queue_precommit_probe_failed",
+                                  "The exact local receiver queue could not be measured before the next server batch; no new batch was submitted.",
+                                  job->local_visual_sync_failure);
+                    return;
+                }
+                paired_raw_i64_170_before = safe_read<std::int64_t>(job->replication_manager + 0x170, -1);
+            }
+
+            if (server_due && !server_throttled && job->local_packed_queue_enabled &&
+                queued_paint_cancel_reason(job->queued) != PaintCancelReason::None)
+            {
+                // This is the last cancellation boundary before the paired
+                // server/local commit begins. Once the RPC returns, the exact
+                // matching local receiver enqueue must complete first.
+                finish_cancelled();
+                return;
+            }
+
+            std::size_t paired_local_packed_count = 0;
+            if (server_due && !server_throttled)
+            {
+                const std::size_t desired_server_count = std::min<std::size_t>(
+                    static_cast<std::size_t>(std::max(1, job->server_batch_limit)),
+                    job->strokes.size() - job->server_offset);
+                std::size_t pass_boundary = job->strokes.size();
+                if (job->server_offset < job->replay_fill_end)
+                {
+                    pass_boundary = job->replay_fill_end;
+                }
+                else if (job->server_offset < job->replay_coarse_end)
+                {
+                    pass_boundary = job->replay_coarse_end;
+                }
+                const std::size_t server_count = std::min(
+                    desired_server_count,
+                    pass_boundary > job->server_offset
+                        ? pass_boundary - job->server_offset
+                        : desired_server_count);
+                if (server_count < desired_server_count)
+                {
+                    ++job->replay_pass_boundary_limited_batches;
+                }
+                SdkContext ctx{};
+                ctx.component = job->component;
+                ctx.relay_component = job->relay_component;
+                ctx.server_packed_paint_batch_function = job->server_packed_paint_batch_function;
+                ctx.server_relay_packed_stroke_batch_function = job->server_relay_packed_stroke_batch_function;
+                std::string batch_failure{};
+                if (job->server_submission_started_at.time_since_epoch().count() == 0)
+                {
+                    job->server_submission_started_at = std::chrono::steady_clock::now();
+                }
+                ++job->server_batch_calls;
+                const auto rpc_started = std::chrono::steady_clock::now();
+                const bool batch_ok = sdk_call_packed_paint_batch_from_strokes(ctx.component,
+                                                                               ctx.relay_component,
+                                                                               ctx.server_packed_paint_batch_function,
+                                                                               ctx.server_relay_packed_stroke_batch_function,
+                                                                               job->server_packed_paint_batch_use_relay,
+                                                                               job->strokes,
+                                                                               job->server_offset,
+                                                                               server_count,
+                                                                               job->server_packed_paint_source_id,
+                                                                               job->packed_wire_radius_scale,
+                                                                               batch_failure);
+                job->replication_pacing_last_rpc_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rpc_started).count();
+                if (!batch_ok)
+                {
+                    ++job->server_batch_failures;
+                    job->first_failure = batch_failure.empty() ? job->server_batch_rpc + "_failed" : batch_failure;
+                    job->server_batch_elapsed_ms = elapsed_ms();
+                    finish_failed("mesh_server_batch_failed",
+                                  job->server_batch_rpc + " failed: " + job->first_failure,
+                                  job->first_failure);
+                    return;
+                }
+                ++job->server_batch_success;
+                job->server_strokes_sent += static_cast<int>(server_count);
+                job->server_offset += server_count;
+                if (job->local_packed_queue_enabled)
+                {
+                    paired_local_packed_count = server_count;
+                }
+                job->server_batch_elapsed_ms = elapsed_ms();
+                job->server_next_dispatch_time = std::chrono::steady_clock::now() +
+                                                 std::chrono::milliseconds(std::max(1, job->server_batch_delay_ms));
+                if (!job->local_packed_queue_enabled)
+                {
+                    job->replication_pacing_post_pressure = capture_replication_pacing_pressure();
+                    mesh_first_update_replication_pacing_model(job, job->replication_pacing_post_pressure);
+                    if (job->replication_pacing_enabled)
+                    {
+                        mesh_first_update_replication_pacing_resolved_batch(job, job->replication_pacing_post_pressure);
+                        mesh_first_set_replication_pacing_effective(job,
+                                                          mesh_first_replication_pacing_resolved_batch(job),
+                                                          mesh_first_replication_pacing_requested_delay(job));
+                        job->replication_pacing_pressure_level = mesh_first_replication_pacing_pressure_level_name(
+                            mesh_first_replication_pacing_queue_gate_pressure_level(job, job->replication_pacing_post_pressure));
+                    }
+                }
+            }
+
+            const bool local_due = job->local_packed_queue_enabled
+                                       ? paired_local_packed_count > 0
+                                       : local_due_by_time;
+            if (local_due)
+            {
+                if (!job->local_packed_queue_enabled &&
+                    !job->internal_no_resend_local_apply_enabled &&
+                    !job->local_paint_at_uv_function)
+                {
+                    job->local_visual_sync_failure = "PaintAtUVWithBrush_unavailable";
+                    finish_failed("mesh_local_visual_sync_failed",
+                                  "PaintAtUVWithBrush is unavailable",
+                                  job->local_visual_sync_failure);
+                    return;
+                }
+                if (!job->local_sync_started)
+                {
+                    job->local_sync_started = true;
+                    job->local_sync_started_at = std::chrono::steady_clock::now();
+                }
+                const std::size_t local_count_cap = std::min<std::size_t>(
+                    job->local_packed_queue_enabled
+                        ? paired_local_packed_count
+                        : static_cast<std::size_t>(std::max(1, job->local_visual_sync_batch_limit)),
+                    job->strokes.size() - job->local_offset);
+                const auto local_dispatch_started = std::chrono::steady_clock::now();
+                std::size_t local_count = 0;
+                int local_render_target_writes = 0;
+                if (job->local_packed_queue_enabled)
+                {
+                    if (local_count_cap == 0 || !live_uobject_not_destroyed(job->replication_manager) ||
+                        !job->replication_component_queued_count_function)
+                    {
+                        job->local_visual_sync_failure = "local_packed_queue_pressure_probe_unavailable";
+                        finish_failed("mesh_local_packed_queue_probe_unavailable",
+                                      "The local packed receiver queue cannot be measured safely after the server batch was submitted.",
+                                      job->local_visual_sync_failure);
+                        return;
+                    }
+                    std::string local_failure{};
+                    bool exception_raised = false;
+                    bool implementation_returned = false;
+                    job->local_packed_queue_last_thread_id = GetCurrentThreadId();
+                    job->local_stroke_calls += static_cast<int>(local_count_cap);
+                    const bool local_ok = sdk_call_local_packed_queue_from_strokes(
+                        job->component,
+                        job->local_packed_queue_implementation,
+                        job->strokes,
+                        job->local_offset,
+                        local_count_cap,
+                        job->local_packed_queue_source_id,
+                        job->packed_wire_radius_scale,
+                        exception_raised,
+                        implementation_returned,
+                        local_failure);
+                    if (exception_raised)
+                    {
+                        ++job->local_packed_queue_call_exceptions;
+                    }
+                    if (implementation_returned)
+                    {
+                        ++job->local_packed_queue_calls_returned;
+                    }
+                    const auto sequence_after = safe_read<std::int64_t>(job->replication_manager + 0x170, -1);
+                    const auto queue_after = mesh_first_capture_cached_replication_snapshot(job);
+                    if (job->local_packed_queue_raw_i64_170_before < 0)
+                    {
+                        job->local_packed_queue_raw_i64_170_before = paired_raw_i64_170_before;
+                    }
+                    job->local_packed_queue_raw_i64_170_after = sequence_after;
+                    job->local_packed_queue_last_queue_before =
+                        paired_queue_before.manager_component_queued_count_available
+                            ? paired_queue_before.manager_component_queued_count
+                            : -1;
+                    job->local_packed_queue_last_queue_after =
+                        queue_after.manager_component_queued_count_available
+                            ? queue_after.manager_component_queued_count
+                            : -1;
+                    job->local_packed_queue_drain_current_queue =
+                        job->local_packed_queue_last_queue_after;
+                    job->local_packed_queue_last_queue_delta =
+                        job->local_packed_queue_last_queue_before >= 0 &&
+                                job->local_packed_queue_last_queue_after >= 0
+                            ? job->local_packed_queue_last_queue_after -
+                                  job->local_packed_queue_last_queue_before
+                            : -1;
+                    if (!local_ok)
+                    {
+                        job->local_stroke_failures += static_cast<int>(local_count_cap);
+                        job->local_visual_sync_failure = local_failure.empty()
+                                                             ? "local_packed_queue_failed"
+                                                             : local_failure;
+                        finish_failed("mesh_local_packed_queue_failed",
+                                      "The server batch was submitted, but the local packed receiver call failed. Do not retry automatically: " +
+                                          job->local_visual_sync_failure,
+                                      job->local_visual_sync_failure);
+                        return;
+                    }
+                    if (!paired_queue_before.manager_component_queued_count_available ||
+                        !queue_after.manager_component_queued_count_available ||
+                        job->local_packed_queue_last_queue_delta != static_cast<int>(local_count_cap))
+                    {
+                        ++job->local_packed_queue_delta_mismatches;
+                        job->local_stroke_failures += static_cast<int>(local_count_cap);
+                        job->local_visual_sync_failure =
+                            "local_packed_queue_delta_mismatch:expected=" +
+                            std::to_string(local_count_cap) +
+                            ",observed=" + std::to_string(job->local_packed_queue_last_queue_delta);
+                        finish_failed("mesh_local_packed_queue_postcondition_failed",
+                                      "The local packed receiver returned without the exact queue growth expected after the server batch. Do not retry automatically.",
+                                      job->local_visual_sync_failure);
+                        return;
+                    }
+                    job->replication_pacing_post_pressure = queue_after;
+                    mesh_first_update_replication_pacing_model(job, job->replication_pacing_post_pressure);
+                    if (job->replication_pacing_enabled)
+                    {
+                        mesh_first_update_replication_pacing_resolved_batch(job,
+                                                                           job->replication_pacing_post_pressure);
+                        mesh_first_set_replication_pacing_effective(
+                            job,
+                            mesh_first_replication_pacing_resolved_batch(job),
+                            mesh_first_replication_pacing_requested_delay(job));
+                        job->replication_pacing_pressure_level =
+                            mesh_first_replication_pacing_pressure_level_name(
+                                mesh_first_replication_pacing_queue_gate_pressure_level(
+                                    job,
+                                    job->replication_pacing_post_pressure));
+                    }
+                    local_count = local_count_cap;
+                    job->local_stroke_success += static_cast<int>(local_count);
+                    job->local_packed_queue_strokes_submitted += static_cast<int>(local_count);
+                    job->local_packed_queue_drained_strokes =
+                        runtime_contract::receiver_queue_rendered_strokes(
+                            job->local_packed_queue_strokes_submitted,
+                            job->local_packed_queue_last_queue_after,
+                            job->local_packed_queue_drained_strokes);
+                }
+                else
+                {
+                    while (local_count < local_count_cap)
+                    {
+                        if (queued_paint_cancel_reason(job->queued) != PaintCancelReason::None)
+                        {
+                            finish_cancelled();
+                            return;
+                        }
+                        const auto& local_stroke = job->strokes[job->local_offset + local_count];
+                        const int next_render_target_writes = runtime_contract::paint_channel_write_cost(
+                            static_cast<int>(local_stroke.TargetChannel));
+                        if (!runtime_contract::local_dispatch_can_append(
+                                static_cast<int>(local_count),
+                                local_render_target_writes,
+                                next_render_target_writes,
+                                job->local_visual_sync_batch_limit,
+                                job->local_render_target_write_budget))
+                        {
+                            ++job->local_write_budget_yields;
+                            break;
+                        }
+                        std::string local_failure{};
+                        ++job->local_stroke_calls;
+                        bool local_ok = false;
+                        const auto local_call_started = std::chrono::steady_clock::now();
+                        if (job->internal_no_resend_local_apply_enabled)
+                        {
+                            bool exception_raised = false;
+                            bool common_returned = false;
+                            job->internal_no_resend_last_thread_id = GetCurrentThreadId();
+                            local_ok = sdk_call_internal_common_no_resend(job->component,
+                                                                          job->no_resend_stroke_constructor,
+                                                                          job->no_resend_common,
+                                                                          local_stroke,
+                                                                          exception_raised,
+                                                                          common_returned,
+                                                                          local_failure);
+                            if (exception_raised)
+                            {
+                                ++job->internal_no_resend_call_exceptions;
+                            }
+                            if (common_returned)
+                            {
+                                ++job->internal_no_resend_calls_returned;
+                            }
+                            if (local_ok)
+                            {
+                                ++job->internal_no_resend_calls_validated;
+                            }
+                        }
+                        else
+                        {
+                            local_ok = sdk_call_paint_at_uv_with_brush(job->component,
+                                                                       job->local_paint_at_uv_function,
+                                                                       local_stroke,
+                                                                       local_failure);
+                        }
+                        const double local_call_elapsed_ms =
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - local_call_started)
+                                .count();
+                        job->local_common_call_total_ms += local_call_elapsed_ms;
+                        job->local_common_call_max_ms = std::max(job->local_common_call_max_ms,
+                                                                 local_call_elapsed_ms);
+                        if (!local_ok)
+                        {
+                            ++job->local_stroke_failures;
+                            job->local_visual_sync_failure = local_failure.empty()
+                                                                 ? (job->internal_no_resend_local_apply_enabled
+                                                                        ? "internal_common_no_resend_failed"
+                                                                        : "PaintAtUVWithBrush_failed")
+                                                                 : local_failure;
+                            finish_failed("mesh_local_visual_sync_failed",
+                                          "Paint strokes were submitted, but local rendering failed: " +
+                                              job->local_visual_sync_failure + ". Do not retry automatically.",
+                                          job->local_visual_sync_failure);
+                            return;
+                        }
+                        ++job->local_stroke_success;
+                        ++local_count;
+                        local_render_target_writes += next_render_target_writes;
+                        const auto dispatch_elapsed_us = static_cast<std::uint64_t>(
+                            std::max<double>(0.0,
+                                             std::chrono::duration<double, std::micro>(
+                                                 std::chrono::steady_clock::now() - local_dispatch_started)
+                                                 .count()));
+                        if (local_count < local_count_cap &&
+                            job->local_offset + local_count < job->strokes.size() &&
+                            runtime_contract::local_dispatch_cpu_budget_reached(
+                                static_cast<int>(local_count),
+                                dispatch_elapsed_us))
+                        {
+                            ++job->local_cpu_budget_yields;
+                            break;
+                        }
+                    }
+                }
+                job->local_offset += local_count;
+                job->local_render_target_writes_scheduled += local_render_target_writes;
+                ++job->local_batch_calls;
+                const double local_dispatch_elapsed_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - local_dispatch_started)
+                        .count();
+                job->local_dispatch_total_ms += local_dispatch_elapsed_ms;
+                job->local_dispatch_max_ms = std::max(job->local_dispatch_max_ms,
+                                                       local_dispatch_elapsed_ms);
+                job->local_visual_sync_elapsed_ms = mesh_first_local_elapsed_ms(job);
+                job->local_next_dispatch_time = job->local_packed_queue_enabled
+                                                    ? job->server_next_dispatch_time
+                                                    : std::chrono::steady_clock::now() +
+                                                          std::chrono::milliseconds(
+                                                              std::max(1, job->local_visual_sync_delay_ms));
+            }
+
+            if (job->local_packed_queue_enabled &&
+                queued_paint_cancel_reason(job->queued) != PaintCancelReason::None &&
+                runtime_contract::paired_paint_cancel_safe_to_observe(
+                    true,
+                    job->server_strokes_sent,
+                    job->local_stroke_success))
+            {
+                finish_cancelled();
+                return;
+            }
+
+            const bool server_remaining = job->server_packed_paint_batch_enabled &&
+                                          job->server_offset < job->strokes.size();
+            const bool local_remaining = job->local_visual_sync_enabled &&
+                                         job->local_offset < job->strokes.size();
+            if (!server_remaining && !local_remaining)
+            {
+                if (job->local_packed_queue_enabled)
+                {
+                    begin_local_queue_drain();
+                }
+                else
+                {
+                    finish_done();
+                }
+                return;
+            }
+
+            const auto schedule_now = std::chrono::steady_clock::now();
+            auto next_due = schedule_now + std::chrono::milliseconds(1);
+            bool have_next_due = false;
+            if (server_remaining)
+            {
+                next_due = job->server_next_dispatch_time.time_since_epoch().count() == 0
+                               ? schedule_now
+                               : job->server_next_dispatch_time;
+                have_next_due = true;
+            }
+            if (local_remaining)
+            {
+                const auto local_due_at = job->local_next_dispatch_time.time_since_epoch().count() == 0
+                                              ? schedule_now
+                                              : job->local_next_dispatch_time;
+                if (!have_next_due || local_due_at < next_due)
+                {
+                    next_due = local_due_at;
+                }
+                have_next_due = true;
+            }
+            const int delay_ms = have_next_due
+                                     ? std::max(1, static_cast<int>(std::ceil(
+                                           std::chrono::duration<double, std::milli>(next_due - schedule_now).count())))
+                                     : 1;
+            job->next_dispatch_time = schedule_now + std::chrono::milliseconds(delay_ms);
+            write_mesh_progress(server_throttled ? "mesh_server_batch_throttle" : "mesh_server_batch",
+                                server_throttled ? "Waiting for paint replication queue to drain"
+                                                 : (job->local_packed_queue_enabled
+                                                        ? "mesh-first paired packed server/local receiver stream"
+                                                        : "mesh-first independent packed/local stream"),
+                                job->local_packed_queue_enabled
+                                    ? job->local_packed_queue_drained_strokes
+                                    : mesh_first_completed_strokes(job),
+                                static_cast<int>(job->strokes.size()),
+                                MeshFirstBatchPhase::ServerBatch,
+                                false,
+                                "running");
+            post_next_after(delay_ms);
+            return;
+        }
+
+        // Every supported async phase returns above.  Fail closed here instead
+        // of falling through to the superseded lockstep scheduler below; that
+        // route has no local CPU budget and historically allowed zero-delay
+        // reposting.
+        finish_failed("mesh_scheduler_invalid_phase",
+                      "Paint scheduler reached an unsupported phase.",
+                      "scheduler_invalid_phase");
+        return;
+
         if (job->next_dispatch_time.time_since_epoch().count() != 0)
         {
             job->replication_pacing_last_timer_drift_ms =
                 std::max(0.0, std::chrono::duration<double, std::milli>(now - job->next_dispatch_time).count());
+        }
+
+        if (job->internal_no_resend_local_apply_enabled &&
+            !job->internal_no_resend_preflight_complete)
+        {
+            for (const auto& stroke : job->strokes)
+            {
+                std::string preflight_failure{};
+                if (!sdk_validate_internal_common_no_resend_preconditions(job->component,
+                                                                          job->no_resend_stroke_constructor,
+                                                                          job->no_resend_common,
+                                                                          stroke,
+                                                                          preflight_failure))
+                {
+                    job->internal_no_resend_preflight_failure = preflight_failure;
+                    job->local_visual_sync_failure = preflight_failure;
+                    finish_failed("mesh_local_visual_sync_preflight_failed",
+                                  "Local no-resend paint preflight failed before any new packed RPC was submitted: " +
+                                      preflight_failure,
+                                  preflight_failure);
+                    return;
+                }
+                ++job->internal_no_resend_preflight_strokes_validated;
+            }
+            job->internal_no_resend_preflight_complete = true;
         }
 
         auto capture_replication_pacing_pressure = [&]() -> MeshFirstReplicationSnapshot {
@@ -11406,7 +15086,7 @@ namespace
                 ++job->replication_pacing_backoff_count;
                 write_mesh_progress("mesh_server_batch_throttle",
                                     "Waiting for paint replication queue to drain",
-                                    job->server_strokes_sent,
+                                    mesh_first_completed_strokes(job),
                                     static_cast<int>(job->strokes.size()),
                                     MeshFirstBatchPhase::ServerBatch,
                                     false,
@@ -11418,44 +15098,72 @@ namespace
             }
         }
 
-        const std::size_t chunk_offset = job->offset;
+        const std::size_t chunk_offset = job->server_offset;
         const std::size_t count = std::min<std::size_t>(static_cast<std::size_t>(std::max(1, job->server_batch_limit)),
                                                         job->strokes.size() - chunk_offset);
+        if (job->internal_no_resend_local_apply_enabled)
+        {
+            for (std::size_t index = 0; index < count; ++index)
+            {
+                std::string preflight_failure{};
+                if (!sdk_validate_internal_common_no_resend_preconditions(job->component,
+                                                                          job->no_resend_stroke_constructor,
+                                                                          job->no_resend_common,
+                                                                          job->strokes[chunk_offset + index],
+                                                                          preflight_failure))
+                {
+                    job->internal_no_resend_preflight_failure = preflight_failure;
+                    job->local_visual_sync_failure = preflight_failure;
+                    finish_failed("mesh_local_visual_sync_preflight_failed",
+                                  "Local no-resend paint preflight failed before the next packed RPC: " +
+                                      preflight_failure,
+                                  preflight_failure);
+                    return;
+                }
+            }
+        }
         SdkContext ctx{};
         ctx.component = job->component;
         ctx.relay_component = job->relay_component;
         ctx.server_packed_paint_batch_function = job->server_packed_paint_batch_function;
         ctx.server_relay_packed_stroke_batch_function = job->server_relay_packed_stroke_batch_function;
         std::string batch_failure{};
-        ++job->server_batch_calls;
-        const auto rpc_started = std::chrono::steady_clock::now();
-        const bool batch_ok = sdk_call_packed_paint_batch_from_strokes(ctx.component,
-                                                                       ctx.relay_component,
-                                                                       ctx.server_packed_paint_batch_function,
-                                                                       ctx.server_relay_packed_stroke_batch_function,
-                                                                       job->server_packed_paint_batch_use_relay,
-                                                                       job->strokes,
-                                                                       chunk_offset,
-                                                                       count,
-                                                                       job->server_packed_paint_source_id,
-                                                                       job->texture_size,
-                                                                       batch_failure);
-        job->replication_pacing_last_rpc_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rpc_started).count();
-        if (!batch_ok)
+        if (job->server_packed_paint_batch_enabled)
         {
-            ++job->server_batch_failures;
-            job->first_failure = batch_failure.empty() ? job->server_batch_rpc + "_failed" : batch_failure;
-            job->server_batch_elapsed_ms = elapsed_ms();
-            finish_failed("mesh_server_batch_failed",
-                          job->server_batch_rpc + " failed: " + job->first_failure,
-                          job->first_failure);
-            return;
-        }
+            if (job->server_submission_started_at.time_since_epoch().count() == 0)
+            {
+                job->server_submission_started_at = std::chrono::steady_clock::now();
+            }
+            ++job->server_batch_calls;
+            const auto rpc_started = std::chrono::steady_clock::now();
+            const bool batch_ok = sdk_call_packed_paint_batch_from_strokes(ctx.component,
+                                                                           ctx.relay_component,
+                                                                           ctx.server_packed_paint_batch_function,
+                                                                           ctx.server_relay_packed_stroke_batch_function,
+                                                                           job->server_packed_paint_batch_use_relay,
+                                                                           job->strokes,
+                                                                           chunk_offset,
+                                                                           count,
+                                                                           job->server_packed_paint_source_id,
+                                                                           job->packed_wire_radius_scale,
+                                                                           batch_failure);
+            job->replication_pacing_last_rpc_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rpc_started).count();
+            if (!batch_ok)
+            {
+                ++job->server_batch_failures;
+                job->first_failure = batch_failure.empty() ? job->server_batch_rpc + "_failed" : batch_failure;
+                job->server_batch_elapsed_ms = elapsed_ms();
+                finish_failed("mesh_server_batch_failed",
+                              job->server_batch_rpc + " failed: " + job->first_failure,
+                              job->first_failure);
+                return;
+            }
 
-        ++job->server_batch_success;
-        job->server_strokes_sent += static_cast<int>(count);
-        job->offset += count;
+            ++job->server_batch_success;
+            job->server_strokes_sent += static_cast<int>(count);
+        }
+        job->server_offset += count;
         job->server_batch_elapsed_ms = elapsed_ms();
 
         job->replication_pacing_post_pressure = capture_replication_pacing_pressure();
@@ -11490,15 +15198,51 @@ namespace
             {
                 std::string local_failure{};
                 ++job->local_stroke_calls;
-                if (!sdk_call_paint_at_uv_with_brush(job->component,
-                                                     job->local_paint_at_uv_function,
-                                                     job->strokes[chunk_offset + index],
-                                                     local_failure))
+                bool local_ok = false;
+                if (job->internal_no_resend_local_apply_enabled)
+                {
+                    bool exception_raised = false;
+                    bool common_returned = false;
+                    job->internal_no_resend_last_thread_id = GetCurrentThreadId();
+                    local_ok = sdk_call_internal_common_no_resend(job->component,
+                                                                  job->no_resend_stroke_constructor,
+                                                                  job->no_resend_common,
+                                                                  job->strokes[chunk_offset + index],
+                                                                  exception_raised,
+                                                                  common_returned,
+                                                                  local_failure);
+                    if (exception_raised)
+                    {
+                        ++job->internal_no_resend_call_exceptions;
+                    }
+                    if (common_returned)
+                    {
+                        ++job->internal_no_resend_calls_returned;
+                    }
+                    if (local_ok)
+                    {
+                        ++job->internal_no_resend_calls_validated;
+                    }
+                }
+                else
+                {
+                    local_ok = sdk_call_paint_at_uv_with_brush(job->component,
+                                                               job->local_paint_at_uv_function,
+                                                               job->strokes[chunk_offset + index],
+                                                               local_failure);
+                }
+                if (!local_ok)
                 {
                     ++job->local_stroke_failures;
-                    job->local_visual_sync_failure = local_failure.empty() ? "PaintAtUVWithBrush_failed" : local_failure;
+                    job->local_visual_sync_failure =
+                        local_failure.empty()
+                            ? (job->internal_no_resend_local_apply_enabled
+                                   ? "internal_common_no_resend_failed"
+                                   : "PaintAtUVWithBrush_failed")
+                            : local_failure;
                     finish_failed("mesh_local_visual_sync_failed",
-                                  job->server_batch_rpc + " succeeded but local visual sync failed: " + job->local_visual_sync_failure,
+                                  "Paint strokes were submitted, but local rendering failed: " +
+                                      job->local_visual_sync_failure + ". Do not retry automatically.",
                                   job->local_visual_sync_failure);
                     return;
                 }
@@ -11511,12 +15255,12 @@ namespace
 
         write_mesh_progress("mesh_server_batch",
                             "mesh-first " + job->server_batch_rpc + " stream",
-                            job->server_strokes_sent,
+                            mesh_first_completed_strokes(job),
                             static_cast<int>(job->strokes.size()),
                             MeshFirstBatchPhase::ServerBatch,
                             false,
                             "running");
-        if (job->offset < job->strokes.size())
+        if (job->server_offset < job->strokes.size())
         {
             job->next_dispatch_time = std::chrono::steady_clock::now() +
                                       std::chrono::milliseconds(std::max(0, job->server_batch_delay_ms));
@@ -11525,7 +15269,14 @@ namespace
         }
         if (job->local_visual_sync_enabled)
         {
-            finish_done();
+            if (job->local_packed_queue_enabled)
+            {
+                begin_local_queue_drain();
+            }
+            else
+            {
+                finish_done();
+            }
             return;
         }
         finish_done();
@@ -11919,21 +15670,382 @@ namespace
                ",\"" + key + "_failure\":\"" + json_escape(snapshot.failure) + "\"";
     }
 
+    // Research-only inventory: the manager's global pressure alone cannot identify which
+    // pawn/component owns queued work. Keep this read-only and run it only from the explicit
+    // pressure probe on the game thread.
+    auto sdk_replication_snapshot_json(const SdkReplicationSnapshot& snapshot) -> std::string
+    {
+        return "{\"recorded_count_available\":" + std::string(json_bool(snapshot.recorded_count_available)) +
+               ",\"recorded_count\":" + std::to_string(snapshot.recorded_count) +
+               ",\"manager_available\":" + std::string(json_bool(snapshot.manager_available)) +
+               ",\"manager_component_queued_count_available\":" +
+               std::string(json_bool(snapshot.manager_component_queued_count_available)) +
+               ",\"manager_component_queued_count\":" + std::to_string(snapshot.manager_component_queued_count) +
+               ",\"manager_queued_count_available\":" + std::string(json_bool(snapshot.manager_queued_count_available)) +
+               ",\"manager_queued_count\":" + std::to_string(snapshot.manager_queued_count) +
+               ",\"queued_batch_count\":" + std::to_string(snapshot.pressure.QueuedBatchCount) +
+               ",\"queued_stroke_count\":" + std::to_string(snapshot.pressure.QueuedStrokeCount) +
+               ",\"max_strokes_per_tick\":" + std::to_string(snapshot.pressure.MaxStrokesPerTick) +
+               ",\"estimated_ticks_to_drain\":" + std::to_string(snapshot.pressure.EstimatedTicksToDrain) +
+               ",\"failure\":\"" + json_escape(snapshot.failure) + "\"}";
+    }
+
+    auto paint_replication_component_inventory_metadata(Reflection& ref,
+                                                         const SdkContext& ctx,
+                                                         bool include_channel_checksums) -> std::string
+    {
+        constexpr std::size_t MaxInventoryComponents = 32;
+        const auto component_class = ref.find_class("RuntimePaintableComponent");
+        if (!component_class)
+        {
+            return ",\"runtime_paint_component_inventory_available\":false" +
+                   std::string(",\"runtime_paint_component_inventory_failure\":\"RuntimePaintableComponent_class_unavailable\"") +
+                   ",\"runtime_paint_component_inventory\":[]";
+        }
+
+        struct InventoryItem
+        {
+            std::uintptr_t component{0};
+            std::uintptr_t owner{0};
+            std::uintptr_t outer{0};
+            std::uintptr_t role_subject{0};
+            std::string component_name{};
+            std::string component_path{};
+            std::string owner_name{};
+            std::string owner_path{};
+            std::string owner_class{};
+            std::string outer_name{};
+            std::string outer_path{};
+            std::string outer_class{};
+            std::string role_subject_source{};
+            bool matches_resolved_component{false};
+            bool belongs_to_controller_pawn{false};
+            bool owner_local_role_available{false};
+            int owner_local_role{-1};
+            std::string owner_local_role_property{};
+            bool owner_remote_role_available{false};
+            int owner_remote_role{-1};
+            std::string owner_remote_role_property{};
+            bool channel_export_eligible{false};
+            MeshFirstChannelChecksum albedo_checksum{};
+            MeshFirstChannelChecksum metallic_checksum{};
+            MeshFirstChannelChecksum roughness_checksum{};
+            MeshFirstResearchTextureDelta texture_delta{};
+            SdkReplicationSnapshot replication{};
+        };
+
+        std::vector<InventoryItem> items{};
+        int detected_count = 0;
+        bool truncated = false;
+        auto is_runtime_paint_component = [&](std::uintptr_t object) {
+            for (auto cls = ref.class_ptr(object); cls; cls = safe_read<std::uintptr_t>(cls + OffSuperStruct))
+            {
+                if (cls == component_class)
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+        ref.for_each_object([&](std::uintptr_t object) {
+            if (!live_uobject(object) || !is_runtime_paint_component(object) ||
+                ref.object_name_raw(object).rfind("Default__", 0) == 0)
+            {
+                return false;
+            }
+            ++detected_count;
+            if (items.size() >= MaxInventoryComponents)
+            {
+                truncated = true;
+                return false;
+            }
+
+            InventoryItem item{};
+            item.component = object;
+            item.component_name = ref.object_name(object);
+            item.component_path = ref.object_path(object);
+            item.owner = read_object_property_by_names(ref, object, {"OwnerPrivate", "Owner"});
+            item.outer = safe_read<std::uintptr_t>(object + OffOuter);
+            item.owner_name = item.owner ? ref.object_name(item.owner) : "";
+            item.owner_path = item.owner ? ref.object_path(item.owner) : "";
+            item.owner_class = item.owner ? ref.class_name(item.owner) : "";
+            item.outer_name = live_uobject(item.outer) ? ref.object_name(item.outer) : "";
+            item.outer_path = live_uobject(item.outer) ? ref.object_path(item.outer) : "";
+            item.outer_class = live_uobject(item.outer) ? ref.class_name(item.outer) : "";
+            item.role_subject = live_uobject(item.owner) ? item.owner : (live_uobject(item.outer) ? item.outer : 0);
+            item.role_subject_source = live_uobject(item.owner) ? "owner" : (live_uobject(item.outer) ? "outer" : "");
+            item.matches_resolved_component = item.component == ctx.component;
+            item.belongs_to_controller_pawn = sdk_object_is_or_belongs_to(ref, item.component, ctx.local_pawn_from_controller);
+            auto read_owner_role = [&](std::initializer_list<const char*> property_names,
+                                       bool& available,
+                                       std::string& resolved_property) -> int {
+                for (const auto* property_name : property_names)
+                {
+                    const auto property = item.role_subject ? find_object_property(ref, item.role_subject, property_name) : 0;
+                    const auto offset = property ? prop_offset(property) : -1;
+                    if (offset < 0)
+                    {
+                        continue;
+                    }
+                    available = true;
+                    resolved_property = property_name;
+                    return static_cast<int>(safe_read<std::uint8_t>(item.role_subject + static_cast<std::uintptr_t>(offset), 0));
+                }
+                available = false;
+                return -1;
+            };
+            item.owner_local_role = read_owner_role({"LocalRole", "Role"},
+                                                     item.owner_local_role_available,
+                                                     item.owner_local_role_property);
+            item.owner_remote_role = read_owner_role({"RemoteRole"},
+                                                      item.owner_remote_role_available,
+                                                      item.owner_remote_role_property);
+            item.replication = sdk_capture_replication_snapshot(ref, object);
+            item.channel_export_eligible = live_uobject(item.outer) &&
+                                            !contains_text(lower_copy(item.outer_class), "blueprintgeneratedclass");
+            if (include_channel_checksums && item.channel_export_eligible)
+            {
+                // ExportChannelToBytes is the existing non-import/readback path used by the
+                // research paint flow. It is deliberately invoked only by the explicit texture
+                // probe, never by the 1-second pressure sampler.
+                if (item.matches_resolved_component)
+                {
+                    item.texture_delta = mesh_first_capture_research_texture_delta(ref, object);
+                    item.albedo_checksum = item.texture_delta.albedo_checksum;
+                    item.metallic_checksum = item.texture_delta.metallic_checksum;
+                    item.roughness_checksum = item.texture_delta.roughness_checksum;
+                }
+                else
+                {
+                    item.albedo_checksum = mesh_first_export_channel_checksum(ref, object, sdk::EPaintChannel::Albedo);
+                    item.metallic_checksum = mesh_first_export_channel_checksum(ref, object, sdk::EPaintChannel::Metallic);
+                    item.roughness_checksum = mesh_first_export_channel_checksum(ref, object, sdk::EPaintChannel::Roughness);
+                }
+            }
+            items.push_back(std::move(item));
+            return false;
+        });
+
+        std::string metadata = ",\"runtime_paint_component_inventory_available\":true";
+        metadata += ",\"runtime_paint_component_inventory_detected_count\":" + std::to_string(detected_count);
+        metadata += ",\"runtime_paint_component_inventory_returned_count\":" + std::to_string(items.size());
+        metadata += ",\"runtime_paint_component_inventory_truncated\":" + std::string(json_bool(truncated));
+        metadata += ",\"runtime_paint_component_channel_export_requested\":" +
+                    std::string(json_bool(include_channel_checksums));
+        metadata += ",\"runtime_paint_component_inventory\":[";
+        for (std::size_t index = 0; index < items.size(); ++index)
+        {
+            const auto& item = items[index];
+            if (index != 0)
+            {
+                metadata += ",";
+            }
+            metadata += "{\"component\":\"" + hex_address(item.component) + "\"";
+            metadata += ",\"component_name\":\"" + json_escape(item.component_name) + "\"";
+            metadata += ",\"component_path\":\"" + json_escape(item.component_path) + "\"";
+            metadata += ",\"component_class\":\"" + json_escape(ref.class_name(item.component)) + "\"";
+            metadata += ",\"owner\":\"" + hex_address(item.owner) + "\"";
+            metadata += ",\"owner_name\":\"" + json_escape(item.owner_name) + "\"";
+            metadata += ",\"owner_path\":\"" + json_escape(item.owner_path) + "\"";
+            metadata += ",\"owner_class\":\"" + json_escape(item.owner_class) + "\"";
+            metadata += ",\"outer\":\"" + hex_address(item.outer) + "\"";
+            metadata += ",\"outer_name\":\"" + json_escape(item.outer_name) + "\"";
+            metadata += ",\"outer_path\":\"" + json_escape(item.outer_path) + "\"";
+            metadata += ",\"outer_class\":\"" + json_escape(item.outer_class) + "\"";
+            metadata += ",\"role_subject\":\"" + hex_address(item.role_subject) + "\"";
+            metadata += ",\"role_subject_source\":\"" + json_escape(item.role_subject_source) + "\"";
+            metadata += ",\"matches_resolved_component\":" + std::string(json_bool(item.matches_resolved_component));
+            metadata += ",\"belongs_to_controller_pawn\":" + std::string(json_bool(item.belongs_to_controller_pawn));
+            metadata += ",\"owner_local_role_available\":" + std::string(json_bool(item.owner_local_role_available));
+            metadata += ",\"owner_local_role\":" + std::to_string(item.owner_local_role);
+            metadata += ",\"owner_local_role_property\":\"" + json_escape(item.owner_local_role_property) + "\"";
+            metadata += ",\"owner_remote_role_available\":" + std::string(json_bool(item.owner_remote_role_available));
+            metadata += ",\"owner_remote_role\":" + std::to_string(item.owner_remote_role);
+            metadata += ",\"owner_remote_role_property\":\"" + json_escape(item.owner_remote_role_property) + "\"";
+            metadata += ",\"channel_export_eligible\":" + std::string(json_bool(item.channel_export_eligible));
+            auto append_checksum = [&](const char* key, const MeshFirstChannelChecksum& checksum) {
+                metadata += ",\"" + std::string(key) + "\":{\"ok\":" + std::string(json_bool(checksum.ok)) +
+                            ",\"bytes\":" + std::to_string(checksum.bytes) +
+                            ",\"hash\":\"" + std::to_string(checksum.hash) + "\"" +
+                            ",\"failure\":\"" + json_escape(checksum.failure) + "\"}";
+            };
+            append_checksum("albedo_export", item.albedo_checksum);
+            append_checksum("metallic_export", item.metallic_checksum);
+            append_checksum("roughness_export", item.roughness_checksum);
+            const double changed_ratio = item.texture_delta.pixels_total > 0
+                                             ? static_cast<double>(item.texture_delta.pixels_changed_any_channel) /
+                                                   static_cast<double>(item.texture_delta.pixels_total)
+                                             : 0.0;
+            metadata += ",\"texture_delta\":{\"capture_ok\":" +
+                        std::string(json_bool(item.texture_delta.capture_ok));
+            metadata += ",\"baseline_available\":" +
+                        std::string(json_bool(item.texture_delta.baseline_available));
+            metadata += ",\"baseline_component_match\":" +
+                        std::string(json_bool(item.texture_delta.baseline_component_match));
+            metadata += ",\"albedo_dump_written\":" +
+                        std::string(json_bool(item.texture_delta.albedo_dump_written));
+            metadata += ",\"albedo_dump_texture_size\":" +
+                        std::to_string(item.texture_delta.albedo_dump_texture_size);
+            metadata += ",\"albedo_dump_path\":\"" +
+                        json_escape(item.texture_delta.albedo_dump_path) + "\"";
+            metadata += ",\"pixels_total\":" + std::to_string(item.texture_delta.pixels_total);
+            metadata += ",\"pixels_changed_any_channel\":" +
+                        std::to_string(item.texture_delta.pixels_changed_any_channel);
+            metadata += ",\"pixels_changed_ratio\":" + std::to_string(changed_ratio);
+            metadata += ",\"albedo_pixels_changed\":" +
+                        std::to_string(item.texture_delta.albedo_pixels_changed);
+            metadata += ",\"metallic_pixels_changed\":" +
+                        std::to_string(item.texture_delta.metallic_pixels_changed);
+            metadata += ",\"roughness_pixels_changed\":" +
+                        std::to_string(item.texture_delta.roughness_pixels_changed);
+            metadata += ",\"albedo_bytes_changed\":" +
+                        std::to_string(item.texture_delta.albedo_bytes_changed);
+            metadata += ",\"metallic_bytes_changed\":" +
+                        std::to_string(item.texture_delta.metallic_bytes_changed);
+            metadata += ",\"roughness_bytes_changed\":" +
+                        std::to_string(item.texture_delta.roughness_bytes_changed);
+            metadata += ",\"failure\":\"" + json_escape(item.texture_delta.failure) + "\"}";
+            metadata += ",\"replication\":" + sdk_replication_snapshot_json(item.replication);
+            metadata += "}";
+        }
+        metadata += "]";
+        return metadata;
+    }
+
+    auto paint_replication_queue_array_json(std::uintptr_t manager,
+                                             std::uintptr_t array_offset,
+                                             int entry_size,
+                                             bool has_processed_index) -> std::string
+    {
+        const auto data = safe_read<std::uintptr_t>(manager + array_offset);
+        const int num = safe_read<int>(manager + array_offset + 8, -1);
+        const int max = safe_read<int>(manager + array_offset + 12, -1);
+        const bool valid = num >= 0 && num <= 100000 && max >= num && max <= 100000 && (num == 0 || data);
+        std::int64_t total = 0;
+        std::int64_t processed = 0;
+        std::int64_t remaining = 0;
+        std::string entries{"["};
+        if (valid)
+        {
+            const int returned = std::min(num, 32);
+            for (int index = 0; index < num; ++index)
+            {
+                const auto entry = data + static_cast<std::uintptr_t>(index) * static_cast<std::uintptr_t>(entry_size);
+                const int entry_total = std::max(0, safe_read<int>(entry + 0x10, 0));
+                const int entry_processed = has_processed_index
+                                                ? std::clamp(safe_read<int>(entry + 0x18, 0), 0, entry_total)
+                                                : 0;
+                const int entry_remaining = std::max(0, entry_total - entry_processed);
+                total += entry_total;
+                processed += entry_processed;
+                remaining += entry_remaining;
+                if (index < returned)
+                {
+                    if (index > 0)
+                    {
+                        entries += ",";
+                    }
+                    entries += "{\"index\":" + std::to_string(index);
+                    entries += ",\"weak_object_index\":" + std::to_string(safe_read<int>(entry, -1));
+                    entries += ",\"weak_object_serial\":" + std::to_string(safe_read<int>(entry + 4, -1));
+                    entries += ",\"total\":" + std::to_string(entry_total);
+                    entries += ",\"processed\":" + std::to_string(entry_processed);
+                    entries += ",\"remaining\":" + std::to_string(entry_remaining) + "}";
+                }
+            }
+        }
+        entries += "]";
+        return "{\"offset\":\"" + hex_address(array_offset) + "\"" +
+               ",\"valid\":" + json_bool(valid) +
+               ",\"data\":\"" + hex_address(data) + "\"" +
+               ",\"num\":" + std::to_string(num) +
+               ",\"max\":" + std::to_string(max) +
+               ",\"entry_size\":" + std::to_string(entry_size) +
+               ",\"total\":" + std::to_string(total) +
+               ",\"processed\":" + std::to_string(processed) +
+               ",\"remaining\":" + std::to_string(remaining) +
+               ",\"entries\":" + entries + "}";
+    }
+
+    auto paint_replication_manager_queue_breakdown_metadata(std::uintptr_t manager) -> std::string
+    {
+        if (!live_uobject(manager))
+        {
+            return ",\"global_manager_queue_breakdown_available\":false";
+        }
+        std::string metadata = ",\"global_manager_queue_breakdown_available\":true";
+        metadata += ",\"global_manager_queue_breakdown\":{";
+        metadata += "\"queued_batches\":" + paint_replication_queue_array_json(manager, 0x68, 0x28, true);
+        metadata += ",\"queued_local_paint_batches\":" + paint_replication_queue_array_json(manager, 0x78, 0x28, true);
+        metadata += ",\"queued_outgoing_batches\":" + paint_replication_queue_array_json(manager, 0x88, 0x20, false);
+        metadata += "}";
+        return metadata;
+    }
+
+    auto paint_component_virtual_slot_metadata(std::uintptr_t component) -> std::string
+    {
+        if (!live_uobject(component))
+        {
+            return ",\"global_component_virtual_slots_available\":false";
+        }
+        const auto vtable = safe_read<std::uintptr_t>(component);
+        const auto module = main_module_range();
+        const std::pair<const char*, std::uintptr_t> slots[]{
+            {"multicast_packed_to_others", 0x548},
+            {"multicast_packed", 0x550},
+            {"multicast_paint_batch_to_others", 0x5a8},
+            {"multicast_paint_batch", 0x5b8},
+        };
+        std::string metadata = ",\"global_component_virtual_slots_available\":" + std::string(json_bool(vtable != 0));
+        metadata += ",\"global_component_vtable\":\"" + hex_address(vtable) + "\"";
+        metadata += ",\"global_component_virtual_slots\":{";
+        bool first = true;
+        for (const auto& [name, offset] : slots)
+        {
+            if (!first)
+            {
+                metadata += ",";
+            }
+            first = false;
+            const auto address = vtable ? safe_read<std::uintptr_t>(vtable + offset) : 0;
+            metadata += "\"" + std::string(name) + "\":{\"offset\":\"" + hex_address(offset) + "\"";
+            metadata += ",\"address\":\"" + hex_address(address) + "\"";
+            metadata += ",\"in_main_code\":" + std::string(json_bool(address_in_main_module_code(address)));
+            metadata += ",\"rva\":\"" +
+                        hex_address(module.base && address >= module.base ? address - module.base : 0) + "\"}";
+        }
+        metadata += "}";
+        return metadata;
+    }
+
     auto paint_replication_global_probe_metadata(Reflection& ref) -> std::string
     {
         std::string metadata{};
         const auto replication_manager = ref.find_first_instance("RuntimePaintReplicationManager");
+        if (replication_manager)
+        {
+            g_auto_event_watch_replication_manager.store(replication_manager);
+        }
         const auto paint_component = ref.find_first_instance("RuntimePaintableComponent");
         metadata += ",\"global_paint_replication_manager\":\"" + hex_address(replication_manager) + "\"";
         metadata += ",\"global_paint_replication_manager_class\":\"" + json_escape(ref.class_name(replication_manager)) + "\"";
         metadata += ",\"global_runtime_paintable_component\":\"" + hex_address(paint_component) + "\"";
         metadata += ",\"global_runtime_paintable_component_class\":\"" + json_escape(ref.class_name(paint_component)) + "\"";
         metadata += sdk_replication_snapshot_metadata("global_replication", sdk_capture_replication_snapshot(ref, paint_component));
+        metadata += paint_replication_manager_queue_breakdown_metadata(replication_manager);
+        metadata += paint_component_virtual_slot_metadata(paint_component);
 
         const std::vector<const char*> component_paint_replication_candidates{
             "ServerPackedPaintBatch",
             "MulticastPackedPaintBatch",
+            "MulticastPaintBatchToOthers",
             "MulticastPackedPaintBatchToOthers",
+            "PaintAtUV",
+            "PaintAtUVWithBrush",
+            "PaintStrokeUV",
+            "SendPaintToServer",
+            "FlushRecordedStrokesToServer",
+            "ClearRecordedStrokes",
         };
         const std::vector<const char*> manager_replication_candidates{
             "GetQueuedStrokeCount",
@@ -11945,6 +16057,14 @@ namespace
             "TickReplication",
         };
         const std::vector<const char*> paint_replication_property_candidates{
+            "bAutoRecordStrokes",
+            "bAutoFlushStrokes",
+            "bAsyncPrepareReplicatedPaint",
+            "bCacheRecordingEnabled",
+            "bPoseIndependentSkeletalPainting",
+            "bUpdateOnlyPaintArea",
+            "bInBrushStroke",
+            "bDisablePaintingStartupSlowdown",
             "bUseCompactPaintReplication",
             "bUseExperimentalPackedPaintReplication",
             "MaxOutgoingStrokesPerBatch",
@@ -11972,6 +16092,16 @@ namespace
                                                               replication_manager,
                                                               "global_manager_probe",
                                                               manager_replication_candidates);
+        const auto manager_class = ref.class_ptr(replication_manager);
+        const auto component_class = ref.class_ptr(paint_component);
+        metadata += ",\"global_manager_declared_property_schema\":\"" +
+                    json_escape(paint_probe_property_schema(ref, manager_class, 128)) + "\"";
+        metadata += ",\"global_manager_declared_function_inventory\":" +
+                    paint_probe_declared_function_inventory(ref, manager_class);
+        metadata += ",\"global_component_declared_property_schema\":\"" +
+                    json_escape(paint_probe_property_schema(ref, component_class, 128)) + "\"";
+        metadata += ",\"global_component_declared_function_inventory\":" +
+                    paint_probe_declared_function_inventory(ref, component_class);
         metadata += paint_replication_property_probe_metadata(ref,
                                                               paint_component,
                                                               "global_component_property_probe",
@@ -12072,6 +16202,14 @@ namespace
         stroke.SkeletalTriangleBarycentric.X = barycentric_a;
         stroke.SkeletalTriangleBarycentric.Y = barycentric_b;
         stroke.SkeletalTriangleBarycentric.Z = barycentric_c;
+        // Do not copy the normalized UV radius into the world-radius field.
+        // The game's packed compact-stroke expander treats <= 0 as the sentinel
+        // for deriving a mesh-correct world radius (supported build RVAs
+        // 0x50F65A0 -> 0x50F6110).
+        stroke.EffectiveBrushWorldRadius = runtime_contract::PackedMeshAnchorWorldRadiusAuto;
+        stroke.EffectiveSubdivisionLevel = runtime_contract::PackedMeshAnchorSubdivisionLevelAuto;
+        stroke.EffectiveSubdivisionPixelSize = runtime_contract::PackedMeshAnchorSubdivisionPixelSizeAuto;
+        stroke.EffectiveTemplateResolution = runtime_contract::PackedMeshAnchorTemplateResolutionAuto;
         return stroke;
     }
 
@@ -12138,7 +16276,7 @@ namespace
                                     std::size_t offset,
                                     std::size_t count,
                                     const sdk::FGuid& source_id,
-                                    int texture_size,
+                                    double packed_wire_radius_scale,
                                     std::vector<std::uint8_t>& packed,
                                     std::string& failure) -> bool
     {
@@ -12152,13 +16290,59 @@ namespace
             failure = "packed_paint_count_too_large";
             return false;
         }
-        const int effective_texture_size = std::max(1, texture_size);
         packed.clear();
         packed.reserve(21 + count * 27);
         packed.push_back(1);
         const auto* source_bytes = reinterpret_cast<const std::uint8_t*>(&source_id);
         packed.insert(packed.end(), source_bytes, source_bytes + sizeof(source_id));
         sdk_append_i32_le(packed, static_cast<std::int32_t>(count));
+
+        bool packet_uses_auto_world_radius = false;
+        bool packet_uses_derived_world_radius = false;
+        float packet_derived_world_radius = 0.0f;
+        std::vector<float> wire_radii(count, 0.0f);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const auto& stroke = strokes[offset + i];
+            float wire_radius = 0.0f;
+            if (!runtime_contract::resolve_packed_wire_brush_radius(
+                    stroke.BrushSettings.Radius,
+                    packed_wire_radius_scale,
+                    wire_radius))
+            {
+                failure = "packed_brush_radius_scaled_out_of_range index=" +
+                          std::to_string(offset + i);
+                packed.clear();
+                return false;
+            }
+            wire_radii[i] = wire_radius;
+            if (!runtime_contract::packed_mesh_anchor_world_radius_contract_valid(
+                    stroke.EffectiveBrushWorldRadius,
+                    wire_radius))
+            {
+                failure = "packed_mesh_anchor_world_radius_contract_invalid index=" +
+                          std::to_string(offset + i);
+                packed.clear();
+                return false;
+            }
+            if (runtime_contract::packed_mesh_anchor_requests_world_radius_conversion(
+                    stroke.EffectiveBrushWorldRadius))
+            {
+                packet_uses_auto_world_radius = true;
+            }
+            else
+            {
+                packet_uses_derived_world_radius = true;
+                packet_derived_world_radius =
+                    std::max(packet_derived_world_radius, stroke.EffectiveBrushWorldRadius);
+            }
+        }
+        if (packet_uses_auto_world_radius && packet_uses_derived_world_radius)
+        {
+            failure = "packed_mesh_anchor_world_radius_policy_mixed_within_batch";
+            packed.clear();
+            return false;
+        }
 
         for (std::size_t i = 0; i < count; ++i)
         {
@@ -12169,10 +16353,20 @@ namespace
                 packed.clear();
                 return false;
             }
+            if (!runtime_contract::packed_mesh_anchor_requests_native_subdivision_preflight(
+                    stroke.EffectiveSubdivisionLevel,
+                    stroke.EffectiveSubdivisionPixelSize,
+                    stroke.EffectiveTemplateResolution))
+            {
+                failure = "packed_mesh_anchor_subdivision_must_request_game_preflight index=" +
+                          std::to_string(offset + i);
+                packed.clear();
+                return false;
+            }
             sdk_append_i32_le(packed, stroke.SkeletalTriangleIndex);
             sdk_append_u16_le(packed, sdk_unit_to_u16(stroke.SkeletalTriangleBarycentric.X));
             sdk_append_u16_le(packed, sdk_unit_to_u16(stroke.SkeletalTriangleBarycentric.Y));
-            sdk_append_f32_le(packed, stroke.BrushSettings.Radius);
+            sdk_append_f32_le(packed, wire_radii[i]);
             packed.push_back(sdk_unit_to_byte(stroke.ChannelData.AlbedoColor.R));
             packed.push_back(sdk_unit_to_byte(stroke.ChannelData.AlbedoColor.G));
             packed.push_back(sdk_unit_to_byte(stroke.ChannelData.AlbedoColor.B));
@@ -12180,20 +16374,12 @@ namespace
             packed.push_back(sdk_unit_to_byte(stroke.ChannelData.Metallic));
             packed.push_back(sdk_unit_to_byte(stroke.ChannelData.Roughness));
             packed.push_back(static_cast<std::uint8_t>(static_cast<std::uint8_t>(stroke.TargetChannel) + 1));
-            sdk_append_f32_le(packed, stroke.EffectiveBrushWorldRadius);
-            const int diameter_texels = std::clamp(static_cast<int>(std::lround(
-                                                       static_cast<double>(stroke.BrushSettings.Radius) *
-                                                       static_cast<double>(effective_texture_size) * 2.0)),
-                                                   0,
-                                                   255);
-            const int subdivision_pixel_size = std::clamp(static_cast<int>(std::lround(stroke.EffectiveSubdivisionPixelSize)),
-                                                          0,
-                                                          255);
-            const int subdivision_level = std::clamp(stroke.EffectiveSubdivisionLevel, 0, 255);
-            packed.push_back(static_cast<std::uint8_t>(diameter_texels));
-            packed.push_back(static_cast<std::uint8_t>(subdivision_pixel_size));
-            packed.push_back(static_cast<std::uint8_t>(subdivision_level));
-            packed.push_back(static_cast<std::uint8_t>(stroke.TargetChannel));
+            sdk_append_f32_le(packed,
+                              packet_uses_derived_world_radius
+                                  ? packet_derived_world_radius
+                                  : stroke.EffectiveBrushWorldRadius);
+            const auto subdivision_tail = runtime_contract::packed_mesh_anchor_auto_subdivision_tail();
+            packed.insert(packed.end(), subdivision_tail.begin(), subdivision_tail.end());
         }
         return true;
     }
@@ -12293,11 +16479,17 @@ namespace
                                                   std::size_t offset,
                                                   std::size_t count,
                                                   const sdk::FGuid& source_id,
-                                                  int texture_size,
+                                                  double packed_wire_radius_scale,
                                                   std::string& failure) -> bool
     {
         std::vector<std::uint8_t> packed_data{};
-        if (!sdk_make_packed_paint_data(strokes, offset, count, source_id, texture_size, packed_data, failure))
+        if (!sdk_make_packed_paint_data(strokes,
+                                        offset,
+                                        count,
+                                        source_id,
+                                        packed_wire_radius_scale,
+                                        packed_data,
+                                        failure))
         {
             return false;
         }
@@ -12317,6 +16509,736 @@ namespace
                                                   failure);
     }
 
+    auto sdk_call_local_packed_queue_from_strokes(std::uintptr_t component,
+                                                  std::uintptr_t implementation,
+                                                  const std::vector<sdk::FPaintStroke>& strokes,
+                                                  std::size_t offset,
+                                                  std::size_t count,
+                                                  const sdk::FGuid& source_id,
+                                                  double packed_wire_radius_scale,
+                                                  bool& exception_raised,
+                                                  bool& implementation_returned,
+                                                  std::string& failure) -> bool
+    {
+        exception_raised = false;
+        implementation_returned = false;
+        const auto expected_thread_id = g_game_thread_id.load(std::memory_order_acquire);
+        if (!expected_thread_id || GetCurrentThreadId() != expected_thread_id)
+        {
+            failure = "local_packed_queue_wrong_thread";
+            return false;
+        }
+        if (!live_uobject_not_destroyed(component))
+        {
+            failure = "paint_component_unavailable";
+            return false;
+        }
+        if (!address_in_main_module_code(implementation))
+        {
+            failure = "local_packed_queue_target_untrusted";
+            return false;
+        }
+        sdk::FGuid component_source_id{};
+        std::string source_failure{};
+        if (!sdk_read_component_packed_source_id(component, component_source_id, source_failure))
+        {
+            failure = "local_packed_queue_component_source_unavailable:" + source_failure;
+            return false;
+        }
+        const auto guid_equal = [](const sdk::FGuid& left, const sdk::FGuid& right) {
+            return left.A == right.A && left.B == right.B && left.C == right.C && left.D == right.D;
+        };
+        if (sdk_guid_is_zero(source_id) || guid_equal(source_id, component_source_id))
+        {
+            failure = "local_packed_queue_source_must_be_nonzero_and_nonself";
+            return false;
+        }
+
+        std::vector<std::uint8_t> packed_data{};
+        if (!sdk_make_packed_paint_data(strokes,
+                                        offset,
+                                        count,
+                                        source_id,
+                                        packed_wire_radius_scale,
+                                        packed_data,
+                                        failure))
+        {
+            return false;
+        }
+        sdk::TArray<std::uint8_t> packed_array{};
+        packed_array.Data = packed_data.data();
+        packed_array.Num = static_cast<std::int32_t>(packed_data.size());
+        packed_array.Max = static_cast<std::int32_t>(packed_data.size());
+        sdk_invoke_local_packed_queue(component,
+                                      implementation,
+                                      &packed_array,
+                                      static_cast<std::int32_t>(count),
+                                      exception_raised,
+                                      implementation_returned);
+        if (exception_raised)
+        {
+            failure = "local_packed_queue_exception";
+            return false;
+        }
+        if (!implementation_returned)
+        {
+            failure = "local_packed_queue_did_not_return";
+            return false;
+        }
+        sdk::FGuid component_source_after{};
+        if (!safe_copy(&component_source_after,
+                       reinterpret_cast<const void*>(component + RuntimePaintableComponentPackedSourceIdOffset),
+                       sizeof(component_source_after)) ||
+            !guid_equal(component_source_after, component_source_id))
+        {
+            failure = "local_packed_queue_component_source_mutated";
+            return false;
+        }
+        return true;
+    }
+
+    auto internal_code_matches(std::uintptr_t address,
+                               std::initializer_list<std::uint8_t> pattern,
+                               const char* mask = nullptr) -> bool
+    {
+        if (!address || pattern.size() == 0 || pattern.size() > 128)
+        {
+            return false;
+        }
+        std::array<std::uint8_t, 128> actual{};
+        if (!safe_copy(actual.data(), reinterpret_cast<const void*>(address), pattern.size()))
+        {
+            return false;
+        }
+        std::size_t index = 0;
+        for (const auto expected : pattern)
+        {
+            if ((!mask || mask[index] != '?') && actual[index] != expected)
+            {
+                return false;
+            }
+            ++index;
+        }
+        return !mask || mask[index] == '\0';
+    }
+
+    auto internal_rel32_call_target(std::uintptr_t instruction) -> std::uintptr_t
+    {
+        if (!address_in_main_module_code(instruction) || safe_read<std::uint8_t>(instruction, 0) != 0xE8)
+        {
+            return 0;
+        }
+        const auto displacement = safe_read<std::int32_t>(instruction + 1, 0);
+        return static_cast<std::uintptr_t>(
+            static_cast<std::intptr_t>(instruction + 5) + static_cast<std::intptr_t>(displacement));
+    }
+
+    auto resolve_local_packed_queue_route(Reflection& ref,
+                                          std::uintptr_t component,
+                                          std::uintptr_t multicast_packed_paint_batch_function) -> LocalPackedQueueRoute
+    {
+        LocalPackedQueueRoute out{};
+        out.status = "failed";
+        if (!live_uobject_not_destroyed(component))
+        {
+            out.failure = "paint_component_unavailable";
+            return out;
+        }
+        if (!multicast_packed_paint_batch_function)
+        {
+            out.failure = "MulticastPackedPaintBatch_unavailable";
+            return out;
+        }
+        if (safe_read<int>(multicast_packed_paint_batch_function + OffPropertiesSize, -1) != 0x18)
+        {
+            out.failure = "MulticastPackedPaintBatch_params_size_mismatch";
+            return out;
+        }
+
+        struct ExpectedParam
+        {
+            const char* name;
+            int offset;
+            int element_size;
+            int observed_offset{-1};
+            int observed_element_size{0};
+            int matches{0};
+        };
+        std::array<ExpectedParam, 2> params{{
+            {"packeddata", 0x00, 0x10},
+            {"strokecount", 0x10, 0x04},
+        }};
+        int visited = 0;
+        for (auto prop = safe_read<std::uintptr_t>(multicast_packed_paint_batch_function + OffChildProperties);
+             prop && visited < 64;
+             prop = safe_read<std::uintptr_t>(prop + OffFFieldNext), ++visited)
+        {
+            const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            for (auto& expected : params)
+            {
+                if (name == expected.name)
+                {
+                    ++expected.matches;
+                    expected.observed_offset = safe_read<int>(prop + OffFPropertyOffset, -1);
+                    expected.observed_element_size = prop_element_size(prop);
+                }
+            }
+        }
+        for (const auto& expected : params)
+        {
+            if (expected.matches != 1 || expected.observed_offset != expected.offset ||
+                expected.observed_element_size != expected.element_size)
+            {
+                out.failure = std::string("MulticastPackedPaintBatch_param_layout_mismatch:") + expected.name;
+                return out;
+            }
+        }
+
+        const auto module = main_module_range();
+        if (!module.base || module.size < sizeof(IMAGE_DOS_HEADER))
+        {
+            out.failure = "main_module_unavailable";
+            return out;
+        }
+        const auto dos = safe_read<IMAGE_DOS_HEADER>(module.base);
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 ||
+            static_cast<std::size_t>(dos.e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > module.size)
+        {
+            out.failure = "main_module_dos_header_mismatch";
+            return out;
+        }
+        const auto nt = safe_read<IMAGE_NT_HEADERS64>(module.base + static_cast<std::uintptr_t>(dos.e_lfanew));
+        const bool steam_shipping_build =
+            nt.Signature == IMAGE_NT_SIGNATURE &&
+            nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+            nt.FileHeader.TimeDateStamp == 0xB76CD1AFu &&
+            nt.OptionalHeader.SizeOfImage == 0x0AAFD000u &&
+            nt.OptionalHeader.CheckSum == 0x0A7394E2u;
+        if (!steam_shipping_build)
+        {
+            out.failure = "main_module_build_identity_mismatch";
+            return out;
+        }
+        static const auto text_file_identity = main_module_text_file_identity();
+        if (!text_file_identity.ok || text_file_identity.raw_size != 0x07AA2800u ||
+            text_file_identity.fnv1a64 != 0x4200B2CAF330F8C3ULL)
+        {
+            out.failure = "main_module_text_identity_mismatch";
+            return out;
+        }
+
+        constexpr std::uintptr_t ExpectedThunkRva = 0x50E40E0;
+        constexpr std::uintptr_t ExpectedImplementationRva = 0x50FBD80;
+        constexpr std::uintptr_t ExpectedDecoderRva = 0x5103A10;
+        constexpr std::uintptr_t ExpectedEnqueueInnerRva = 0x50F5EE0;
+        constexpr std::uintptr_t ExpectedComponentContextResolverRva = 0x3AEAF10;
+        constexpr std::uintptr_t ExpectedManagerResolverRva = 0x50E9170;
+        constexpr std::uintptr_t ExpectedManagerEnqueueRva = 0x5109030;
+        constexpr std::uintptr_t ExpectedQueueCoalescerRva = 0x5108E30;
+
+        std::vector<std::uintptr_t> thunks{};
+        for (std::uintptr_t slot = 0; slot <= 0x180; slot += sizeof(std::uintptr_t))
+        {
+            const auto thunk = safe_read<std::uintptr_t>(multicast_packed_paint_batch_function + slot);
+            if (!address_in_main_module_code(thunk) || thunk - module.base != ExpectedThunkRva)
+            {
+                continue;
+            }
+            if (!internal_code_matches(thunk,
+                                       {0x48, 0x89, 0x5C, 0x24, 0x10,
+                                        0x48, 0x89, 0x74, 0x24, 0x18,
+                                        0x57, 0x48, 0x83, 0xEC, 0x30,
+                                        0x33, 0xFF, 0x48, 0x8B, 0xDA}) ||
+                !internal_code_matches(thunk + 0xB8,
+                                       {0x48, 0x8B, 0x06, 0xFF, 0x90, 0x50, 0x05, 0x00, 0x00}))
+            {
+                continue;
+            }
+            thunks.push_back(thunk);
+        }
+        if (thunks.size() != 1)
+        {
+            out.failure = "validated_MulticastPackedPaintBatch_thunk_count:" + std::to_string(thunks.size());
+            return out;
+        }
+
+        const auto vtable = safe_read<std::uintptr_t>(component);
+        const auto implementation = safe_read<std::uintptr_t>(vtable + 0x550);
+        if (!address_in_main_module_code(implementation) ||
+            implementation - module.base != ExpectedImplementationRva ||
+            !internal_code_matches(implementation,
+                                   {0x48, 0x89, 0x6C, 0x24, 0x18,
+                                    0x57, 0x48, 0x83, 0xEC, 0x50,
+                                    0x33, 0xFF, 0x4C, 0x8D, 0x4C, 0x24, 0x40}) ||
+            !internal_code_matches(implementation + 0xA0,
+                                   {0x44, 0x8B, 0x4B, 0xF8,
+                                    0x41, 0x8B, 0xC1,
+                                    0x8B, 0x4B, 0xFC}) ||
+            !internal_code_matches(implementation + 0xD5,
+                                   {0x41, 0x0B, 0xC8, 0x41, 0x0B, 0xC9, 0x74, 0x57}))
+        {
+            out.failure = "local_packed_queue_vtable_implementation_mismatch";
+            return out;
+        }
+        const auto decoder = internal_rel32_call_target(implementation + 0x1E);
+        const auto enqueue_inner = internal_rel32_call_target(implementation + 0x14D);
+        if (!address_in_main_module_code(decoder) || decoder - module.base != ExpectedDecoderRva ||
+            !internal_code_matches(decoder,
+                                   {0x4C, 0x89, 0x4C, 0x24, 0x20,
+                                    0x44, 0x89, 0x44, 0x24, 0x18,
+                                    0x53, 0x55, 0x56,
+                                    0x48, 0x81, 0xEC, 0xA0, 0x00, 0x00, 0x00}) ||
+            !address_in_main_module_code(enqueue_inner) ||
+            enqueue_inner - module.base != ExpectedEnqueueInnerRva ||
+            !internal_code_matches(enqueue_inner,
+                                   {0x48, 0x89, 0x74, 0x24, 0x10,
+                                    0x57, 0x48, 0x81, 0xEC, 0x20, 0x01, 0x00, 0x00}))
+        {
+            out.failure = "local_packed_queue_decoder_or_inner_mismatch";
+            return out;
+        }
+        const auto component_context_resolver = internal_rel32_call_target(enqueue_inner + 0x175);
+        const auto manager_resolver = internal_rel32_call_target(enqueue_inner + 0x182);
+        if (!internal_code_matches(enqueue_inner + 0x166,
+                                   {0x48, 0x8B, 0x87, 0xA8, 0x00, 0x00, 0x00,
+                                    0x48, 0x85, 0xC0,
+                                    0x75, 0x0D,
+                                    0x48, 0x8B, 0xCF}) ||
+            !address_in_main_module_code(component_context_resolver) ||
+            component_context_resolver - module.base != ExpectedComponentContextResolverRva ||
+            !address_in_main_module_code(manager_resolver) ||
+            manager_resolver - module.base != ExpectedManagerResolverRva)
+        {
+            out.failure = "local_packed_queue_manager_resolver_mismatch";
+            return out;
+        }
+        const auto manager_enqueue = internal_rel32_call_target(enqueue_inner + 0x1A0);
+        if (!address_in_main_module_code(manager_enqueue) ||
+            manager_enqueue - module.base != ExpectedManagerEnqueueRva ||
+            !internal_code_matches(manager_enqueue,
+                                   {0x48, 0x83, 0xEC, 0x38,
+                                    0x48, 0x8B, 0xC2,
+                                    0xC6, 0x44, 0x24, 0x28, 0x00}) ||
+            internal_rel32_call_target(manager_enqueue + 0x1B) != module.base + ExpectedQueueCoalescerRva)
+        {
+            out.failure = "local_packed_queue_manager_enqueue_mismatch";
+            return out;
+        }
+
+        out.resolved = true;
+        out.status = "resolved";
+        out.thunk = thunks.front();
+        out.implementation = implementation;
+        out.decoder = decoder;
+        out.enqueue_inner = enqueue_inner;
+        out.manager_enqueue = manager_enqueue;
+        out.component_context_resolver = component_context_resolver;
+        out.manager_resolver = manager_resolver;
+        return out;
+    }
+
+    auto resolve_internal_no_resend_route(Reflection& ref,
+                                          std::uintptr_t paint_at_uv_with_brush_function) -> InternalNoResendRoute
+    {
+        InternalNoResendRoute out{};
+        out.status = "failed";
+        if (!paint_at_uv_with_brush_function)
+        {
+            out.failure = "PaintAtUVWithBrush_unavailable";
+            return out;
+        }
+        if (safe_read<int>(paint_at_uv_with_brush_function + OffPropertiesSize, -1) != 0x60)
+        {
+            out.failure = "PaintAtUVWithBrush_params_size_mismatch";
+            return out;
+        }
+
+        struct ExpectedParam
+        {
+            const char* name;
+            int offset;
+            int element_size;
+            int observed_offset{-1};
+            int observed_element_size{0};
+            int matches{0};
+        };
+        std::array<ExpectedParam, 4> params{{
+            {"uv", 0, 0x10},
+            {"channeldata", 0x10, 0x20},
+            {"brushsettings", 0x30, 0x28},
+            {"channel", 0x58, 0x01},
+        }};
+        int visited = 0;
+        for (auto prop = safe_read<std::uintptr_t>(paint_at_uv_with_brush_function + OffChildProperties);
+             prop && visited < 64;
+             prop = safe_read<std::uintptr_t>(prop + OffFFieldNext), ++visited)
+        {
+            const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            for (auto& expected : params)
+            {
+                if (name == expected.name)
+                {
+                    ++expected.matches;
+                    expected.observed_offset = safe_read<int>(prop + OffFPropertyOffset, -1);
+                    expected.observed_element_size = prop_element_size(prop);
+                }
+            }
+        }
+        for (const auto& expected : params)
+        {
+            if (expected.matches != 1 || expected.observed_offset != expected.offset ||
+                expected.observed_element_size != expected.element_size)
+            {
+                out.failure = std::string("PaintAtUVWithBrush_param_layout_mismatch:") + expected.name;
+                return out;
+            }
+        }
+
+        const auto module = main_module_range();
+        if (!module.base || module.size < sizeof(IMAGE_DOS_HEADER))
+        {
+            out.failure = "main_module_unavailable";
+            return out;
+        }
+        const auto dos = safe_read<IMAGE_DOS_HEADER>(module.base);
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 ||
+            static_cast<std::size_t>(dos.e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > module.size)
+        {
+            out.failure = "main_module_dos_header_mismatch";
+            return out;
+        }
+        const auto nt = safe_read<IMAGE_NT_HEADERS64>(module.base + static_cast<std::uintptr_t>(dos.e_lfanew));
+        if (nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        {
+            out.failure = "main_module_build_identity_mismatch";
+            return out;
+        }
+        const bool legacy_shipping_build =
+            nt.FileHeader.TimeDateStamp == 0x534F2F4Bu &&
+            nt.OptionalHeader.SizeOfImage == 0x0AAFE000u &&
+            nt.OptionalHeader.CheckSum == 0x0A735A7Cu;
+        // Steam Shipping build captured from the single-host investigation on
+        // 2026-07-11.  The no-resend call chain is byte-identical to the legacy
+        // build at the verified offsets below after a uniform -0xBC0 RVA shift.
+        const bool steam_shipping_build =
+            nt.FileHeader.TimeDateStamp == 0xB76CD1AFu &&
+            nt.OptionalHeader.SizeOfImage == 0x0AAFD000u &&
+            nt.OptionalHeader.CheckSum == 0x0A7394E2u;
+        if (!legacy_shipping_build && !steam_shipping_build)
+        {
+            out.failure = "main_module_build_identity_mismatch";
+            return out;
+        }
+        static const auto text_file_identity = main_module_text_file_identity();
+        const bool text_identity_matches = text_file_identity.ok &&
+                                           ((legacy_shipping_build &&
+                                             text_file_identity.raw_size == 0x07AA3200u &&
+                                             text_file_identity.fnv1a64 == 0x085F72BE8C58A9E6ULL) ||
+                                            (steam_shipping_build &&
+                                             text_file_identity.raw_size == 0x07AA2800u &&
+                                             text_file_identity.fnv1a64 == 0x4200B2CAF330F8C3ULL));
+        if (!text_identity_matches)
+        {
+            out.failure = "main_module_text_identity_mismatch";
+            return out;
+        }
+
+        const std::uintptr_t ExpectedThunkRva = steam_shipping_build ? 0x50E4E20 : 0x50E59E0;
+        const std::uintptr_t ExpectedImplRva = steam_shipping_build ? 0x50FEA90 : 0x50FF650;
+        const std::uintptr_t ExpectedConstructorRva = steam_shipping_build ? 0x50DA6A0 : 0x50DB260;
+        const std::uintptr_t ExpectedCommonRva = steam_shipping_build ? 0x50EE0C0 : 0x50EEC80;
+        std::vector<InternalNoResendRoute> matches{};
+        for (std::uintptr_t slot = 0; slot <= 0x180; slot += sizeof(std::uintptr_t))
+        {
+            const auto thunk = safe_read<std::uintptr_t>(paint_at_uv_with_brush_function + slot);
+            if (!address_in_main_module_code(thunk) || thunk - module.base != ExpectedThunkRva)
+            {
+                continue;
+            }
+            if (!internal_code_matches(thunk,
+                                       {0x48, 0x89, 0x5C, 0x24, 0x08,
+                                        0x48, 0x89, 0x74, 0x24, 0x18,
+                                        0x48, 0x89, 0x7C, 0x24, 0x20,
+                                        0x55, 0x48, 0x8D, 0x6C, 0x24, 0xA9,
+                                        0x48, 0x81, 0xEC, 0xF0, 0x00, 0x00, 0x00}))
+            {
+                continue;
+            }
+            const auto impl = internal_rel32_call_target(thunk + 0x1A2);
+            if (!address_in_main_module_code(impl) || impl - module.base != ExpectedImplRva ||
+                !internal_code_matches(impl,
+                                       {0x48, 0x89, 0x5C, 0x24, 0x08,
+                                        0x48, 0x89, 0x6C, 0x24, 0x10,
+                                        0x48, 0x89, 0x74, 0x24, 0x18,
+                                        0x57, 0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00,
+                                        0x48, 0x8B, 0xE9}) ||
+                !internal_code_matches(impl + 0x38, {0x45, 0x33, 0xC0}))
+            {
+                continue;
+            }
+            const auto stroke_constructor = internal_rel32_call_target(impl + 0x28);
+            const auto common = internal_rel32_call_target(impl + 0x8B);
+            if (!address_in_main_module_code(stroke_constructor) ||
+                !address_in_main_module_code(common) ||
+                stroke_constructor - module.base != ExpectedConstructorRva ||
+                common - module.base != ExpectedCommonRva)
+            {
+                continue;
+            }
+            if (!internal_code_matches(stroke_constructor,
+                                       {0x0F, 0x10, 0x05, 0, 0, 0, 0,
+                                        0x33, 0xC0,
+                                        0x0F, 0x11, 0x01,
+                                        0x0F, 0x10, 0x0D, 0, 0, 0, 0},
+                                       "xxx????xxxxxxxx????") ||
+                !internal_code_matches(stroke_constructor + 0x46,
+                                       {0xC7, 0x41, 0x4C, 0xFF, 0xFF, 0xFF, 0xFF}) ||
+                !internal_code_matches(stroke_constructor + 0xEF,
+                                       {0xC6, 0x81, 0xB0, 0x00, 0x00, 0x00, 0x04}))
+            {
+                continue;
+            }
+            if (!internal_code_matches(common,
+                                       {0x48, 0x8B, 0xC4, 0x55, 0x53, 0x57, 0x41, 0x57,
+                                        0x48, 0x8D, 0xA8, 0x18, 0xFF, 0xFF, 0xFF,
+                                        0x48, 0x81, 0xEC, 0xC8, 0x01, 0x00, 0x00}) ||
+                !internal_code_matches(common + 0x1D, {0x45, 0x0F, 0xB6, 0xF8}) ||
+                !internal_code_matches(common + 0x70,
+                                       {0x45, 0x0F, 0xB6, 0xC7, 0x48, 0x8B, 0xD3, 0x41, 0x80, 0xF0, 0x01}) ||
+                !internal_code_matches(common + 0xAF, {0x45, 0x0F, 0xB6, 0xCF}) ||
+                !internal_code_matches(common + 0x376,
+                                       {0x45, 0x84, 0xFF,
+                                        0x0F, 0x85, 0x1C, 0x01, 0x00, 0x00,
+                                        0x44, 0x38, 0xB3, 0x25, 0x01, 0x00, 0x00,
+                                        0x74, 0x11}) ||
+                !internal_code_matches(common + 0x399,
+                                       {0x44, 0x38, 0xB3, 0xAC, 0x01, 0x00, 0x00}) ||
+                !internal_code_matches(common + 0x16,
+                                       {0x80, 0xB9, 0xE8, 0x01, 0x00, 0x00, 0x00}) ||
+                !internal_code_matches(common + 0x723,
+                                       {0x83, 0xBB, 0x50, 0x03, 0x00, 0x00, 0x00}) ||
+                !internal_code_matches(common + 0x968,
+                                       {0x48, 0xFF, 0x83, 0xC8, 0x02, 0x00, 0x00}) ||
+                !internal_code_matches(common + 0x9AB, {0xC3}) ||
+                safe_read<std::uint8_t>(common + 0x379, 0) != 0x0F ||
+                safe_read<std::uint8_t>(common + 0x37A, 0) != 0x85)
+            {
+                continue;
+            }
+            const auto true_branch_displacement = safe_read<std::int32_t>(common + 0x37B, 0);
+            const auto true_branch_target = static_cast<std::uintptr_t>(
+                static_cast<std::intptr_t>(common + 0x37F) +
+                static_cast<std::intptr_t>(true_branch_displacement));
+            if (!address_in_main_module_code(true_branch_target) || true_branch_target != common + 0x49B)
+            {
+                continue;
+            }
+
+            InternalNoResendRoute match{};
+            match.resolved = true;
+            match.status = "resolved";
+            match.thunk = thunk;
+            match.impl = impl;
+            match.stroke_constructor = stroke_constructor;
+            match.common = common;
+            matches.push_back(match);
+        }
+        if (matches.size() != 1)
+        {
+            out.failure = "validated_PaintAtUVWithBrush_thunk_count:" + std::to_string(matches.size());
+            return out;
+        }
+        return matches.front();
+    }
+
+    auto sdk_validate_internal_common_no_resend_preconditions(std::uintptr_t component,
+                                                              std::uintptr_t stroke_constructor,
+                                                              std::uintptr_t common,
+                                                              const sdk::FPaintStroke& source,
+                                                              std::string& failure) -> bool
+    {
+        const auto expected_thread_id = g_game_thread_id.load(std::memory_order_acquire);
+        if (!expected_thread_id || GetCurrentThreadId() != expected_thread_id)
+        {
+            failure = "internal_no_resend_wrong_thread";
+            return false;
+        }
+        if (!live_uobject_not_destroyed(component))
+        {
+            failure = "paint_component_unavailable";
+            return false;
+        }
+        if (safe_read<std::uint8_t>(component + 0x1E8, 0) == 0)
+        {
+            failure = "internal_no_resend_component_not_ready";
+            return false;
+        }
+        struct RuntimeTriangleCacheHeader
+        {
+            std::uintptr_t data{0};
+            std::int32_t num{0};
+            std::int32_t max{0};
+        } triangle_cache{};
+        if (!safe_copy(&triangle_cache,
+                       reinterpret_cast<const void*>(component + 0x1C8),
+                       sizeof(triangle_cache)) ||
+            !triangle_cache.data || triangle_cache.num <= 0 || triangle_cache.max < triangle_cache.num ||
+            triangle_cache.max > 2'000'000)
+        {
+            failure = "internal_no_resend_runtime_triangle_cache_unavailable";
+            return false;
+        }
+        constexpr std::uintptr_t RuntimeTriangleStride = 0xD0;
+        std::uint8_t readable_byte = 0;
+        const auto last_triangle = triangle_cache.data +
+                                   static_cast<std::uintptr_t>(triangle_cache.num - 1) * RuntimeTriangleStride;
+        if (!safe_copy(&readable_byte, reinterpret_cast<const void*>(triangle_cache.data), sizeof(readable_byte)) ||
+            !safe_copy(&readable_byte,
+                       reinterpret_cast<const void*>(last_triangle + RuntimeTriangleStride - 1),
+                       sizeof(readable_byte)))
+        {
+            failure = "internal_no_resend_runtime_triangle_cache_unreadable";
+            return false;
+        }
+        if (source.BrushSettings.BrushTexture &&
+            !live_uobject_not_destroyed(reinterpret_cast<std::uintptr_t>(source.BrushSettings.BrushTexture)))
+        {
+            failure = "internal_no_resend_brush_texture_unavailable";
+            return false;
+        }
+        if (!address_in_main_module_code(stroke_constructor) || !address_in_main_module_code(common))
+        {
+            failure = "internal_no_resend_target_untrusted";
+            return false;
+        }
+
+        // Current-build common+0x2a7..+0x307 dispatches through these four
+        // UTextureRenderTarget2D pointers.  The +0x2c8 counter increments even
+        // when a selected pointer is absent, so validate every channel required
+        // by TargetChannel before treating that counter as a call postcondition.
+        auto require_channel_target = [&](std::uintptr_t offset, const char* name) -> bool {
+            const auto target = safe_read<std::uintptr_t>(component + offset);
+            if (!live_uobject_not_destroyed(target))
+            {
+                failure = std::string("internal_no_resend_") + name + "_target_unavailable";
+                return false;
+            }
+            return true;
+        };
+        switch (source.TargetChannel)
+        {
+        case sdk::EPaintChannel::Albedo:
+            return require_channel_target(0x148, "albedo");
+        case sdk::EPaintChannel::Metallic:
+            return require_channel_target(0x150, "metallic");
+        case sdk::EPaintChannel::Roughness:
+            return require_channel_target(0x158, "roughness");
+        case sdk::EPaintChannel::Height:
+            return require_channel_target(0x160, "height");
+        case sdk::EPaintChannel::All:
+            return require_channel_target(0x148, "albedo") &&
+                   require_channel_target(0x150, "metallic") &&
+                   require_channel_target(0x158, "roughness") &&
+                   require_channel_target(0x160, "height");
+        case sdk::EPaintChannel::AlbedoMetallicRoughness:
+            return require_channel_target(0x148, "albedo") &&
+                   require_channel_target(0x150, "metallic") &&
+                   require_channel_target(0x158, "roughness");
+        default:
+            failure = "internal_no_resend_target_channel_unsupported";
+            return false;
+        }
+    }
+
+    auto sdk_call_internal_common_no_resend(std::uintptr_t component,
+                                            std::uintptr_t stroke_constructor,
+                                            std::uintptr_t common,
+                                            const sdk::FPaintStroke& source,
+                                            bool& exception_raised,
+                                            bool& common_returned,
+                                            std::string& failure) -> bool
+    {
+        static_assert(sizeof(sdk::FPaintStroke) == 0xE0, "FPaintStroke size mismatch");
+        static_assert(offsetof(sdk::FPaintStroke, Uv) == 0x00, "FPaintStroke Uv offset mismatch");
+        static_assert(offsetof(sdk::FPaintStroke, BrushSettings) == 0x68,
+                      "FPaintStroke BrushSettings offset mismatch");
+        static_assert(offsetof(sdk::FPaintStroke, ChannelData) == 0x90,
+                      "FPaintStroke ChannelData offset mismatch");
+        static_assert(offsetof(sdk::FPaintStroke, TargetChannel) == 0xB0,
+                      "FPaintStroke TargetChannel offset mismatch");
+        static_assert(std::is_standard_layout_v<sdk::FPaintStroke>,
+                      "FPaintStroke must retain a standard layout");
+        static_assert(std::is_trivially_copyable_v<sdk::FPaintStroke>,
+                      "FPaintStroke must remain trivially copyable");
+        static_assert(std::is_trivially_destructible_v<sdk::FPaintStroke>,
+                      "FPaintStroke must remain trivially destructible");
+        exception_raised = false;
+        common_returned = false;
+        if (!sdk_validate_internal_common_no_resend_preconditions(component,
+                                                                  stroke_constructor,
+                                                                  common,
+                                                                  source,
+                                                                  failure))
+        {
+            return false;
+        }
+
+        using StrokeConstructorFn = sdk::FPaintStroke*(__fastcall*)(sdk::FPaintStroke*);
+        using CommonFn = void(__fastcall*)(void*, sdk::FPaintStroke*, bool);
+        alignas(16) std::array<std::uint8_t, 0xE0> storage{};
+        auto* const storage_stroke = reinterpret_cast<sdk::FPaintStroke*>(storage.data());
+        bool constructor_return_mismatch = false;
+        const auto dispatch_count_before = safe_read<std::int64_t>(component + 0x2C8,
+                                                                   std::numeric_limits<std::int64_t>::min());
+        g_active_ue_calls.fetch_add(1);
+        __try
+        {
+            auto* const constructed = reinterpret_cast<StrokeConstructorFn>(stroke_constructor)(storage_stroke);
+            if (constructed != storage_stroke)
+            {
+                constructor_return_mismatch = true;
+            }
+            else
+            {
+                constructed->Uv = source.Uv;
+                constructed->ChannelData = source.ChannelData;
+                constructed->BrushSettings = source.BrushSettings;
+                constructed->TargetChannel = source.TargetChannel;
+                reinterpret_cast<CommonFn>(common)(reinterpret_cast<void*>(component), constructed, true);
+                common_returned = true;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            exception_raised = true;
+        }
+        g_active_ue_calls.fetch_sub(1);
+        if (exception_raised)
+        {
+            failure = "internal_common_no_resend_exception";
+            return false;
+        }
+        if (constructor_return_mismatch)
+        {
+            failure = "FPaintStroke_constructor_return_mismatch";
+            return false;
+        }
+        if (!common_returned)
+        {
+            failure = "internal_common_no_resend_did_not_return";
+            return false;
+        }
+        const auto dispatch_count_after = safe_read<std::int64_t>(component + 0x2C8,
+                                                                  std::numeric_limits<std::int64_t>::min());
+        if (dispatch_count_before == std::numeric_limits<std::int64_t>::min() ||
+            dispatch_count_after != dispatch_count_before + 1)
+        {
+            failure = "internal_common_no_resend_dispatch_postcondition_failed";
+            return false;
+        }
+        return true;
+    }
+
     auto sdk_call_paint_at_uv_with_brush(std::uintptr_t component,
                                          std::uintptr_t function,
                                          const sdk::FPaintStroke& stroke,
@@ -12330,6 +17252,12 @@ namespace
         if (!live_uobject(component))
         {
             failure = "paint_component_unavailable";
+            return false;
+        }
+        const int params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size != static_cast<int>(sizeof(sdk::RuntimePaintableComponent_PaintAtUVWithBrush)))
+        {
+            failure = "PaintAtUVWithBrush_params_size_mismatch:" + std::to_string(params_size);
             return false;
         }
         sdk::RuntimePaintableComponent_PaintAtUVWithBrush params{};
@@ -12503,12 +17431,33 @@ namespace
         const auto st = struct_type(ref, prop, {"X", "Y", "Z", "W"});
         if (st)
         {
-            bool read = false;
-            if (const auto p = find_property_any(ref, st, {"X"})) { out.X = sdk_read_number(ref, p, base); read = true; }
-            if (const auto p = find_property_any(ref, st, {"Y"})) { out.Y = sdk_read_number(ref, p, base); read = true; }
-            if (const auto p = find_property_any(ref, st, {"Z"})) { out.Z = sdk_read_number(ref, p, base); read = true; }
-            if (const auto p = find_property_any(ref, st, {"W"})) { out.W = sdk_read_number(ref, p, base); read = true; }
-            return read && std::isfinite(out.X) && std::isfinite(out.Y) && std::isfinite(out.Z) && std::isfinite(out.W);
+            const auto x = find_property_any(ref, st, {"X"});
+            const auto y = find_property_any(ref, st, {"Y"});
+            const auto z = find_property_any(ref, st, {"Z"});
+            const auto w = find_property_any(ref, st, {"W"});
+            const auto xo = x ? prop_offset(x) : -1;
+            const auto yo = y ? prop_offset(y) : -1;
+            const auto zo = z ? prop_offset(z) : -1;
+            const auto wo = w ? prop_offset(w) : -1;
+            if (xo >= 0 && yo > xo && zo > yo && wo > zo)
+            {
+                if (yo - xo >= 8 && zo - yo >= 8 && wo - zo >= 8)
+                {
+                    out = {*reinterpret_cast<double*>(base + xo),
+                           *reinterpret_cast<double*>(base + yo),
+                           *reinterpret_cast<double*>(base + zo),
+                           *reinterpret_cast<double*>(base + wo)};
+                }
+                else
+                {
+                    out = {static_cast<double>(*reinterpret_cast<float*>(base + xo)),
+                           static_cast<double>(*reinterpret_cast<float*>(base + yo)),
+                           static_cast<double>(*reinterpret_cast<float*>(base + zo)),
+                           static_cast<double>(*reinterpret_cast<float*>(base + wo))};
+                }
+                return std::isfinite(out.X) && std::isfinite(out.Y) &&
+                       std::isfinite(out.Z) && std::isfinite(out.W);
+            }
         }
         const auto size = prop_element_size(prop);
         if (size >= 32)
@@ -12534,29 +17483,32 @@ namespace
             return false;
         }
         auto* base = container + offset;
+        const auto size = prop_element_size(prop);
+        if (size == static_cast<int>(sizeof(sdk::FTransform)))
+        {
+            return safe_copy(&out, base, sizeof(out)) && sdk::transform_is_plausible(out);
+        }
         const auto st = struct_type(ref, prop, {"Rotation", "Translation", "Scale3D"});
         if (st)
         {
             out = mesh_first_identity_transform();
-            bool read = false;
+            bool rotation_read = false;
+            bool translation_read = false;
+            bool scale_read = false;
             if (const auto p = find_property_any(ref, st, {"Rotation"}))
             {
-                read = sdk_read_quat(ref, p, base, out.Rotation) || read;
+                rotation_read = sdk_read_quat(ref, p, base, out.Rotation);
             }
             if (const auto p = find_property_any(ref, st, {"Translation", "Location"}))
             {
-                read = sdk_read_vector3(ref, p, base, out.Translation) || read;
+                translation_read = sdk_read_vector3(ref, p, base, out.Translation);
             }
             if (const auto p = find_property_any(ref, st, {"Scale3D", "Scale"}))
             {
-                read = sdk_read_vector3(ref, p, base, out.Scale3D) || read;
+                scale_read = sdk_read_vector3(ref, p, base, out.Scale3D);
             }
-            return read && sdk_transform_finite(out);
-        }
-        const auto size = prop_element_size(prop);
-        if (size >= static_cast<int>(sizeof(sdk::FTransform)))
-        {
-            return safe_copy(&out, base, sizeof(out)) && sdk_transform_finite(out);
+            return rotation_read && translation_read && scale_read &&
+                   sdk::transform_is_plausible(out);
         }
         return false;
     }
@@ -14230,7 +19182,8 @@ namespace
     auto is_paint_replication_probe_request(const std::string& request) -> bool
     {
         return request.find("\"type\":\"paint_replication_probe\"") != std::string::npos ||
-               request.find("\"type\":\"paint_replication_pressure_probe\"") != std::string::npos;
+               request.find("\"type\":\"paint_replication_pressure_probe\"") != std::string::npos ||
+               request.find("\"type\":\"paint_replication_texture_probe\"") != std::string::npos;
     }
 
     auto paint_replication_probe_metadata_for_context(Reflection& ref, const SdkContext& ctx) -> std::string
@@ -14260,7 +19213,14 @@ namespace
         const std::vector<const char*> component_paint_replication_candidates{
             "ServerPackedPaintBatch",
             "MulticastPackedPaintBatch",
+            "MulticastPaintBatchToOthers",
             "MulticastPackedPaintBatchToOthers",
+            "PaintAtUV",
+            "PaintAtUVWithBrush",
+            "PaintStrokeUV",
+            "SendPaintToServer",
+            "FlushRecordedStrokesToServer",
+            "ClearRecordedStrokes",
         };
         const std::vector<const char*> relay_paint_replication_candidates{
             "ServerRelayCompactPaint",
@@ -14268,6 +19228,14 @@ namespace
             "ServerRelayPackedStrokeBatch",
         };
         const std::vector<const char*> paint_replication_property_candidates{
+            "bAutoRecordStrokes",
+            "bAutoFlushStrokes",
+            "bAsyncPrepareReplicatedPaint",
+            "bCacheRecordingEnabled",
+            "bPoseIndependentSkeletalPainting",
+            "bUpdateOnlyPaintArea",
+            "bInBrushStroke",
+            "bDisablePaintingStartupSlowdown",
             "bUseCompactPaintReplication",
             "bUseExperimentalPackedPaintReplication",
             "MaxOutgoingStrokesPerBatch",
@@ -14292,6 +19260,11 @@ namespace
                                                               replication_manager,
                                                               "paint_replication_manager_property_probe",
                                                               paint_replication_property_candidates);
+        metadata += paint_property_offset_inventory_metadata(ref,
+                                                             ctx.component,
+                                                             "paint_replication_component_property_inventory",
+                                                             0x100,
+                                                             0x2b0);
         return metadata;
     }
 
@@ -14324,9 +19297,11 @@ namespace
                                  "\"route\":\"paint_replication_probe\",\"sdk_resolution_exception\":true");
         }
 
-        if (request.find("\"type\":\"paint_replication_pressure_probe\"") != std::string::npos)
+        const bool texture_probe = request.find("\"type\":\"paint_replication_texture_probe\"") != std::string::npos;
+        if (request.find("\"type\":\"paint_replication_pressure_probe\"") != std::string::npos || texture_probe)
         {
-            std::string pressure_metadata = "\"route\":\"paint_replication_pressure_probe\"";
+            const char* route = texture_probe ? "paint_replication_texture_probe" : "paint_replication_pressure_probe";
+            std::string pressure_metadata = "\"route\":\"" + std::string(route) + "\"";
             pressure_metadata += paint_replication_global_probe_metadata(ref);
             if (!ctx.ok)
             {
@@ -14335,11 +19310,12 @@ namespace
             pressure_metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
             pressure_metadata += ",\"component_class\":\"" + json_escape(ref.class_name(ctx.component)) + "\"";
             pressure_metadata += sdk_replication_snapshot_metadata("replication", sdk_capture_replication_snapshot(ref, ctx.component));
+            pressure_metadata += paint_replication_component_inventory_metadata(ref, ctx, texture_probe);
             return response_json(true,
-                                 "paint_replication_pressure_probe",
+                                 route,
                                  0,
                                  0,
-                                 "paint replication pressure probe complete",
+                                 texture_probe ? "paint replication texture probe complete" : "paint replication pressure probe complete",
                                  pressure_metadata);
         }
         const auto metadata = paint_replication_probe_metadata_for_context(ref, ctx);
@@ -14458,17 +19434,35 @@ namespace
 
     auto drain_paint_jobs_on_game_thread() -> void
     {
-        tick_mesh_first_batch_async_job();
-
+        const auto expected_thread_id = g_game_thread_id.load();
+        if (!expected_thread_id || GetCurrentThreadId() != expected_thread_id)
+        {
+            return;
+        }
         std::vector<std::shared_ptr<QueuedPaintJob>> jobs{};
         {
             std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
             jobs.swap(g_paint_jobs);
+            for (const auto& job : jobs)
+            {
+                if (!job || job->done)
+                {
+                    continue;
+                }
+                job->dispatched = true;
+                job->state.store(static_cast<int>(PaintJobState::Executing), std::memory_order_release);
+                g_executing_paint_jobs.push_back(job);
+            }
         }
         for (const auto& job : jobs)
         {
             if (!job)
             {
+                continue;
+            }
+            if (queued_paint_cancel_reason(job) != PaintCancelReason::None)
+            {
+                complete_queued_paint_job(job, queued_paint_cancel_response(job));
                 continue;
             }
             if (is_paint_packed_replay_probe_request(job->request))
@@ -14497,18 +19491,87 @@ namespace
         tick_mesh_first_batch_async_job();
     }
 
+    auto fail_paint_dispatch_after_exception() -> void
+    {
+        const auto async_job = active_mesh_first_batch_job();
+        if (async_job && !async_job->completed.load(std::memory_order_acquire))
+        {
+            // SEH does not guarantee C++ unwinding under /EHsc.  Explicitly
+            // release the scheduler gate and terminalise the transaction so
+            // shutdown cannot wait forever on a stale tick_in_progress bit.
+            async_job->tick_in_progress.store(false, std::memory_order_release);
+            complete_mesh_first_batch_job(
+                async_job,
+                response_json(false,
+                              "game_thread_dispatch_exception",
+                              mesh_first_rendered_strokes(async_job),
+                              1,
+                              "paint stopped after a structured exception on the game thread",
+                              async_job->metadata +
+                                  ",\"server_strokes_sent\":" + std::to_string(async_job->server_strokes_sent) +
+                                  ",\"local_strokes_synced\":" + std::to_string(async_job->local_stroke_success) +
+                                  ",\"paint_strokes_submitted\":" +
+                                  std::to_string(mesh_first_completed_strokes(async_job)) +
+                                  ",\"paint_strokes_rendered\":" +
+                                  std::to_string(mesh_first_rendered_strokes(async_job)) +
+                                  ",\"paint_strokes_completed\":" +
+                                  std::to_string(mesh_first_rendered_strokes(async_job)) +
+                                  mesh_first_interrupted_commit_metadata(async_job) +
+                                  ",\"scheduler_faulted\":true"));
+        }
+
+        std::vector<std::shared_ptr<QueuedPaintJob>> executing{};
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            executing = g_executing_paint_jobs;
+        }
+        for (const auto& queued : executing)
+        {
+            complete_queued_paint_job(
+                queued,
+                response_json(false,
+                              "game_thread_dispatch_exception",
+                              0,
+                              1,
+                              "paint planning stopped after a structured exception on the game thread",
+                              "\"partial_commit\":false,\"server_local_diverged\":false,"
+                                  "\"automatic_retry_safe\":false,\"scheduler_faulted\":true"));
+        }
+    }
+
     void __fastcall hooked_process_event(void* object, void* function, void* params)
     {
         g_active_hook_callbacks.fetch_add(1);
         const auto original = g_original_process_event.load();
-        (void)object;
+        AutoEventWatchEntry* queue_delta_entry = nullptr;
+        EventWatchQueuedBatchesSnapshot queued_batches_before{};
         if (function && params)
         {
             __try
             {
                 const auto function_address = reinterpret_cast<std::uintptr_t>(function);
                 const auto params_bytes = reinterpret_cast<std::uint8_t*>(params);
-                auto_event_watch_record(function_address, params_bytes);
+                for (auto& entry : g_auto_event_watch)
+                {
+                    if (function_address != entry.function.load())
+                    {
+                        continue;
+                    }
+                    if (std::strcmp(entry.name, "MulticastPackedPaintBatch") == 0 ||
+                        std::strcmp(entry.name, "MulticastPackedPaintBatchToOthers") == 0 ||
+                        std::strcmp(entry.name, "MulticastPaintBatch") == 0 ||
+                        std::strcmp(entry.name, "MulticastPaintBatchToOthers") == 0)
+                    {
+                        queue_delta_entry = &entry;
+                        queued_batches_before = auto_event_watch_queued_batches_snapshot();
+                        if (!queued_batches_before.valid)
+                        {
+                            entry.queued_batches_delta_unavailable.fetch_add(1);
+                        }
+                    }
+                    break;
+                }
+                auto_event_watch_record(reinterpret_cast<std::uintptr_t>(object), function_address, params_bytes);
                 if (function_address == g_observed_sync_channel_function.load())
                 {
                     const auto channel = *reinterpret_cast<std::uint8_t*>(params_bytes);
@@ -14537,18 +19600,54 @@ namespace
         if (!g_inside_process_event_hook)
         {
             g_inside_process_event_hook = true;
+            bool dispatch_faulted = false;
+            g_active_paint_dispatches.fetch_add(1, std::memory_order_acq_rel);
             __try
             {
                 drain_paint_jobs_on_game_thread();
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
+                dispatch_faulted = true;
             }
+            g_active_paint_dispatches.fetch_sub(1, std::memory_order_acq_rel);
             g_inside_process_event_hook = false;
+            if (dispatch_faulted)
+            {
+                fail_paint_dispatch_after_exception();
+            }
         }
         if (original)
         {
             reinterpret_cast<ProcessEventFn>(original)(object, function, params);
+        }
+        if (queue_delta_entry && queued_batches_before.valid)
+        {
+            __try
+            {
+                const auto queued_batches_after = auto_event_watch_queued_batches_snapshot();
+                if (queued_batches_after.valid)
+                {
+                    const auto delta = queued_batches_after.total - queued_batches_before.total;
+                    queue_delta_entry->last_queued_batches_total_before.store(queued_batches_before.total);
+                    queue_delta_entry->last_queued_batches_total_after.store(queued_batches_after.total);
+                    queue_delta_entry->last_queued_batches_total_delta.store(delta);
+                    queue_delta_entry->queued_batches_total_signed_delta.fetch_add(delta);
+                    if (delta > 0)
+                    {
+                        queue_delta_entry->queued_batches_total_positive_delta.fetch_add(delta);
+                    }
+                    queue_delta_entry->queued_batches_delta_observations.fetch_add(1);
+                }
+                else
+                {
+                    queue_delta_entry->queued_batches_delta_unavailable.fetch_add(1);
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                queue_delta_entry->queued_batches_delta_unavailable.fetch_add(1);
+            }
         }
         g_active_hook_callbacks.fetch_sub(1);
     }
@@ -14561,12 +19660,21 @@ namespace
             const auto* msg = reinterpret_cast<const MSG*>(lparam);
             if (msg && msg->message == PaintDispatchMessage)
             {
+                g_paint_dispatch_message_pending.store(false, std::memory_order_release);
+                bool dispatch_faulted = false;
+                g_active_paint_dispatches.fetch_add(1, std::memory_order_acq_rel);
                 __try
                 {
                     drain_paint_jobs_on_game_thread();
                 }
                 __except (EXCEPTION_EXECUTE_HANDLER)
                 {
+                    dispatch_faulted = true;
+                }
+                g_active_paint_dispatches.fetch_sub(1, std::memory_order_acq_rel);
+                if (dispatch_faulted)
+                {
+                    fail_paint_dispatch_after_exception();
                 }
             }
         }
@@ -14575,30 +19683,104 @@ namespace
         return result;
     }
 
+    auto force_terminal_idle_local_queue_drain(const char* cancel_reason) -> bool;
+
     auto paint_full_route_native(const std::string& request) -> std::string
     {
+        if (!g_accepting_bridge_commands.load(std::memory_order_acquire))
+        {
+            return response_json(false,
+                                 "bridge_stopping",
+                                 0,
+                                 1,
+                                 "bridge is stopping and is not accepting paint commands");
+        }
+        bool expected_idle = false;
+        if (!g_paint_request_in_progress.compare_exchange_strong(expected_idle, true, std::memory_order_acq_rel))
+        {
+            return response_json(false,
+                                 "paint_request_busy",
+                                 0,
+                                 1,
+                                 "another paint or probe command is already active");
+        }
+        struct PaintRequestLease
+        {
+            ~PaintRequestLease()
+            {
+                g_paint_request_in_progress.store(false, std::memory_order_release);
+                g_paint_jobs_cv.notify_all();
+            }
+        } request_lease{};
+
+        if (!g_accepting_bridge_commands.load(std::memory_order_acquire))
+        {
+            return response_json(false,
+                                 "bridge_stopping",
+                                 0,
+                                 1,
+                                 "bridge stopped accepting commands before paint admission completed");
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            if (!g_paint_jobs.empty() || !g_executing_paint_jobs.empty())
+            {
+                return response_json(false,
+                                     "paint_pipeline_busy",
+                                     0,
+                                     1,
+                                     "a previous paint job is still draining");
+            }
+        }
         std::string failure{};
         if (!install_process_event_hook(failure))
         {
             return response_json(false, failure.c_str(), 0, 1, failure);
         }
+        if (!g_accepting_bridge_commands.load(std::memory_order_acquire))
+        {
+            uninstall_message_hook();
+            return response_json(false,
+                                 "bridge_stopping",
+                                 0,
+                                 1,
+                                 "bridge stopped accepting commands during paint setup");
+        }
         auto job = std::make_shared<QueuedPaintJob>();
         job->request = request;
+        bool admitted = false;
         {
             std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
-            g_paint_jobs.push_back(job);
+            if (g_accepting_bridge_commands.load(std::memory_order_acquire))
+            {
+                g_paint_jobs.push_back(job);
+                admitted = true;
+            }
+        }
+        if (!admitted)
+        {
+            uninstall_message_hook();
+            return response_json(false,
+                                 "bridge_stopping",
+                                 0,
+                                 1,
+                                 "bridge stopped accepting commands before paint was queued");
         }
         g_paint_jobs_cv.notify_all();
         post_paint_dispatch_message();
         std::unique_lock<std::mutex> lock(g_paint_jobs_mutex);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(240);
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(PaintRequestTimeoutSeconds);
         const auto dispatch_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
-        auto finish_response = [&](std::string response) -> std::string {
+        auto finish_response = [&](std::string response, bool uninstall_hook = true) -> std::string {
             if (lock.owns_lock())
             {
                 lock.unlock();
             }
-            uninstall_message_hook();
+            if (uninstall_hook)
+            {
+                uninstall_message_hook();
+            }
             return response;
         };
         bool completed = job->done;
@@ -14629,21 +19811,53 @@ namespace
         }
         if (!completed)
         {
+            const bool remained_queued =
+                job->state.load(std::memory_order_acquire) == static_cast<int>(PaintJobState::Queued);
             g_paint_jobs.erase(std::remove(g_paint_jobs.begin(), g_paint_jobs.end(), job), g_paint_jobs.end());
-            if (!job->dispatched)
+            if (remained_queued)
             {
-                job->response = response_json(false,
-                                              "game_thread_dispatch_timeout",
-                                              0,
-                                              1,
-                                              "game thread did not start paint job",
-                                              "\"queued_paint_removed\":true");
-                job->done = true;
+                lock.unlock();
+                request_queued_paint_cancel(job, "paint_request_timeout");
+                const auto response = response_json(false,
+                                                    "game_thread_dispatch_timeout",
+                                                    0,
+                                                    1,
+                                                    "game thread did not start paint job",
+                                                    "\"queued_paint_removed\":true,\"automatic_retry_safe\":false");
+                complete_queued_paint_job(job, response);
+                return finish_response(response);
+            }
+            lock.unlock();
+            const auto active_job = active_mesh_first_batch_job();
+            const bool active_job_matches = active_job && active_job->queued == job;
+            request_queued_paint_cancel(job, "paint_request_timeout");
+            post_paint_dispatch_message();
+            bool quiescent = wait_for_queued_paint_job_quiescent(job, std::chrono::seconds(5));
+            const auto force_deadline = std::chrono::steady_clock::now() +
+                                        std::chrono::milliseconds(500);
+            while (!quiescent && std::chrono::steady_clock::now() < force_deadline)
+            {
+                force_terminal_idle_local_queue_drain("paint_request_timeout");
+                quiescent = wait_for_queued_paint_job_quiescent(
+                    job, std::chrono::milliseconds(20));
+            }
+            lock.lock();
+            if (job->done)
+            {
                 return finish_response(job->response);
             }
-            job->response = response_json(false, "game_thread_dispatch_timeout", 0, 1, "game thread did not process paint job");
-            job->done = true;
-            return finish_response(job->response);
+            const auto timeout_response = response_json(false,
+                                                        quiescent ? "game_thread_dispatch_timeout" : "paint_cancel_timeout",
+                                                        0,
+                                                        1,
+                                                        quiescent
+                                                            ? "game thread did not complete paint job"
+                                                            : "paint timed out and cancellation is still pending",
+                                                        std::string("\"cancel_requested\":true") +
+                                                            ",\"active_async_job_matched\":" + std::string(active_job_matches ? "true" : "false") +
+                                                            ",\"cancel_quiescent\":" + std::string(quiescent ? "true" : "false") +
+                                                            ",\"automatic_retry_safe\":false");
+            return finish_response(timeout_response, quiescent);
         }
         return finish_response(job->response);
     }
@@ -14732,9 +19946,105 @@ namespace
                                  ",\"port\":" + std::to_string(g_bound_port.load()));
     }
 
+    auto paint_pipeline_is_quiescent() -> bool
+    {
+        if (g_paint_request_in_progress.load(std::memory_order_acquire) ||
+            g_active_ue_calls.load(std::memory_order_acquire) != 0 ||
+            g_active_paint_dispatches.load(std::memory_order_acquire) != 0)
+        {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            if (!g_paint_jobs.empty() || !g_executing_paint_jobs.empty())
+            {
+                return false;
+            }
+        }
+        const auto async_job = active_mesh_first_batch_job();
+        return !async_job || (async_job->completed.load(std::memory_order_acquire) &&
+                              !async_job->tick_in_progress.load(std::memory_order_acquire));
+    }
+
+    auto force_terminal_idle_local_queue_drain(const char* cancel_reason) -> bool
+    {
+        const auto job = active_mesh_first_batch_job();
+        if (!job || job->completed.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+        bool expected_idle = false;
+        if (!job->tick_in_progress.compare_exchange_strong(
+                expected_idle, true, std::memory_order_acq_rel))
+        {
+            return false;
+        }
+        struct TickLease
+        {
+            std::atomic<bool>& active;
+            ~TickLease() { active.store(false, std::memory_order_release); }
+        } tick_lease{job->tick_in_progress};
+        if (job->completed.load(std::memory_order_acquire) ||
+            job->phase != MeshFirstBatchPhase::LocalQueueDrain)
+        {
+            return false;
+        }
+
+        request_queued_paint_cancel(job->queued, cancel_reason);
+        const std::string reason =
+            paint_cancel_reason_name(queued_paint_cancel_reason(job->queued));
+        job->phase = MeshFirstBatchPhase::Cancelled;
+        if (job->local_sync_started)
+        {
+            job->local_visual_sync_elapsed_ms = mesh_first_local_elapsed_ms(job);
+        }
+        // A nullptr-window timer belongs to the game thread. Leave an already
+        // armed one to self-kill in its callback rather than killing it from
+        // this listener thread; no async job remains for the stale wakeup.
+        job->dispatch_timer_id = 0;
+        complete_mesh_first_batch_job(
+            job,
+            mesh_first_cancel_response(job, reason, "local_queue_drain"));
+        return true;
+    }
+
+    auto wait_for_paint_pipeline_quiescent(std::chrono::milliseconds timeout,
+                                           const char* cancel_reason) -> bool
+    {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            cancel_executing_paint_jobs(cancel_reason);
+            cancel_queued_paint_jobs(cancel_reason);
+            if (paint_pipeline_is_quiescent())
+            {
+                return true;
+            }
+            post_paint_dispatch_message();
+            Sleep(10);
+        }
+        cancel_executing_paint_jobs(cancel_reason);
+        cancel_queued_paint_jobs(cancel_reason);
+        const auto forced_deadline = std::chrono::steady_clock::now() +
+                                     std::chrono::milliseconds(500);
+        while (!paint_pipeline_is_quiescent() &&
+               std::chrono::steady_clock::now() < forced_deadline)
+        {
+            force_terminal_idle_local_queue_drain(cancel_reason);
+            if (paint_pipeline_is_quiescent())
+            {
+                return true;
+            }
+            Sleep(10);
+        }
+        return paint_pipeline_is_quiescent();
+    }
+
     auto valid_hello(const std::string& request) -> bool
     {
-        return g_bridge_started.load() &&
+        return g_bridge_started.load(std::memory_order_acquire) &&
+               g_accepting_bridge_commands.load(std::memory_order_acquire) &&
+               g_running.load(std::memory_order_acquire) &&
                json_string_field(request, "type", "") == "hello" &&
                json_int_field(request, "bootstrap_protocol", 0, 0, 100) == static_cast<int>(BridgeBootstrapProtocolV1) &&
                fixed_hex_matches(json_string_field(request, "instance_id", ""), g_bridge_identity.instance_guid, 16) &&
@@ -14743,6 +20053,12 @@ namespace
 
     auto request_bridge_stop() -> void
     {
+        // Stop and join the writer before a later same-module start can publish a
+        // new identity.  The writer snapshots that identity by value, so no old
+        // generation can wake and overwrite the new artifact.
+        g_accepting_bridge_commands.store(false, std::memory_order_release);
+        stop_auto_event_watch_and_join();
+        g_bridge_state.store(BRIDGE_RUNTIME_STOPPING);
         g_running.store(false);
         const SOCKET listener = g_listener.exchange(INVALID_SOCKET);
         if (listener != INVALID_SOCKET)
@@ -14754,6 +20070,16 @@ namespace
 
     auto handle_request(const std::string& line) -> std::string
     {
+        const std::string request_type = json_string_field(line, "type", "");
+        const bool lifecycle_control = request_type == "cancel_paint" || request_type == "shutdown";
+        if (!lifecycle_control && !g_accepting_bridge_commands.load(std::memory_order_acquire))
+        {
+            return response_json(false,
+                                 "bridge_stopping",
+                                 0,
+                                 1,
+                                 "bridge is stopping and rejected the command");
+        }
         if (line.find("\"type\":\"ping\"") != std::string::npos)
         {
             return response_json(true,
@@ -14766,23 +20092,25 @@ namespace
         }
         if (line.find("\"type\":\"capabilities\"") != std::string::npos)
         {
-            std::string commands = "[\"ping\",\"capabilities\",\"paint_full_route\",\"paint_replication_probe\",\"paint_replication_pressure_probe\",\"paint_packed_replay_probe\",\"cancel_paint\",\"shutdown\"]";
+            std::string commands = "[\"ping\",\"capabilities\",\"paint_full_route\",\"paint_replication_probe\",\"paint_replication_pressure_probe\",\"paint_replication_texture_probe\",\"paint_packed_replay_probe\",\"cancel_paint\",\"shutdown\"]";
             return std::string("{\"success\":true,\"stage\":\"capabilities\",\"applied\":0,\"failures\":0,") +
                    "\"message\":\"ok\",\"timing_ms\":{}," +
                    "\"metadata\":{\"commands\":" + commands + "," +
                    "\"cancel_paint\":true," +
-                   "\"single_injection_per_pid\":true," +
+                   "\"single_injection_per_pid\":false," +
+                   "\"fresh_instance_reinjection\":true," +
                    "\"sdk\":\"runtime_dynamic_reflection_min\"," +
                    "\"paint_full_route\":\"mesh_first_paint\"," +
                    "\"texture_import_used\":false," +
                    "\"local_paint_used\":true," +
-                   "\"paint_at_uv_with_brush_used\":true," +
+                   "\"paint_at_uv_with_brush_used\":false," +
+                   "\"internal_no_resend_local_apply\":true," +
                    "\"replication\":\"server_paint_batch\"," +
                    "\"multiplayer_replicated\":true}}\n";
         }
         if (line.find("\"type\":\"cancel_paint\"") != std::string::npos)
         {
-            const int cancelled_active = cancel_active_mesh_first_batch_job("cancel_paint");
+            const int cancelled_active = cancel_executing_paint_jobs("cancel_paint");
             const int cancelled_queued = cancel_queued_paint_jobs("cancel_paint");
             return response_json(true,
                                  "paint_cancel_requested",
@@ -14794,24 +20122,67 @@ namespace
         }
         if (line.find("\"type\":\"shutdown\"") != std::string::npos)
         {
-            const int cancelled_active = force_cancel_active_mesh_first_batch_job("shutdown");
-            const int cancelled_queued = cancel_queued_paint_jobs("shutdown");
-            uninstall_process_event_hook();
+            // Close admission/listening before observing jobs.  A handler which
+            // was already accepted must pass the dispatch gate above and a paint
+            // request which already passed it remains covered by the request
+            // lease checked in wait_for_paint_pipeline_quiescent().
             request_bridge_stop();
+            const bool paint_request_was_in_progress =
+                g_paint_request_in_progress.load(std::memory_order_acquire);
+            const int cancelled_active = cancel_executing_paint_jobs("shutdown");
+            const int cancelled_queued = cancel_queued_paint_jobs("shutdown");
+            // BridgeClient allows 10 seconds, leaving transport margin around
+            // this native seven-second upper bound.
+            const bool active_quiescent =
+                wait_for_paint_pipeline_quiescent(std::chrono::seconds(7), "shutdown");
+            if (!active_quiescent)
+            {
+                return response_json(false,
+                                     "shutdown_paint_cancel_timeout",
+                                     0,
+                                     1,
+                                     "bridge shutdown is waiting for the active paint call to stop",
+                                     "\"cancelled_active_paint_jobs\":" + std::to_string(cancelled_active) +
+                                         ",\"cancelled_queued_paint_jobs\":" + std::to_string(cancelled_queued) +
+                                         ",\"paint_request_was_in_progress\":" +
+                                         std::string(json_bool(paint_request_was_in_progress)) +
+                                         ",\"active_paint_quiescent\":false");
+            }
+            uninstall_process_event_hook();
+            const bool callbacks_quiescent = wait_for_hook_callbacks_quiescent(std::chrono::milliseconds(500));
+            if (!callbacks_quiescent)
+            {
+                return response_json(false,
+                                     "shutdown_hook_callback_timeout",
+                                     0,
+                                     1,
+                                     "bridge shutdown is waiting for hook callbacks to stop",
+                                     "\"cancelled_active_paint_jobs\":" + std::to_string(cancelled_active) +
+                                         ",\"cancelled_queued_paint_jobs\":" + std::to_string(cancelled_queued) +
+                                         ",\"paint_request_was_in_progress\":" +
+                                         std::string(json_bool(paint_request_was_in_progress)) +
+                                         ",\"active_paint_quiescent\":true" +
+                                         ",\"hook_callbacks_quiescent\":false");
+            }
             return response_json(true,
                                  "shutdown",
                                  0,
                                  0,
                                  "bridge shutdown requested",
                                  "\"cancelled_active_paint_jobs\":" + std::to_string(cancelled_active) +
-                                     ",\"cancelled_queued_paint_jobs\":" + std::to_string(cancelled_queued));
+                                     ",\"cancelled_queued_paint_jobs\":" + std::to_string(cancelled_queued) +
+                                     ",\"paint_request_was_in_progress\":" +
+                                     std::string(json_bool(paint_request_was_in_progress)) +
+                                     ",\"active_paint_quiescent\":true" +
+                                     ",\"hook_callbacks_quiescent\":true");
         }
         if (line.find("\"type\":\"paint_full_route\"") != std::string::npos)
         {
             return paint_full_route_native(line);
         }
         if (line.find("\"type\":\"paint_replication_probe\"") != std::string::npos ||
-            line.find("\"type\":\"paint_replication_pressure_probe\"") != std::string::npos)
+            line.find("\"type\":\"paint_replication_pressure_probe\"") != std::string::npos ||
+            line.find("\"type\":\"paint_replication_texture_probe\"") != std::string::npos)
         {
             return paint_full_route_native(line);
         }
@@ -14901,6 +20272,7 @@ namespace
             g_active_client_handlers.fetch_add(1);
             std::thread(handle_bridge_client, client).detach();
         }
+        g_accepting_bridge_commands.store(false, std::memory_order_release);
         g_running.store(false);
         if (g_bridge_state.load() != BRIDGE_RUNTIME_FAILED)
         {
@@ -14912,15 +20284,35 @@ namespace
         }
         while (g_active_client_handlers.load() > 0)
         {
+            cancel_executing_paint_jobs("bridge_stopping");
+            cancel_queued_paint_jobs("bridge_stopping");
+            post_paint_dispatch_message();
             Sleep(50);
         }
+        // A timed-out paint handler may have returned while its game-thread
+        // cancellation was still pending.  Keep the old hook alive until that
+        // work reaches a terminal state; never tear it down underneath planning
+        // or an internal UE call.
+        while (!wait_for_paint_pipeline_quiescent(std::chrono::seconds(1), "bridge_stopping"))
+        {
+        }
+        stop_auto_event_watch_and_join();
         WSACleanup();
         uninstall_process_event_hook();
-        if (g_bridge_state.load() != BRIDGE_RUNTIME_FAILED)
+        while (!wait_for_hook_callbacks_quiescent(std::chrono::seconds(1)))
         {
-            g_bridge_state.store(BRIDGE_RUNTIME_STOPPED);
         }
-        g_bridge_thread_done.store(true);
+        reset_auto_event_watch_state();
+        {
+            std::lock_guard<std::mutex> start_lock(g_bridge_start_mutex);
+            g_bound_port.store(0);
+            if (g_bridge_state.load() != BRIDGE_RUNTIME_FAILED)
+            {
+                g_bridge_state.store(BRIDGE_RUNTIME_STOPPED);
+            }
+            g_bridge_started.store(false, std::memory_order_release);
+            g_bridge_thread_done.store(true, std::memory_order_release);
+        }
     }
 }
 
@@ -14978,6 +20370,7 @@ namespace
     {
         g_bridge_last_win32.store(winsock_error != 0 ? winsock_error : win32_error);
         g_bridge_state.store(BRIDGE_RUNTIME_FAILED);
+        g_accepting_bridge_commands.store(false, std::memory_order_release);
         g_running.store(false);
         g_bridge_thread_done.store(true);
         write_start_result(remote_block, input, state, 0, win32_error, winsock_error);
@@ -15001,6 +20394,23 @@ extern "C" __declspec(dllexport) DWORD WINAPI BridgeStartV1(void* remote_block)
         return ERROR_INVALID_DATA;
     }
 
+    if (g_bridge_started.load(std::memory_order_acquire) &&
+        g_bridge_state.load(std::memory_order_acquire) == BRIDGE_RUNTIME_STOPPING)
+    {
+        // Shutdown replies are written by a client handler just before the
+        // listener thread publishes STOPPED.  A same-module reinjection should
+        // wait for that short rundown instead of permanently rejecting the
+        // already-loaded DLL as "already started".
+        // Existing accepted clients have a five-second receive timeout; leave
+        // room for their guards plus callback rundown while remaining below the
+        // injector's 15-second remote-start timeout.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        while (!g_bridge_thread_done.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline)
+        {
+            Sleep(10);
+        }
+    }
     std::lock_guard<std::mutex> lock(g_bridge_start_mutex);
     if (g_bridge_started.load())
     {
@@ -15013,6 +20423,10 @@ extern "C" __declspec(dllexport) DWORD WINAPI BridgeStartV1(void* remote_block)
         return ERROR_ALREADY_EXISTS;
     }
 
+    // Texture deltas are research evidence scoped to one authenticated bridge
+    // instance. A same-module restart must not treat the previous instance's
+    // final snapshot as the new instance's baseline.
+    mesh_first_clear_research_texture_snapshot();
     g_bridge_state.store(BRIDGE_RUNTIME_STARTING);
 
     WSADATA data{};
@@ -15072,6 +20486,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI BridgeStartV1(void* remote_block)
     g_bridge_state.store(BRIDGE_RUNTIME_LISTENING);
     g_bridge_thread_done.store(false);
     g_running.store(true);
+    g_accepting_bridge_commands.store(true, std::memory_order_release);
     g_bridge_started.store(true);
     try
     {
@@ -15080,6 +20495,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI BridgeStartV1(void* remote_block)
     catch (...)
     {
         g_bridge_started.store(false);
+        g_accepting_bridge_commands.store(false, std::memory_order_release);
         g_running.store(false);
         if (g_listener.exchange(INVALID_SOCKET) == listener)
         {

@@ -70,7 +70,14 @@ helper still needed for issue triage.
   lifecycle.
 - C# / WebView2 / bridge IPC command names and response shape.
 - UE object scanning, reflection lookup, `ProcessEvent`, and RPC wrappers.
-- `ServerPackedPaintBatch` default route and packed payload layout.
+- `ServerPackedPaintBatch` default route, packed payload layout, and validated
+  internal anti-echo local apply.
+- Packed mesh-anchor radius units: UV radius and effective world radius are
+  distinct fields. Production calibrates the normalized radius from the
+  validated runtime mesh/local-UV scale and live bounds, then uses a
+  non-positive world-radius sentinel for receiver-side conversion.
+- Packed effective subdivision fields are level/pixel-size/template-resolution,
+  not diameter metadata; production sends all-zero native-preflight sentinels.
 - Async paint lifecycle, queue draining, cancellation, and pawn/component guards.
 - Preview/unpreview texture import/export and local snapshot behavior.
 - Runtime asset cache repair, startup diagnostics, injector diagnostics, and

@@ -37,9 +37,11 @@ public sealed record RgbColor(byte R, byte G, byte B)
 
 public sealed class PaintSettings
 {
-    public double StrokeSizeTexels { get; set; } = 5.0;
-    public double CoverageStepTexels { get; set; } = 5.0;
-    public int PackedBatchDelayMs { get; set; } = 75;
+    public double Brush1SizeTexels { get; set; } = 20.0;
+    public double Brush2SizeTexels { get; set; } = 10.0;
+    public double CoverageStepTexels { get; set; } = 10.0;
+    public int PackedBatchLimit { get; set; } = 20;
+    public int PackedBatchPacingMs { get; set; } = 50;
     public double SideSourceMaxUv { get; set; } = 0.08;
     public double FrontBackSourceMaxUv { get; set; } = 0.45;
     public RegionMode FrontRegionMode { get; set; } = RegionMode.Fill;
@@ -60,7 +62,7 @@ public sealed class PaintSettings
 
 public sealed class AppSettings
 {
-    public const int CurrentLayoutVersion = 34;
+    public const int CurrentLayoutVersion = 37;
     public int LayoutVersion { get; set; } = CurrentLayoutVersion;
     public double PanelX { get; set; } = -1.0;
     public double PanelY { get; set; } = -1.0;

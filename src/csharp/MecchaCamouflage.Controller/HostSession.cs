@@ -7,13 +7,14 @@ namespace MecchaCamouflage.Controller;
 public sealed class HostSession
 {
     private const int DefaultPackedBatchLimit = 20;
-    private const int DefaultPackedPacingMs = 75;
+    private const int DefaultPackedPacingMs = 50;
 
     private static readonly string[] ResetKeys =
     [
-        "paint.brushSizeTexels",
-        "paint.packedBatchDelayMs",
-        "paint.coverageStepTexels",
+        "paint.brush1SizeTexels",
+        "paint.brush2SizeTexels",
+        "paint.packedBatchLimit",
+        "paint.packedBatchPacingMs",
         "paint.autoMaterial",
         "paint.metallic",
         "paint.roughness",
@@ -56,12 +57,15 @@ public sealed class HostSession
     private bool finalProgressLogged;
     private bool currentProgressIsServerPaint;
     private bool nativePaintMayBeRunning;
+    private readonly object replayPassLogGate = new();
+    private readonly HashSet<string> loggedReplayPasses = new(StringComparer.Ordinal);
 
     public async Task<UiSnapshot> GetSnapshotAsync(CancellationToken cancellationToken = default)
     {
         using var process = Runtime.FindGameProcess(Settings.GameProcessName);
         var ping = await Runtime.PingAsync(cancellationToken, RuntimeBridgeService.BridgeProbeTimeout);
         var progress = ReadCurrentProgressSnapshot(liveOnly: true);
+        LogReplayPassTransition(progress);
         var bridgeReady = process is not null &&
             Runtime.IsConnected &&
             ping.Ok &&
@@ -159,9 +163,11 @@ public sealed class HostSession
                 return new HostCommandResult(true);
             case "paint.geometry":
             case "geometry":
-                next.Paint.StrokeSizeTexels = defaults.Paint.StrokeSizeTexels;
-                next.Paint.CoverageStepTexels = defaults.Paint.StrokeSizeTexels;
-                next.Paint.PackedBatchDelayMs = defaults.Paint.PackedBatchDelayMs;
+                next.Paint.Brush1SizeTexels = defaults.Paint.Brush1SizeTexels;
+                next.Paint.Brush2SizeTexels = defaults.Paint.Brush2SizeTexels;
+                next.Paint.CoverageStepTexels = defaults.Paint.Brush2SizeTexels;
+                next.Paint.PackedBatchLimit = defaults.Paint.PackedBatchLimit;
+                next.Paint.PackedBatchPacingMs = defaults.Paint.PackedBatchPacingMs;
                 break;
             case "paint.material":
             case "material":
@@ -235,6 +241,7 @@ public sealed class HostSession
         currentPaintStartedAt = DateTimeOffset.UtcNow;
         currentProgressIsServerPaint = !previewOnly && !unpreviewOnly;
         finalProgressLogged = false;
+        ResetReplayPassLog();
         TryDeleteProgressSnapshot();
         try
         {
@@ -422,8 +429,10 @@ public sealed class HostSession
             return "Preview: no active preview to restore.";
         if (lower is "mesh_unpreview_component_mismatch")
             return "The saved preview belongs to a different mesh.";
+        if (lower.Contains("strokes were submitted, but local rendering failed"))
+            return "Paint: strokes were sent, but local rendering failed. Do not retry automatically.";
         if (lower is "mesh_local_visual_sync_failed")
-            return "Paint: completed, but local preview failed.";
+            return "Paint: strokes were sent, but local rendering failed. Do not retry automatically.";
         if (lower is "mesh_paint_context_changed" || lower.Contains("paint_context_changed"))
             return "Paint: stopped because the game paint component changed.";
         if (lower.Contains("game paint component is no longer available"))
@@ -442,6 +451,9 @@ public sealed class HostSession
             return "Paint failed because strokes could not be packed.";
         if (lower is "mesh_server_packed_source_id_unavailable" || lower.Contains("source id is unavailable"))
             return "Packed multiplayer paint source id is unavailable.";
+        if (lower is "mesh_internal_no_resend_resolver_failed" ||
+            (lower.Contains("internal no-resend route") && lower.Contains("failed")))
+            return "Paint: this game build is not supported.";
         if (lower is "mesh_server_batch_failed")
             return "Paint: failed while sending strokes.";
 
@@ -463,29 +475,35 @@ public sealed class HostSession
     {
         var defaults = new AppSettings();
         var percent = 0.0;
+        var progressSource = "";
+        var pass = "-";
+        var passProgress = "-";
+        var passEta = "-";
         var eta = "-";
         var elapsed = "-";
         var batch = "-";
-        var delay = "-";
-        var timingLabel = "delay";
+        var pacing = "-";
         var queue = "-";
         if (progress is not null)
         {
             percent = progress.TotalSteps > 0
                 ? Math.Clamp(progress.Step * 100.0 / progress.TotalSteps, 0.0, 100.0)
                 : Math.Clamp(progress.Progress * 100.0, 0.0, 100.0);
+            progressSource = progress.ReplayProgressSource;
+            pass = ReplayPassLabel(progress.ReplayCurrentPass);
+            passProgress = FormatReplayPassProgress(progress);
+            passEta = FormatDuration(progress.ReplayCurrentPassEtaMs);
             eta = FormatEta(progress);
             elapsed = FormatDuration(progress.PaintElapsedMs);
             batch = FormatBatch(progress);
-            delay = FormatDelay(progress);
-            timingLabel = TimingLabel(progress);
+            pacing = FormatPacing(progress);
             queue = FormatQueue(progress);
         }
 
         return new UiSnapshot(
             VersionInfo.Current,
             Settings.Language,
-            new RuntimeSnapshot(process, bridge, service, percent, eta, elapsed, batch, delay, timingLabel, queue, Log.Text, PaintRunning, progress is not null, DiagnosticsState.Snapshot(Paths)),
+            new RuntimeSnapshot(process, bridge, service, percent, progressSource, pass, passProgress, passEta, eta, elapsed, batch, pacing, queue, Log.Text, PaintRunning, progress is not null, DiagnosticsState.Snapshot(Paths)),
             ToSnapshot(Settings),
             ToSnapshot(defaults),
             BuildResetSnapshot(Settings, defaults),
@@ -498,9 +516,10 @@ public sealed class HostSession
         var paint = settings.Paint;
         return new SettingsSnapshot(
             new PaintSnapshot(
-                paint.StrokeSizeTexels,
-                paint.PackedBatchDelayMs,
-                paint.CoverageStepTexels,
+                paint.Brush1SizeTexels,
+                paint.Brush2SizeTexels,
+                paint.PackedBatchLimit,
+                paint.PackedBatchPacingMs,
                 paint.AutoMaterial,
                 paint.Metallic,
                 paint.Roughness,
@@ -534,13 +553,11 @@ public sealed class HostSession
         return batch > 0 ? batch.ToString(System.Globalization.CultureInfo.InvariantCulture) : "-";
     }
 
-    private static string FormatDelay(ProgressSnapshot progress)
+    private static string FormatPacing(ProgressSnapshot progress)
     {
-        var delay = EffectiveDelay(progress);
-        return delay >= 0 ? $"{delay}ms" : "-";
+        var pacing = EffectivePacing(progress);
+        return pacing >= 0 ? $"{pacing}ms" : "-";
     }
-
-    private static string TimingLabel(ProgressSnapshot _) => "delay";
 
     private static int EffectiveBatch(ProgressSnapshot progress)
     {
@@ -551,28 +568,37 @@ public sealed class HostSession
         return DefaultPackedBatchLimit;
     }
 
-    private static int EffectiveDelay(ProgressSnapshot progress)
+    private static int EffectivePacing(ProgressSnapshot progress)
     {
-        if (progress.ReplicationPacingEnabled && progress.ReplicationPacingDelayMs > 0)
-            return progress.ReplicationPacingDelayMs;
-        if (progress.ServerBatchDelayMs > 0)
-            return progress.ServerBatchDelayMs;
+        if (progress.ReplicationPacingEnabled && progress.ReplicationPacingMs > 0)
+            return progress.ReplicationPacingMs;
+        if (progress.ServerBatchPacingMs > 0)
+            return progress.ServerBatchPacingMs;
         return DefaultPackedPacingMs;
     }
 
     private static string FormatQueue(ProgressSnapshot progress)
     {
-        if (progress.ReplicationQueuedStrokeCount < 0)
+        var queueCount = string.Equals(progress.ReplayProgressSource, "receiver_queue_drain", StringComparison.OrdinalIgnoreCase) &&
+                         progress.LocalPackedQueueDrainCurrentQueue >= 0
+            ? progress.LocalPackedQueueDrainCurrentQueue
+            : progress.ReplicationQueuedStrokeCount;
+        if (queueCount < 0)
             return "-";
-        var strokes = progress.ReplicationQueuedStrokeCount == 1 ? "stroke" : "strokes";
-        if (progress.ReplicationPacingQueueDrainStrokesPerSec > 0.0 && double.IsFinite(progress.ReplicationPacingQueueDrainStrokesPerSec))
+        var strokes = queueCount == 1 ? "stroke" : "strokes";
+        var drainRate = string.Equals(progress.ReplayProgressSource, "receiver_queue_drain", StringComparison.OrdinalIgnoreCase) &&
+                        progress.LocalPackedQueueDrainStrokesPerSec > 0.0 &&
+                        double.IsFinite(progress.LocalPackedQueueDrainStrokesPerSec)
+            ? progress.LocalPackedQueueDrainStrokesPerSec
+            : progress.ReplicationPacingQueueDrainStrokesPerSec;
+        if (drainRate > 0.0 && double.IsFinite(drainRate))
         {
-            var drain = progress.ReplicationPacingQueueDrainStrokesPerSec >= 10.0
-                ? Math.Round(progress.ReplicationPacingQueueDrainStrokesPerSec).ToString(System.Globalization.CultureInfo.InvariantCulture)
-                : Math.Round(progress.ReplicationPacingQueueDrainStrokesPerSec, 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
-            return $"{progress.ReplicationQueuedStrokeCount} {strokes} (drain {drain}/s)";
+            var drain = drainRate >= 10.0
+                ? Math.Round(drainRate).ToString(System.Globalization.CultureInfo.InvariantCulture)
+                : Math.Round(drainRate, 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return $"{queueCount} {strokes} (drain {drain}/s)";
         }
-        return $"{progress.ReplicationQueuedStrokeCount} {strokes}";
+        return $"{queueCount} {strokes}";
     }
 
     private static ResetSnapshot BuildResetSnapshot(AppSettings settings, AppSettings defaults)
@@ -580,7 +606,7 @@ public sealed class HostSession
         var map = ResetKeys.ToDictionary(key => key, key => !SettingEquals(settings, defaults, key), StringComparer.OrdinalIgnoreCase);
         var sections = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
         {
-            ["paint.geometry"] = map["paint.brushSizeTexels"] || map["paint.coverageStepTexels"] || map["paint.packedBatchDelayMs"],
+            ["paint.geometry"] = map["paint.brush1SizeTexels"] || map["paint.brush2SizeTexels"] || map["paint.packedBatchLimit"] || map["paint.packedBatchPacingMs"],
             ["paint.material"] = map["paint.autoMaterial"] || map["paint.metallic"] || map["paint.roughness"],
             ["regions"] = map["paint.frontRegionMode"] || map["paint.sideRegionMode"] || map["paint.backRegionMode"],
             ["fill.material"] = map["paint.fillColor"] || map["paint.fillMetallic"] || map["paint.fillRoughness"],
@@ -592,9 +618,10 @@ public sealed class HostSession
 
     private static bool SettingEquals(AppSettings left, AppSettings right, string key) => key switch
     {
-        "paint.brushSizeTexels" => Nearly(left.Paint.StrokeSizeTexels, right.Paint.StrokeSizeTexels),
-        "paint.packedBatchDelayMs" => left.Paint.PackedBatchDelayMs == right.Paint.PackedBatchDelayMs,
-        "paint.coverageStepTexels" => Nearly(left.Paint.CoverageStepTexels, right.Paint.CoverageStepTexels),
+        "paint.brush1SizeTexels" => Nearly(left.Paint.Brush1SizeTexels, right.Paint.Brush1SizeTexels),
+        "paint.brush2SizeTexels" => Nearly(left.Paint.Brush2SizeTexels, right.Paint.Brush2SizeTexels),
+        "paint.packedBatchLimit" => left.Paint.PackedBatchLimit == right.Paint.PackedBatchLimit,
+        "paint.packedBatchPacingMs" => left.Paint.PackedBatchPacingMs == right.Paint.PackedBatchPacingMs,
         "paint.autoMaterial" => left.Paint.AutoMaterial == right.Paint.AutoMaterial,
         "paint.metallic" => Nearly(left.Paint.Metallic, right.Paint.Metallic),
         "paint.roughness" => Nearly(left.Paint.Roughness, right.Paint.Roughness),
@@ -619,13 +646,13 @@ public sealed class HostSession
     {
         switch (key)
         {
-            case "paint.brushSizeTexels":
-            case "paint.coverageStepTexels":
-                settings.Paint.StrokeSizeTexels = defaults.Paint.StrokeSizeTexels;
-                settings.Paint.CoverageStepTexels = defaults.Paint.StrokeSizeTexels;
-                settings.Paint.PackedBatchDelayMs = defaults.Paint.PackedBatchDelayMs;
+            case "paint.brush1SizeTexels": settings.Paint.Brush1SizeTexels = defaults.Paint.Brush1SizeTexels; break;
+            case "paint.brush2SizeTexels":
+                settings.Paint.Brush2SizeTexels = defaults.Paint.Brush2SizeTexels;
+                settings.Paint.CoverageStepTexels = defaults.Paint.Brush2SizeTexels;
                 break;
-            case "paint.packedBatchDelayMs": settings.Paint.PackedBatchDelayMs = defaults.Paint.PackedBatchDelayMs; break;
+            case "paint.packedBatchLimit": settings.Paint.PackedBatchLimit = defaults.Paint.PackedBatchLimit; break;
+            case "paint.packedBatchPacingMs": settings.Paint.PackedBatchPacingMs = defaults.Paint.PackedBatchPacingMs; break;
             case "paint.autoMaterial": settings.Paint.AutoMaterial = defaults.Paint.AutoMaterial; break;
             case "paint.metallic": settings.Paint.Metallic = defaults.Paint.Metallic; break;
             case "paint.roughness": settings.Paint.Roughness = defaults.Paint.Roughness; break;
@@ -651,12 +678,13 @@ public sealed class HostSession
     {
         switch (key)
         {
-            case "paint.brushSizeTexels":
-            case "paint.coverageStepTexels":
-                settings.Paint.StrokeSizeTexels = value.GetDouble();
-                settings.Paint.CoverageStepTexels = settings.Paint.StrokeSizeTexels;
+            case "paint.brush1SizeTexels": settings.Paint.Brush1SizeTexels = value.GetDouble(); break;
+            case "paint.brush2SizeTexels":
+                settings.Paint.Brush2SizeTexels = value.GetDouble();
+                settings.Paint.CoverageStepTexels = settings.Paint.Brush2SizeTexels;
                 break;
-            case "paint.packedBatchDelayMs": settings.Paint.PackedBatchDelayMs = value.GetInt32(); break;
+            case "paint.packedBatchLimit": settings.Paint.PackedBatchLimit = RoundedInteger(value); break;
+            case "paint.packedBatchPacingMs": settings.Paint.PackedBatchPacingMs = RoundedInteger(value); break;
             case "paint.autoMaterial": settings.Paint.AutoMaterial = value.GetBoolean(); break;
             case "paint.metallic": settings.Paint.Metallic = value.GetDouble(); break;
             case "paint.roughness": settings.Paint.Roughness = value.GetDouble(); break;
@@ -687,6 +715,15 @@ public sealed class HostSession
         }
     }
 
+    private static int RoundedInteger(JsonElement value)
+    {
+        if (value.ValueKind != JsonValueKind.Number)
+            throw new ArgumentException("Integer setting must be numeric.");
+        if (value.TryGetInt32(out var exact))
+            return exact;
+        return checked((int)Math.Round(value.GetDouble(), MidpointRounding.AwayFromZero));
+    }
+
     private static RegionMode ParseRegionMode(string? value)
     {
         if (Enum.TryParse<RegionMode>(value, true, out var mode) && Enum.IsDefined(mode))
@@ -712,14 +749,30 @@ public sealed class HostSession
     {
         if (currentPaintStartedAt == DateTimeOffset.MinValue)
             return null;
-        var progress = ReadProgressSnapshot(Runtime.ProgressPath, out var writeTime);
-        if (progress is null)
+        var preferredPath = Runtime.ProgressPath;
+        var hasPreferredPath = !string.IsNullOrWhiteSpace(preferredPath);
+        ProgressSnapshot? progress;
+        DateTimeOffset writeTime;
+        if (hasPreferredPath)
+        {
+            // The configured path belongs to the authenticated bridge instance.
+            // Until its first atomic snapshot appears (or if it is malformed),
+            // show no progress rather than borrowing another instance's file.
+            progress = ReadProgressSnapshot(preferredPath, out writeTime);
+            if (progress is null)
+                return null;
+        }
+        else
+        {
             progress = ReadFallbackProgressSnapshot(out writeTime);
+        }
         if (progress is null)
             return null;
         var cutoff = currentPaintStartedAt.AddSeconds(-1);
         if (writeTime < cutoff)
         {
+            if (hasPreferredPath)
+                return null;
             progress = ReadFallbackProgressSnapshot(out writeTime);
             if (progress is null || writeTime < cutoff)
                 return null;
@@ -817,6 +870,7 @@ public sealed class HostSession
         var progress = ReadCurrentProgressSnapshot(liveOnly: false);
         if (progress is null)
             return;
+        LogReplayPassTransition(progress);
         var line = FormatProgressLogLine(progress);
         if (line.Length == 0)
             return;
@@ -833,6 +887,7 @@ public sealed class HostSession
         var progress = ReadCurrentProgressSnapshot(liveOnly: false);
         if (progress is null || !ShouldLogFailureProgress(progress))
             return;
+        LogReplayPassTransition(progress);
         var line = FormatProgressLogLine(progress);
         if (line.Length == 0)
             return;
@@ -848,13 +903,88 @@ public sealed class HostSession
                phase.StartsWith("mesh_paint_", StringComparison.OrdinalIgnoreCase);
     }
 
+    private void ResetReplayPassLog()
+    {
+        lock (replayPassLogGate)
+            loggedReplayPasses.Clear();
+    }
+
+    private void LogReplayPassTransition(ProgressSnapshot? progress)
+    {
+        if (!currentProgressIsServerPaint || progress is null)
+            return;
+        var key = progress.ReplayCurrentPass.Trim().ToLowerInvariant();
+        if (key is not ("fill" or "coarse_paint" or "fine_paint" or "complete"))
+            return;
+        lock (replayPassLogGate)
+        {
+            if (!loggedReplayPasses.Add(key))
+                return;
+        }
+        var stage = ReplayProgressStageLabel(progress.ReplayProgressSource);
+        var stageSuffix = stage.Length > 0 ? $" ({stage})" : "";
+        Log.Info($"Paint: pass {ReplayPassLabel(key)}{stageSuffix}.");
+    }
+
     private string FormatProgressLogLine(ProgressSnapshot progress)
     {
         var percent = progress.TotalSteps > 0
             ? Math.Clamp(progress.Step * 100.0 / progress.TotalSteps, 0.0, 100.0)
             : Math.Clamp(progress.Progress * 100.0, 0.0, 100.0);
         var rounded = (int)Math.Round(percent);
-        return $"Paint: {rounded}% {ProgressBar(rounded)} | batch {FormatBatch(progress)} | {TimingLabel(progress)} {FormatDelay(progress)} | queue {FormatQueue(progress)} | ETA {FormatEta(progress)} | elapsed {FormatDuration(progress.PaintElapsedMs)}";
+        var pass = FormatReplayPass(progress);
+        return $"Paint: overall {rounded}% {ProgressBar(rounded)} | pass {pass} | pass ETA {FormatDuration(progress.ReplayCurrentPassEtaMs)} | total ETA {FormatEta(progress)} | batch {FormatBatch(progress)} | pacing {FormatPacing(progress)} | queue {FormatQueue(progress)} | elapsed {FormatDuration(progress.PaintElapsedMs)}";
+    }
+
+    private static string FormatReplayPass(ProgressSnapshot progress)
+    {
+        var stage = ReplayProgressStageLabel(progress.ReplayProgressSource);
+        var pass = ReplayPassLabel(progress.ReplayCurrentPass);
+        var passProgress = FormatReplayPassProgress(progress);
+        return string.Join(' ', new[] { stage, pass, passProgress }.Where(value => !string.IsNullOrWhiteSpace(value) && value != "-")) switch
+        {
+            "" => "-",
+            var detail => detail
+        };
+    }
+
+    private static string ReplayPassLabel(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "fill" => "Fill",
+        "coarse_paint" => "Brush 1",
+        "fine_paint" => "Brush 2",
+        "complete" => "Complete",
+        "" => "-",
+        _ => value.Trim()
+    };
+
+    private static string ReplayProgressStageLabel(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "receiver_queue_drain" => "painting",
+        "submission" => "queueing",
+        _ => ""
+    };
+
+    private static string FormatReplayPassProgress(ProgressSnapshot progress)
+    {
+        var pass = ReplayPassLabel(progress.ReplayCurrentPass);
+        var completed = progress.ReplayCurrentPassCompleted;
+        var total = progress.ReplayCurrentPassTotal;
+        if (total < 0 && progress.ReplayCurrentPassStart >= 0 && progress.ReplayCurrentPassEnd >= progress.ReplayCurrentPassStart)
+        {
+            total = progress.ReplayCurrentPassEnd - progress.ReplayCurrentPassStart;
+            completed = Math.Clamp(progress.Step - progress.ReplayCurrentPassStart, 0, total);
+        }
+        if (pass == "Complete" && total <= 0 && progress.TotalSteps > 0)
+        {
+            completed = progress.TotalSteps;
+            total = progress.TotalSteps;
+        }
+        if (total <= 0)
+            return pass == "Complete" ? "100%" : "-";
+        completed = Math.Clamp(completed, 0, total);
+        var percent = (int)Math.Round(completed * 100.0 / total);
+        return $"{completed}/{total} ({percent}%)";
     }
 
     private static string ProgressBar(int percent)
@@ -882,15 +1012,17 @@ public sealed class HostSession
                 Int(root, "total_steps", Int(root, "total_strokes", 0)),
                 Number(root, "progress", 0.0),
                 Int(root, "server_batch_limit", -1),
-                Int(root, "server_batch_delay_ms", -1),
+                Int(root, "server_batch_pacing_ms", Int(root, "server_batch_delay_ms", -1)),
                 Number(root, "paint_eta_ms", -1.0),
                 Number(root, "paint_elapsed_ms", Number(root, "elapsed_ms", -1.0)),
                 Bool(root, "replication_pacing_enabled", Bool(root, "adaptive_batch_enabled", false)),
                 Int(root, "replication_pacing_requested_batch_limit", Int(root, "adaptive_requested_batch_limit", -1)),
                 Int(root, "replication_pacing_resolved_batch_limit", Int(root, "adaptive_resolved_batch_limit", -1)),
-                Int(root, "replication_pacing_requested_delay_ms", Int(root, "adaptive_requested_delay_ms", -1)),
+                Int(root, "replication_pacing_requested_ms",
+                    Int(root, "replication_pacing_requested_delay_ms", Int(root, "adaptive_requested_delay_ms", -1))),
                 Int(root, "replication_pacing_batch_limit", Int(root, "adaptive_batch_limit", -1)),
-                Int(root, "replication_pacing_delay_ms", Int(root, "adaptive_delay_ms", -1)),
+                Int(root, "replication_pacing_ms",
+                    Int(root, "replication_pacing_delay_ms", Int(root, "adaptive_delay_ms", -1))),
                 Text(root, "replication_pacing_pressure_level", Text(root, "adaptive_pressure_level", "unknown")),
                 Int(root, "replication_pacing_backoff_count", Int(root, "adaptive_backoff_count", 0)),
                 Number(root, "replication_pacing_queue_drain_strokes_per_sec", Number(root, "adaptive_queue_drain_strokes_per_sec", -1.0)),
@@ -899,7 +1031,18 @@ public sealed class HostSession
                 Int(root, "replication_queued_batch_count", -1),
                 Int(root, "replication_queued_stroke_count", -1),
                 Int(root, "replication_max_strokes_per_tick", -1),
-                Number(root, "replication_estimated_ticks_to_drain", -1.0));
+                Number(root, "replication_estimated_ticks_to_drain", -1.0),
+                Text(root, "replay_current_pass", ""),
+                Int(root, "replay_current_pass_start", -1),
+                Int(root, "replay_current_pass_end", -1),
+                Int(root, "replay_server_offset", -1),
+                Int(root, "replay_local_offset", -1),
+                Text(root, "replay_progress_source", ""),
+                Int(root, "replay_current_pass_completed", -1),
+                Int(root, "replay_current_pass_total", -1),
+                Number(root, "replay_current_pass_eta_ms", -1.0),
+                Int(root, "local_packed_queue_drain_current_queue", -1),
+                Number(root, "local_packed_queue_drain_strokes_per_sec", -1.0));
         }
         catch
         {

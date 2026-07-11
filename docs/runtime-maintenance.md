@@ -103,16 +103,30 @@ directory.
 
 ## Paint Replication Rules
 
-Normal paint uses the packed component route. Do not reintroduce automatic
-fallback to old compact/adaptive/send-custom routes.
+Normal paint uses the packed component route plus the validated native packed
+receiver queue for painter-local submission. Do not invoke the reflected
+multicast UFunction for local application, and do not reintroduce automatic
+fallback to the per-stroke internal-common, compact/adaptive/send-custom, or
+reflected `PaintAtUVWithBrush` routes.
 
-If the packed route cannot be prepared, fail with diagnostic metadata instead
-of silently changing routes.
+If either half of the route cannot be prepared, fail with diagnostic metadata
+before the first packed submission instead of silently changing routes.
 
 When changing replication behavior, verify host and joining-client behavior
 separately. Painter-side completion is not enough; a normal other client must
 also receive the final result without returning to the old multi-minute drain
 path.
+
+### Game-update revalidation
+
+The native packed receiver route is exact-build gated. After any game update,
+do not copy old RVAs forward. Recompute and record the PE timestamp, image size,
+checksum, raw `.text` size/hash, reflected `MulticastPackedPaintBatch` payload
+layout, UFunction thunk, vtable slot, decoder, source-ID filter,
+component-to-manager resolver, enqueue/coalescer chain, manager queue offsets,
+and runtime-triangle `TArray` offset/stride. Then repeat both multiplayer
+directions with event-watch, pressure/queue samples, and painter/receiver
+texture checksums. A mismatch must remain fail-closed before the first RPC.
 
 ## Bridge File Structure
 

@@ -163,15 +163,24 @@ function buildProgressLine(runtime) {
     return "";
   }
   const percent = Math.max(0, Math.min(100, Math.round(runtime.progressPercent)));
-  const timingLabel = runtime.timingLabel || "delay";
+  const passStage = runtime.paintProgressSource === "receiver_queue_drain"
+    ? "painting"
+    : runtime.paintProgressSource === "submission"
+      ? "queueing"
+      : "";
+  const pass = [passStage, runtime.paintPass, runtime.paintPassProgress]
+    .filter(value => value && value !== "-")
+    .join(" ");
   const detail = [
+    `pass ${pass || "-"}`,
+    `pass ETA ${runtime.paintPassEta || "-"}`,
+    `total ETA ${runtime.paintEta || "-"}`,
     `batch ${runtime.batch || "-"}`,
-    `${timingLabel} ${runtime.delay || "-"}`,
+    `pacing ${runtime.pacing || "-"}`,
     `queue ${runtime.queue || "-"}`,
-    `ETA ${runtime.paintEta || "-"}`,
     `elapsed ${runtime.paintElapsed || "-"}`
   ].join(" | ");
-  return `${logPrefix("INFO")} Paint: ${percent}% ${progressBar(percent)} | ${detail}`;
+  return `${logPrefix("INFO")} Paint: overall ${percent}% ${progressBar(percent)} | ${detail}`;
 }
 
 function progressBar(percent) {
@@ -256,8 +265,10 @@ function statusClass(value) {
 
 function renderSettings(snapshot) {
   const paint = snapshot.settings.paint;
-  setNumberPair("brush-size", "brush-size-number", paint.brushSizeTexels);
-  setNumberPair("packed-batch-delay", "packed-batch-delay-number", paint.packedBatchDelayMs);
+  setNumberPair("brush-1-size", "brush-1-size-number", paint.brush1SizeTexels);
+  setNumberPair("brush-2-size", "brush-2-size-number", paint.brush2SizeTexels);
+  setNumberPair("packed-batch-limit", "packed-batch-limit-number", paint.packedBatchLimit);
+  setNumberPair("packed-batch-pacing", "packed-batch-pacing-number", paint.packedBatchPacingMs);
   setChecked("auto-material", paint.autoMaterial);
   setNumberPair("metallic", "metallic-number", paint.metallic);
   setNumberPair("roughness", "roughness-number", paint.roughness);
@@ -298,6 +309,13 @@ function renderSettings(snapshot) {
 
   const materialLocked = paint.autoMaterial || !editing;
   setDisabled(["metallic", "metallic-number", "roughness", "roughness-number"], materialLocked);
+
+  setDisabled([
+    "packed-batch-limit",
+    "packed-batch-limit-number",
+    "packed-batch-pacing",
+    "packed-batch-pacing-number"
+  ], !editing);
 
   const fillLocked = !editing || !usesFill(paint);
   byId("fill-section").classList.toggle("disabled", !usesFill(paint));
@@ -460,9 +478,6 @@ function setDraftSetting(key, value) {
     node = node[path[index]];
   }
   node[path.at(-1)] = value;
-  if (key === "paint.brushSizeTexels") {
-    draftSnapshot.settings.paint.coverageStepTexels = value;
-  }
 }
 
 function getSnapshotSetting(snapshot, key) {
@@ -487,8 +502,10 @@ function snapshotPath(key) {
 function diffSnapshots(before, after) {
   const keys = [
     "app.language",
-    "paint.brushSizeTexels",
-    "paint.packedBatchDelayMs",
+    "paint.brush1SizeTexels",
+    "paint.brush2SizeTexels",
+    "paint.packedBatchLimit",
+    "paint.packedBatchPacingMs",
     "paint.autoMaterial",
     "paint.metallic",
     "paint.roughness",
@@ -534,12 +551,19 @@ function bindRangePair(sliderId, numberId, key, transform = Number) {
     if (!Number.isFinite(raw)) {
       return;
     }
-    const clamped = clamp(raw, Number(source.min), Number(source.max));
-    slider.value = String(clamped);
-    number.value = fmt(clamped);
-    setDraftSetting(key, transform(clamped));
+    const minimum = Number(source.min);
+    const maximum = Number(source.max);
+    const step = Number(source.step);
+    const clamped = clamp(raw, minimum, maximum);
+    const stepped = Number.isFinite(step) && step > 0
+      ? minimum + Math.round((clamped - minimum) / step) * step
+      : clamped;
+    const normalized = clamp(stepped, minimum, maximum);
+    slider.value = String(normalized);
+    number.value = fmt(normalized);
+    setDraftSetting(key, transform(normalized));
     if (key === "app.opacity") {
-      send("previewWindow", { opacity: transform(clamped) }).catch(error => showError(error.message || String(error)));
+      send("previewWindow", { opacity: transform(normalized) }).catch(error => showError(error.message || String(error)));
     }
   };
   slider.addEventListener("input", () => commit(slider));
@@ -671,8 +695,10 @@ function toast(message, level = "success") {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  bindRangePair("brush-size", "brush-size-number", "paint.brushSizeTexels");
-  bindRangePair("packed-batch-delay", "packed-batch-delay-number", "paint.packedBatchDelayMs");
+  bindRangePair("brush-1-size", "brush-1-size-number", "paint.brush1SizeTexels");
+  bindRangePair("brush-2-size", "brush-2-size-number", "paint.brush2SizeTexels");
+  bindRangePair("packed-batch-limit", "packed-batch-limit-number", "paint.packedBatchLimit");
+  bindRangePair("packed-batch-pacing", "packed-batch-pacing-number", "paint.packedBatchPacingMs");
   bindCheckbox("auto-material", "paint.autoMaterial");
   bindRangePair("metallic", "metallic-number", "paint.metallic");
   bindRangePair("roughness", "roughness-number", "paint.roughness");

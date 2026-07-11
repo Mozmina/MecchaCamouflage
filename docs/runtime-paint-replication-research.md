@@ -10,12 +10,49 @@ paint behavior.
 Normal paint uses the direct component route:
 
 - `RuntimePaintableComponent.ServerPackedPaintBatch`
-- packed batch size fixed by the bridge
+- painter-side submission through the native packed receiver implementation
+  behind `MulticastPackedPaintBatch`, called directly rather than through the
+  reflected multicast UFunction
+- identical server/local packed boundaries and pacing (1--20 strokes,
+  50--500 ms; default 20/50)
+- exact PE/text identity plus reflected payload, UFunction thunk, vtable slot,
+  decoder, component-to-manager resolver, and enqueue-chain validation before
+  the first packed submission
+- one packed-radius scale is derived per validated mesh/job from the
+  UV-area-weighted world-triangle/UV Jacobian and live mesh bounds diameter,
+  then multiplied by the host-A/B conservative fold/seam safety factor; it is
+  frozen across Fill/Coarse/Fine and does not change planner spacing
+- mesh-anchor `EffectiveBrushWorldRadius` remains the non-positive conversion
+  sentinel. Compact expansion derives the world radius only for `<= 0`;
+  copying normalized UV radius here collapses strokes to dots
+- the effective subdivision tail is exactly `level=0`, `pixel-size=0`,
+  `template-resolution=0`, allowing receiver preflight to select the component
+  defaults. These fields are not brush diameter bytes
+- an exact manager/component queue probe before every server commit and an
+  exact queue-count increase after the paired local receiver call
 - no fallback to old compact/adaptive `SendCustom` path
+- no fallback to the per-stroke internal common or reflected
+  `PaintAtUVWithBrush` routes when validation fails
 - failure stops paint with explicit metadata
 
-The production route must remain small and deterministic. Research helpers
-should not be wired into normal paint decisions.
+`local_packed_queue_calls_returned` proves only that the receiver implementation
+returned. `local_packed_queue_last_queue_delta` proves observed queue growth on
+the exact manager. Neither field proves a render-thread write or pixel coverage;
+even a few dots change a whole-texture checksum. Release evidence must separately
+observe queue drain and compare exported channel bytes by changed-texel count (or
+perform an equivalent visual-coverage check), not hash inequality alone.
+
+The game renderer's homogeneous-batch key includes quantized ChannelData.
+Different camouflage colors therefore commonly turn one packed network batch
+into per-stroke surface generation. Network batch size and render batch size
+must not be treated as equivalent in FPS analysis.
+
+Painter-local receiver backlog is not remote-peer pressure and does not back
+off the outgoing server lane. The game-owned receiver/render budgets drain it
+asynchronously without modifying any game limit. The production route must
+remain small and deterministic. Research probes and artifact collection must
+not change normal route selection; research mode names explicitly choose their
+A/B route.
 
 ## Research Entry Points
 

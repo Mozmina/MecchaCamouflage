@@ -19,6 +19,7 @@ public sealed class MainForm : Form
     private const int HotkeyUnPreview = 3;
     private const int HotkeyStop = 4;
     private const int WmHotkey = 0x0312;
+    private const uint ModNoRepeat = 0x4000;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -1054,7 +1055,7 @@ public sealed class MainForm : Form
         foreach (var (id, key) in keys)
         {
             var virtualKey = ParseVirtualKey(key);
-            if (virtualKey == 0 || !RegisterHotKey(Handle, id, 0, virtualKey))
+            if (virtualKey == 0 || !RegisterHotKey(Handle, id, ModNoRepeat, virtualKey))
             {
                 message = $"Hotkey registration failed: {key}";
                 UnregisterHotkeys();

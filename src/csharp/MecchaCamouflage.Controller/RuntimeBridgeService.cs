@@ -5,6 +5,50 @@ using MecchaCamouflage.Core;
 
 namespace MecchaCamouflage.Controller;
 
+/// <summary>Read-only native research requests accepted by the current bridge protocol.</summary>
+public enum ResearchProbeKind
+{
+    Replication,
+    ReplicationPressure,
+    ReplicationTexture
+}
+
+/// <summary>
+/// Explicit opt-in for a fresh, controller-owned research bridge. The event-watch sidecar must
+/// exist before the injector loads the staged DLL, because the native bridge reads it only at
+/// listener startup.
+/// </summary>
+public sealed record ResearchBridgeOptions(string EventWatchOutputPath);
+
+/// <summary>Non-secret identity exported to research artifacts for correlation with event-watch output.</summary>
+public sealed record ResearchBridgeIdentity(int ProcessId, Guid InstanceId, string BridgeHash, string BridgePath);
+
+/// <summary>Creates the pre-injection, local-only sidecar used by the native event watcher.</summary>
+public static class ResearchBridgeArtifacts
+{
+    public static string StageEventWatchSidecar(string bridgePath, string outputPath)
+    {
+        if (string.IsNullOrWhiteSpace(bridgePath))
+            throw new ArgumentException("A staged bridge path is required.", nameof(bridgePath));
+        if (string.IsNullOrWhiteSpace(outputPath))
+            throw new ArgumentException("An event-watch output path is required.", nameof(outputPath));
+
+        var normalizedBridgePath = Path.GetFullPath(bridgePath);
+        if (!File.Exists(normalizedBridgePath))
+            throw new FileNotFoundException("The staged bridge DLL is missing.", normalizedBridgePath);
+
+        var normalizedOutputPath = Path.GetFullPath(outputPath);
+        var outputDirectory = Path.GetDirectoryName(normalizedOutputPath);
+        if (string.IsNullOrWhiteSpace(outputDirectory))
+            throw new ArgumentException("The event-watch output path must have a parent directory.", nameof(outputPath));
+
+        Directory.CreateDirectory(outputDirectory);
+        var sidecarPath = normalizedBridgePath + ".eventwatch.path";
+        File.WriteAllText(sidecarPath, normalizedOutputPath + Environment.NewLine, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        return sidecarPath;
+    }
+}
+
 /// <summary>
 /// Stages and starts one uniquely named direct bridge per attempt. Existing bridge modules are
 /// intentionally outside this service's control: they are neither enumerated, switched,
@@ -16,6 +60,7 @@ public sealed class RuntimeBridgeService
 
     private readonly AppPaths paths;
     private readonly RuntimeLog log;
+    private readonly object bridgeStateGate = new();
     private BridgeInstance? activeInstance;
     private string waitingForProcessName = "";
     private string lastBridgeReadyLogKey = "";
@@ -28,9 +73,59 @@ public sealed class RuntimeBridgeService
         this.log = log;
     }
 
-    public string BridgePath => activeInstance?.BridgePath ?? "";
-    public string ProgressPath => activeInstance?.ProgressPath ?? "";
-    public bool IsConnected => bridgeConnected;
+    public string BridgePath
+    {
+        get
+        {
+            lock (bridgeStateGate)
+                return activeInstance?.BridgePath ?? "";
+        }
+    }
+
+    public string ProgressPath
+    {
+        get
+        {
+            lock (bridgeStateGate)
+                return activeInstance?.ProgressPath ?? "";
+        }
+    }
+
+    public bool IsConnected
+    {
+        get
+        {
+            lock (bridgeStateGate)
+                return bridgeConnected;
+        }
+    }
+
+    public bool HasActiveBridgeInstance
+    {
+        get
+        {
+            lock (bridgeStateGate)
+                return activeInstance is not null;
+        }
+    }
+
+    public ResearchBridgeIdentity? ActiveResearchBridgeIdentity
+    {
+        get
+        {
+            lock (bridgeStateGate)
+            {
+                var instance = activeInstance;
+                return instance is null
+                    ? null
+                    : new ResearchBridgeIdentity(
+                        instance.Target.ProcessId,
+                        instance.InstanceId,
+                        instance.ExpectedBridgeHash,
+                        instance.BridgePath);
+            }
+        }
+    }
 
     /// <summary>
     /// Resolves the configured process name for the current UI flow. Once selected, the exact
@@ -52,12 +147,28 @@ public sealed class RuntimeBridgeService
     public Task<BridgeReply> SendPaintAsync(string payload, CancellationToken cancellationToken = default) =>
         RequestActiveAsync(client => client.RequestAsync(payload, cancellationToken));
 
+    /// <summary>
+    /// Sends one whitelisted, authenticated research request through the controller-owned bridge.
+    /// This does not create a second listener or bypass the per-instance HELLO handshake.
+    /// </summary>
+    public Task<BridgeReply> SendResearchProbeAsync(ResearchProbeKind kind, CancellationToken cancellationToken = default) =>
+        RequestActiveAsync(client => client.RequestAsync(ResearchProbePayload(kind), cancellationToken));
+
     public async Task<BridgeReply> ShutdownAsync(CancellationToken cancellationToken = default)
     {
-        var reply = await RequestActiveAsync(client => client.ShutdownAsync(cancellationToken));
-        if (reply.Ok && reply.Success)
-            bridgeConnected = false;
-        return reply;
+        var result = await RequestActiveWithInstanceAsync(client => client.ShutdownAsync(cancellationToken));
+        if (result.Reply.Ok && result.Reply.Success)
+        {
+            lock (bridgeStateGate)
+            {
+                if (ReferenceEquals(activeInstance, result.Instance))
+                {
+                    bridgeConnected = false;
+                    activeInstance = null;
+                }
+            }
+        }
+        return result.Reply;
     }
 
     public async Task<bool> EnsureReadyAsync(string processName, CancellationToken cancellationToken = default)
@@ -65,7 +176,7 @@ public sealed class RuntimeBridgeService
         var process = FindGameProcess(processName);
         if (process is null)
         {
-            bridgeConnected = false;
+            MarkDisconnected();
             if (!string.Equals(waitingForProcessName, processName, StringComparison.OrdinalIgnoreCase))
             {
                 log.Warn($"Game process: waiting for {processName}.");
@@ -88,9 +199,42 @@ public sealed class RuntimeBridgeService
         }
         catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
         {
-            bridgeConnected = false;
+            MarkDisconnected();
             DiagnosticsState.SetLastCode("MC-INJ-102", ex.Message);
             log.Warn($"Game process: selected pid={selectedProcessId} is no longer available.");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Starts one fresh, exact-PID bridge with event-watch armed before injection. This is
+    /// deliberately separate from normal warmup so the research runner can validate its own
+    /// event-watch identity and lifecycle.
+    /// </summary>
+    public async Task<bool> EnsureResearchReadyAsync(
+        int selectedProcessId,
+        ResearchBridgeOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        lock (bridgeStateGate)
+        {
+            if (activeInstance is not null && bridgeConnected)
+                throw new InvalidOperationException("A controller bridge is already active in this runner. Shut it down before starting another research bridge.");
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(selectedProcessId);
+            var target = CaptureTargetIdentity(process);
+            waitingForProcessName = "";
+            return await InjectDirectInstanceAsync(target, options, cancellationToken);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception or UnauthorizedAccessException)
+        {
+            MarkDisconnected();
+            DiagnosticsState.SetLastCode("MC-INJ-102", ex.Message);
+            log.Error("Research bridge: could not read the selected game process identity: " + FriendlyAccessFailure(ex.Message));
             return false;
         }
     }
@@ -110,7 +254,7 @@ public sealed class RuntimeBridgeService
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or UnauthorizedAccessException)
         {
-            bridgeConnected = false;
+            MarkDisconnected();
             DiagnosticsState.SetLastCode("MC-INJ-102", ex.Message);
             log.Error("Bridge: could not read the selected game process identity: " + FriendlyAccessFailure(ex.Message));
             return false;
@@ -124,27 +268,34 @@ public sealed class RuntimeBridgeService
     {
         ArgumentNullException.ThrowIfNull(target);
         waitingForProcessName = "";
-        if (ActiveInstanceMatches(target))
+        var matchingInstance = MatchingActiveInstance(target);
+        if (matchingInstance is not null)
         {
             var ping = await PingAsync(cancellationToken, BridgeProbeTimeout);
-            if (IsBridgeReadyForInstance(ping, activeInstance!))
+            if (IsBridgeReadyForInstance(ping, matchingInstance))
             {
                 bridgeReadyTimeoutLogged = false;
-                RestoreConnectedState(activeInstance!);
-                return true;
+                if (RestoreConnectedState(matchingInstance))
+                    return true;
             }
-            bridgeConnected = false;
+            MarkDisconnectedIfCurrent(matchingInstance);
         }
 
-        return await InjectDirectInstanceAsync(target, cancellationToken);
+        return await InjectDirectInstanceAsync(target, null, cancellationToken);
     }
 
-    private Task<bool> InjectDirectInstanceAsync(TargetProcessIdentity target, CancellationToken cancellationToken) =>
+    private Task<bool> InjectDirectInstanceAsync(
+        TargetProcessIdentity target,
+        ResearchBridgeOptions? researchOptions,
+        CancellationToken cancellationToken) =>
         // Mutex ownership is thread-affine. Keep the complete critical section on one worker
         // thread so asynchronous injector/network continuations cannot release it elsewhere.
-        Task.Run(() => InjectDirectInstanceOnMutexThread(target, cancellationToken), CancellationToken.None);
+        Task.Run(() => InjectDirectInstanceOnMutexThread(target, researchOptions, cancellationToken), CancellationToken.None);
 
-    private bool InjectDirectInstanceOnMutexThread(TargetProcessIdentity target, CancellationToken cancellationToken)
+    private bool InjectDirectInstanceOnMutexThread(
+        TargetProcessIdentity target,
+        ResearchBridgeOptions? researchOptions,
+        CancellationToken cancellationToken)
     {
         var mutexName = $@"Local\MecchaCamouflage.Inject.{target.ProcessId}";
         using var mutex = new Mutex(false, mutexName);
@@ -168,11 +319,11 @@ public sealed class RuntimeBridgeService
             BridgeInstance instance;
             try
             {
-                instance = PrepareDirectBridgeInstance(target);
+                instance = PrepareDirectBridgeInstance(target, researchOptions);
             }
-            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or DirectoryNotFoundException or FileNotFoundException)
+            catch (Exception ex) when (ex is ArgumentException or UnauthorizedAccessException or IOException or DirectoryNotFoundException or FileNotFoundException)
             {
-                bridgeConnected = false;
+                MarkDisconnected();
                 DiagnosticsState.SetLastCode("MC-RT-001", ex.Message);
                 DiagnosticsState.SetBridgeInjection("direct bridge staging failed");
                 log.Error("Bridge: runtime files could not be staged: " + FriendlyAccessFailure(ex.Message));
@@ -184,7 +335,7 @@ public sealed class RuntimeBridgeService
             var invocation = InvokeDirectInjectorAsync(instance, cancellationToken).GetAwaiter().GetResult();
             if (invocation.Canceled)
             {
-                bridgeConnected = false;
+                MarkDisconnected();
                 DiagnosticsState.SetLastCode("MC-INJ-131", "injector wait was canceled; target memory ownership is indeterminate");
                 DiagnosticsState.SetBridgeInjection($"direct injector canceled pid={target.ProcessId}");
                 log.Warn("Bridge: injection was canceled while the target operation may still be running. Retry explicitly when ready.");
@@ -192,7 +343,7 @@ public sealed class RuntimeBridgeService
             }
             if (!invocation.Parsed || invocation.Result is null || !invocation.Result.Matches(target.ProcessId, instance.InstanceId, instance.ExpectedBridgeHash))
             {
-                bridgeConnected = false;
+                MarkDisconnected();
                 var result = invocation.Result;
                 var detail = result?.Detail;
                 if (string.IsNullOrWhiteSpace(detail))
@@ -205,16 +356,19 @@ public sealed class RuntimeBridgeService
             }
 
             instance.SetPort(invocation.Result.BoundPort!.Value);
-            activeInstance = instance;
+            lock (bridgeStateGate)
+            {
+                activeInstance = instance;
+                bridgeConnected = false;
+            }
             var ping = PingAsync(cancellationToken, TimeSpan.FromSeconds(3)).GetAwaiter().GetResult();
             if (IsBridgeReadyForInstance(ping, instance))
             {
                 bridgeReadyTimeoutLogged = false;
-                RestoreConnectedState(instance);
-                return true;
+                return RestoreConnectedState(instance);
             }
 
-            bridgeConnected = false;
+            MarkDisconnectedIfCurrent(instance);
             DiagnosticsState.SetLastCode("MC-INJ-145", ping.Message);
             DiagnosticsState.SetBridgeInjection($"direct bridge hello failed pid={target.ProcessId} instance={instance.InstanceId:N}");
             if (!bridgeReadyTimeoutLogged)
@@ -231,7 +385,7 @@ public sealed class RuntimeBridgeService
         }
     }
 
-    private BridgeInstance PrepareDirectBridgeInstance(TargetProcessIdentity target)
+    private BridgeInstance PrepareDirectBridgeInstance(TargetProcessIdentity target, ResearchBridgeOptions? researchOptions)
     {
         paths.EnsureBaseDirectories();
         var nativeRoot = PackagedAssets.ResolveRequiredAssetRoot(paths, "native", log);
@@ -252,6 +406,8 @@ public sealed class RuntimeBridgeService
         PackagedAssets.CopyIfInvalid(bridgeSource, bridgePath);
         PackagedAssets.CopyIfInvalid(injectorSource, injectorPath);
         CopyMeshProfiles(profilesRoot, instanceDirectory);
+        if (researchOptions is not null)
+            ResearchBridgeArtifacts.StageEventWatchSidecar(bridgePath, researchOptions.EventWatchOutputPath);
 
         var progressPath = bridgePath + ".progress.json";
         var instance = new BridgeInstance(target, instanceId, token, hash, bridgePath, injectorPath, progressPath);
@@ -325,15 +481,32 @@ public sealed class RuntimeBridgeService
         }
     }
 
-    private async Task<BridgeReply> RequestActiveAsync(Func<BridgeClient, Task<BridgeReply>> request)
+    private async Task<BridgeReply> RequestActiveAsync(Func<BridgeClient, Task<BridgeReply>> request) =>
+        (await RequestActiveWithInstanceAsync(request)).Reply;
+
+    private async Task<ActiveBridgeRequest> RequestActiveWithInstanceAsync(Func<BridgeClient, Task<BridgeReply>> request)
     {
-        var instance = activeInstance;
+        BridgeInstance? instance;
+        lock (bridgeStateGate)
+            instance = activeInstance;
         if (instance?.Port is not int)
-            return new BridgeReply(false, false, "not_connected", "Bridge is not connected.", "");
+            return new ActiveBridgeRequest(instance, new BridgeReply(false, false, "not_connected", "Bridge is not connected.", ""));
         var reply = await request(new BridgeClient(instance.Endpoint, instance.Target.ProcessId));
-        bridgeConnected = IsBridgeReadyForInstance(reply, instance) || (reply.Ok && reply.InstanceId == instance.InstanceId);
-        return reply;
+        lock (bridgeStateGate)
+        {
+            if (ReferenceEquals(activeInstance, instance))
+                bridgeConnected = IsBridgeReadyForInstance(reply, instance) || (reply.Ok && reply.InstanceId == instance.InstanceId);
+        }
+        return new ActiveBridgeRequest(instance, reply);
     }
+
+    private static string ResearchProbePayload(ResearchProbeKind kind) => kind switch
+    {
+        ResearchProbeKind.Replication => "{\"type\":\"paint_replication_probe\"}",
+        ResearchProbeKind.ReplicationPressure => "{\"type\":\"paint_replication_pressure_probe\"}",
+        ResearchProbeKind.ReplicationTexture => "{\"type\":\"paint_replication_texture_probe\"}",
+        _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unsupported research probe.")
+    };
 
     private static bool IsBridgeReadyForInstance(BridgeReply reply, BridgeInstance instance) =>
         reply.Ok &&
@@ -343,12 +516,20 @@ public sealed class RuntimeBridgeService
         string.Equals(reply.BridgeHash, instance.ExpectedBridgeHash, StringComparison.OrdinalIgnoreCase) &&
         reply.ProtocolVersion == BridgeProtocolV1.Version;
 
-    private bool ActiveInstanceMatches(TargetProcessIdentity target) =>
-        activeInstance is not null &&
-        activeInstance.Target.ProcessId == target.ProcessId &&
-        activeInstance.Target.CreationTimeUtcFileTime == target.CreationTimeUtcFileTime &&
-        string.Equals(activeInstance.Target.ExecutablePath, target.ExecutablePath, StringComparison.OrdinalIgnoreCase) &&
-        activeInstance.Port is not null;
+    private BridgeInstance? MatchingActiveInstance(TargetProcessIdentity target)
+    {
+        lock (bridgeStateGate)
+        {
+            var instance = activeInstance;
+            return instance is not null &&
+                   instance.Target.ProcessId == target.ProcessId &&
+                   instance.Target.CreationTimeUtcFileTime == target.CreationTimeUtcFileTime &&
+                   string.Equals(instance.Target.ExecutablePath, target.ExecutablePath, StringComparison.OrdinalIgnoreCase) &&
+                   instance.Port is not null
+                ? instance
+                : null;
+        }
+    }
 
     private static TargetProcessIdentity CaptureTargetIdentity(Process process)
     {
@@ -377,15 +558,41 @@ public sealed class RuntimeBridgeService
             PackagedAssets.CopyIfInvalid(file, Path.Combine(target, Path.GetFileName(file)));
     }
 
-    private void RestoreConnectedState(BridgeInstance instance)
+    private void MarkDisconnectedIfCurrent(BridgeInstance instance)
     {
-        bridgeConnected = true;
-        var key = $"{instance.Target.ProcessId}:{instance.InstanceId:N}:{instance.Port}";
-        if (string.Equals(lastBridgeReadyLogKey, key, StringComparison.Ordinal))
-            return;
-        lastBridgeReadyLogKey = key;
+        lock (bridgeStateGate)
+        {
+            if (ReferenceEquals(activeInstance, instance))
+                bridgeConnected = false;
+        }
+    }
+
+    private void MarkDisconnected()
+    {
+        lock (bridgeStateGate)
+            bridgeConnected = false;
+    }
+
+    private bool RestoreConnectedState(BridgeInstance instance)
+    {
+        var shouldLog = false;
+        lock (bridgeStateGate)
+        {
+            if (!ReferenceEquals(activeInstance, instance))
+                return false;
+            bridgeConnected = true;
+            var key = $"{instance.Target.ProcessId}:{instance.InstanceId:N}:{instance.Port}";
+            if (!string.Equals(lastBridgeReadyLogKey, key, StringComparison.Ordinal))
+            {
+                lastBridgeReadyLogKey = key;
+                shouldLog = true;
+            }
+        }
+        if (!shouldLog)
+            return true;
         DiagnosticsState.SetBridgeInjection($"ready pid={instance.Target.ProcessId} instance={instance.InstanceId:N} port={instance.Port}");
         log.Info($"Bridge: connected to direct instance in game process pid={instance.Target.ProcessId}.");
+        return true;
     }
 
     private void LogRuntimeFilesPrepared(BridgeInstance instance)
@@ -469,5 +676,6 @@ public sealed class RuntimeBridgeService
     private static bool ResearchArtifactsEnabled() =>
         string.Equals(Environment.GetEnvironmentVariable("MECCHA_RESEARCH_ARTIFACTS"), "1", StringComparison.Ordinal);
 
+    private sealed record ActiveBridgeRequest(BridgeInstance? Instance, BridgeReply Reply);
     private sealed record InjectorInvocation(bool Canceled, bool Parsed, InjectorResultV1? Result, string ParseError, string StandardError);
 }

@@ -134,6 +134,14 @@ sidecars or probe another bridge for compatibility. The `.progress.path` and
 `.progress.json` sidecars remain solely for paint progress; research event
 watch artifacts remain research-only.
 
+Shutdown closes command admission and the listener before cancellation. An
+already accepted handler must recheck admission before dispatch, and paint is
+tracked from queue removal through planning, async execution, and terminal
+completion. The bridge restores its hooks only after that pipeline is
+quiescent; the DLL remains resident and may start a later authenticated
+instance after listener/callback rundown. A timed-out shutdown does not report
+success or authorize an automatic retry while cancellation is still pending.
+
 ## Failure handling
 
 Startup failures identify the stage (staging, target identity, remote load,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -85,6 +86,7 @@ namespace sdk
         Roughness = 2,
         Height = 3,
         All = 4,
+        AlbedoMetallicRoughness = 5,
         Max = 6,
     };
 
@@ -194,6 +196,45 @@ namespace sdk
         FVector Scale3D{1.0, 1.0, 1.0};
         std::uint8_t Pad_58[0x8]{};
     };
+
+    inline auto transform_is_plausible(const FTransform& transform) noexcept -> bool
+    {
+        const double values[]{
+            transform.Rotation.X,
+            transform.Rotation.Y,
+            transform.Rotation.Z,
+            transform.Rotation.W,
+            transform.Translation.X,
+            transform.Translation.Y,
+            transform.Translation.Z,
+            transform.Scale3D.X,
+            transform.Scale3D.Y,
+            transform.Scale3D.Z,
+        };
+        for (const auto value : values)
+        {
+            if (!std::isfinite(value) || std::abs(value) > 1.0e8)
+            {
+                return false;
+            }
+        }
+
+        const double quaternion_length_squared =
+            transform.Rotation.X * transform.Rotation.X +
+            transform.Rotation.Y * transform.Rotation.Y +
+            transform.Rotation.Z * transform.Rotation.Z +
+            transform.Rotation.W * transform.Rotation.W;
+        if (quaternion_length_squared < 0.25 || quaternion_length_squared > 2.25)
+        {
+            return false;
+        }
+
+        const double scale_sum =
+            std::abs(transform.Scale3D.X) +
+            std::abs(transform.Scale3D.Y) +
+            std::abs(transform.Scale3D.Z);
+        return scale_sum > 0.001 && scale_sum < 1000.0;
+    }
 
     struct FGuid
     {

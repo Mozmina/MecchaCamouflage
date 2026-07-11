@@ -121,14 +121,51 @@
             json += extra;
         }
         json += "}\n";
-        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        static std::atomic<std::uint64_t> temp_sequence{0};
+        std::wstring temp_path;
+        HANDLE file = INVALID_HANDLE_VALUE;
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            const auto sequence = temp_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+            temp_path = path + L".tmp." +
+                        std::to_wstring(GetCurrentProcessId()) + L"." +
+                        std::to_wstring(sequence);
+            file = CreateFileW(temp_path.c_str(),
+                               GENERIC_WRITE,
+                               0,
+                               nullptr,
+                               CREATE_NEW,
+                               FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+            if (file != INVALID_HANDLE_VALUE)
+            {
+                break;
+            }
+            const auto error = GetLastError();
+            if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS)
+            {
+                break;
+            }
+        }
         if (file == INVALID_HANDLE_VALUE)
         {
             return;
         }
         DWORD written = 0;
-        WriteFile(file, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
-        CloseHandle(file);
+        const bool write_ok =
+            json.size() <= static_cast<std::size_t>(std::numeric_limits<DWORD>::max()) &&
+            WriteFile(file, json.data(), static_cast<DWORD>(json.size()), &written, nullptr) != FALSE &&
+            written == json.size();
+        const bool flush_ok = write_ok && FlushFileBuffers(file) != FALSE;
+        const bool close_ok = CloseHandle(file) != FALSE;
+        const bool replace_ok = flush_ok && close_ok &&
+                                MoveFileExW(temp_path.c_str(),
+                                            path.c_str(),
+                                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+        if (!replace_ok)
+        {
+            DeleteFileW(temp_path.c_str());
+        }
     }
 
     auto clear_bridge_progress() -> void

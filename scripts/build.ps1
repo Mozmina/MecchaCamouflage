@@ -212,11 +212,12 @@ $WebView2BootstrapperCacheRoot = Join-Path $RuntimeRoot ".build\cache\webview2\e
 
 $BridgeSource = Join-Path $RuntimeRoot "src\native\bridge\bridge.cpp"
 $InjectorSource = Join-Path $RuntimeRoot "src\native\injector\injector.cpp"
+$TransformValidationTestSource = Join-Path $RuntimeRoot "src\native\tests\transform_validation_test.cpp"
 $WebHostProject = Join-Path $RuntimeRoot "src\csharp\MecchaCamouflage.WebHost\MecchaCamouflage.WebHost.csproj"
 $TestsProject = Join-Path $RuntimeRoot "src\csharp\MecchaCamouflage.Tests\MecchaCamouflage.Tests.csproj"
 $MeshProfilesSourceDir = Join-Path $RuntimeRoot "resources\mesh-profiles"
 
-foreach ($path in @($BridgeSource, $InjectorSource, $WebHostProject, $TestsProject)) {
+foreach ($path in @($BridgeSource, $InjectorSource, $TransformValidationTestSource, $WebHostProject, $TestsProject)) {
     if (-not (Test-Path $path -PathType Leaf)) {
         throw "Required source not found: $path"
     }
@@ -238,6 +239,19 @@ Push-Location $RuntimeRoot
 try {
     Invoke-BuildStep -Name "run C# tests" -ScriptBlock {
         Invoke-DotNet -Arguments @("run", "--project", $TestsProject, "-c", "Release")
+    }
+
+    $TransformValidationTestOutput = Join-Path $ObjDir "transform-validation-test.exe"
+    Invoke-BuildStep -Name "run native transform validation test" -ScriptBlock {
+        Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs @(
+            "/nologo", "/std:c++17", "/EHsc", "/O2", $TransformValidationTestSource,
+            "/Fo:$(Join-Path $ObjDir 'transform-validation-test.obj')",
+            "/Fe:$TransformValidationTestOutput"
+        )
+        & $TransformValidationTestOutput
+        if ($LASTEXITCODE -ne 0) {
+            throw "Native transform validation test failed with exit code $LASTEXITCODE"
+        }
     }
 
     $BridgeOutput = Join-Path $NativePackageDir "runtime-bridge.dll"

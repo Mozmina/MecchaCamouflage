@@ -77,7 +77,7 @@ public sealed class BridgeClient
         RequestAsync("{\"type\":\"cancel_paint\"}", cancellationToken, TimeSpan.FromSeconds(5));
 
     public Task<BridgeReply> ShutdownAsync(CancellationToken cancellationToken = default) =>
-        RequestAsync("{\"type\":\"shutdown\"}", cancellationToken, TimeSpan.FromSeconds(5));
+        RequestAsync("{\"type\":\"shutdown\"}", cancellationToken, TimeSpan.FromSeconds(10));
 
     private static async Task WriteLineAsync(NetworkStream stream, string line, CancellationToken cancellationToken)
     {
