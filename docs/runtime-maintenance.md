@@ -103,17 +103,16 @@ directory.
 
 ## Paint Replication Rules
 
-Normal paint always keeps server replication and painter-local application on
-independent lanes. `ServerPackedPaintBatch` uses either Auto Adapt game limits
-or the manual controls. Painter-local application always uses the dynamically
-validated internal-common no-resend route, capped at 6 calls and a 4-ms CPU
-budget per dispatch. It may immediately repost one additional slice, but must
-then use a deferred wakeup so the game message pump cannot be held
-continuously. Never call reflected `PaintAtUVWithBrush`, which can re-enter
-replication. The native packed receiver queue remains research-only.
+Normal paint sends planned batches through `ServerPackedPaintBatch`, then
+coalesces already-submitted strokes into the painter's working Albedo,
+Metallic, and Roughness bytes and imports the three channels at a 100 ms
+cadence. Auto Adapt uses at least 40 strokes per local update; larger manual
+server batches remain one local update. Production must not replay every stroke through reflected
+`PaintAtUVWithBrush`, internal-common no-resend, or the native packed receiver
+queue; those routes remain research-only.
 
 The server schema, packed payload, and source ID remain fatal requirements. If
-only the local no-resend route is unavailable, stop local calls and continue
+the painter-local texture export/import fails, stop local work and continue
 `ServerPackedPaintBatch` at 20 strokes / 50 ms. Preserve
 `local_route_mode`, `fallback_reason`, `fallback_batch_limit`, and
 `fallback_pacing_ms` metadata.

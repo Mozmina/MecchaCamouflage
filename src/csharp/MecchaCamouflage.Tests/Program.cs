@@ -16,7 +16,7 @@ var tests = new List<(string Name, Action Run)>
     ("payload sends active brushes", PayloadSendsTwoPassBrushPipeline),
     ("native accepts the Brush 1 configured range", NativeAcceptsBrush1ConfiguredRange),
     ("native local route is signature resolved instead of build gated", NativeLocalRouteIsSignatureResolvedInsteadOfBuildGated),
-    ("native production direct route is signature resolved instead of build gated", NativeProductionDirectRouteIsSignatureResolvedInsteadOfBuildGated),
+    ("native research no-resend route is signature resolved instead of build gated", NativeResearchNoResendRouteIsSignatureResolvedInsteadOfBuildGated),
     ("native local failures use fixed server packed fallback", NativeLocalFailuresUseFixedServerPackedFallback),
     ("native production radius follows each triangle and fill stays fixed", NativeProductionRadiusFollowsEachTriangleAndFillStaysFixed),
     ("native spatial replay follows the current pose and camera", NativeSpatialReplayFollowsCurrentPoseAndCamera),
@@ -122,7 +122,7 @@ static void PaintDefaultsExposeCoarseAndDetailBrushes()
     Assert(!paint.Brush1Enabled, "brush 1 should default off");
     Assert(paint.Brush2Enabled, "brush 2 should default on");
     Assert(Math.Abs(paint.Brush1SizeTexels - 25.0) < 0.000001, "brush 1 should default to 25 texels");
-    Assert(Math.Abs(paint.Brush2SizeTexels - 7.5) < 0.000001, "brush 2 should default to 7.5 texels");
+    Assert(Math.Abs(paint.Brush2SizeTexels - 5.0) < 0.000001, "brush 2 should default to 5 texels");
     Assert(Math.Abs(paint.CoverageStepTexels - paint.Brush2SizeTexels) < 0.000001, "coverage compatibility should follow brush 2");
 }
 
@@ -251,25 +251,25 @@ static void NativeLocalRouteIsSignatureResolvedInsteadOfBuildGated()
         "local route must retain schema validation and require one signature/call-chain candidate");
 }
 
-static void NativeProductionDirectRouteIsSignatureResolvedInsteadOfBuildGated()
+static void NativeResearchNoResendRouteIsSignatureResolvedInsteadOfBuildGated()
 {
     var bridge = File.ReadAllText(Path.Combine(
         FindRepositoryRoot(),
         "src", "native", "bridge", "bridge.cpp"));
     var start = bridge.LastIndexOf("auto resolve_internal_no_resend_route(", StringComparison.Ordinal);
     var end = bridge.IndexOf("auto sdk_validate_internal_common_no_resend_preconditions(", start, StringComparison.Ordinal);
-    Assert(start >= 0 && end > start, "production direct resolver should be present");
+    Assert(start >= 0 && end > start, "research no-resend resolver should be present");
     var resolver = bridge[start..end];
 
     Assert(!resolver.Contains("TimeDateStamp ==", StringComparison.Ordinal) &&
            !resolver.Contains("ExpectedThunkRva", StringComparison.Ordinal) &&
            !resolver.Contains("main_module_build_identity_mismatch", StringComparison.Ordinal) &&
            !resolver.Contains("main_module_text_identity_mismatch", StringComparison.Ordinal),
-        "production direct route must not reject a build solely because its identity or RVAs changed");
+        "research no-resend route must not reject a build solely because its identity or RVAs changed");
     Assert(resolver.Contains("PaintAtUVWithBrush_param_layout_mismatch", StringComparison.Ordinal) &&
            resolver.Contains("internal_rel32_call_target", StringComparison.Ordinal) &&
            resolver.Contains("matches.size() != 1", StringComparison.Ordinal),
-        "production direct route must retain schema, signature, relative-call, and uniqueness validation");
+        "research no-resend route must retain schema, signature, relative-call, and uniqueness validation");
 }
 
 static void NativeLocalFailuresUseFixedServerPackedFallback()
@@ -303,6 +303,8 @@ static void NativeLocalFailuresUseFixedServerPackedFallback()
     Assert(bridge.Contains("mesh_local_packed_queue_still_draining", StringComparison.Ordinal) &&
            bridge.Contains("component_queue_not_empty", StringComparison.Ordinal),
         "a readable nonzero previous queue must remain a blocking condition");
+    Assert(bridge.Contains("the painter-local texture import failed before server submission", StringComparison.Ordinal),
+        "production texture-import failure should activate the fixed server fallback before submission");
 }
 
 static void NativeProductionRadiusFollowsEachTriangleAndFillStaysFixed()
@@ -916,13 +918,24 @@ static void NativeProgressExposesReplayPassState()
     Assert(bridge.Contains("receiver_queue_idle_threshold_reached", StringComparison.Ordinal),
         "receiver drain should invalidate stale ETA and fail closed after an idle timeout");
     Assert(json.Contains("replay_current_pass", StringComparison.Ordinal), "compact progress metadata should retain the current pass");
-    Assert(bridge.Contains("production_paint_uses_direct_local", StringComparison.Ordinal) &&
-           bridge.Contains("local_direct_submission", StringComparison.Ordinal) &&
-           bridge.Contains("parallel_lane_eta_ms", StringComparison.Ordinal),
-        "production paint should expose independent direct-local progress and parallel-lane ETA");
-    Assert(bridge.Contains("production_direct_local_requested", StringComparison.Ordinal) &&
-           !bridge.Contains("!manual_direct_local_requested", StringComparison.Ordinal),
-        "Auto Adapt and manual paint should both select the bounded direct-local route");
+    Assert(bridge.Contains("production_paint_uses_texture_import", StringComparison.Ordinal) &&
+           bridge.Contains("production_texture_import_requested", StringComparison.Ordinal) &&
+           bridge.Contains("server_packed_with_incremental_local_texture_import", StringComparison.Ordinal) &&
+           bridge.Contains("coalesced_incremental_local_texture_import", StringComparison.Ordinal) &&
+           bridge.Contains("IncrementalTextureImportPacingMs", StringComparison.Ordinal),
+        "production paint should coalesce painter-local texture imports independently of packed server pacing");
+    Assert(bridge.Contains("mesh_first_apply_local_material_import_preview", StringComparison.Ordinal) &&
+           bridge.Contains("mesh_first_apply_local_material_import_increment", StringComparison.Ordinal) &&
+           !bridge.Contains("production_direct_local_requested", StringComparison.Ordinal) &&
+           !bridge.Contains("completed_before_server_submission", StringComparison.Ordinal),
+        "Auto Adapt and manual paint should use incremental imports instead of a completed preview before submission");
+    Assert(json.Contains("local_texture_import_ok", StringComparison.Ordinal) &&
+           json.Contains("local_texture_import_calls", StringComparison.Ordinal) &&
+           json.Contains("local_texture_import_strokes_painted", StringComparison.Ordinal) &&
+           json.Contains("local_texture_import_compose_elapsed_ms", StringComparison.Ordinal) &&
+           json.Contains("local_texture_import_channel_elapsed_ms", StringComparison.Ordinal) &&
+           json.Contains("local_texture_import_elapsed_ms", StringComparison.Ordinal),
+        "compact production progress and replies should retain local texture-import evidence");
 }
 
 static void SettingsClampBatchSliders()

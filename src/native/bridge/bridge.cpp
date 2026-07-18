@@ -6761,70 +6761,61 @@ namespace
         int pixels_changed{0};
         std::uint64_t before_hash{1469598103934665603ULL};
         std::uint64_t preview_hash{1469598103934665603ULL};
+        double compose_elapsed_ms{0.0};
+        double channel_import_elapsed_ms{0.0};
         double elapsed_ms{0.0};
         std::string failure{"not_run"};
     };
 
-    auto mesh_first_apply_local_material_import_preview(Reflection& ref,
-                                                        std::uintptr_t component,
-                                                        const std::vector<sdk::FPaintStroke>& strokes,
-                                                        int texture_size,
-                                                        const std::vector<std::uint8_t>* base_albedo_bytes = nullptr,
-                                                        const std::vector<std::uint8_t>* base_metallic_bytes = nullptr,
-                                                        const std::vector<std::uint8_t>* base_roughness_bytes = nullptr) -> MeshFirstLocalTextureImportResult
+    auto mesh_first_apply_local_material_import_increment(
+        Reflection& ref,
+        std::uintptr_t component,
+        const std::vector<sdk::FPaintStroke>& strokes,
+        std::size_t stroke_offset,
+        std::size_t stroke_count,
+        int texture_size,
+        std::vector<std::uint8_t>& albedo_bytes,
+        std::vector<std::uint8_t>& metallic_bytes,
+        std::vector<std::uint8_t>& roughness_bytes,
+        bool capture_before_hash = false,
+        bool capture_after_hash = false) -> MeshFirstLocalTextureImportResult
     {
         const auto started = std::chrono::steady_clock::now();
         MeshFirstLocalTextureImportResult out{};
         out.texture_size = texture_size;
         const int size = std::max(1, texture_size);
         const std::size_t expected_bytes = static_cast<std::size_t>(size) * static_cast<std::size_t>(size) * 4U;
-        MeshFirstChannelBytes albedo{};
-        MeshFirstChannelBytes metallic{};
-        MeshFirstChannelBytes roughness{};
-        auto prepare_channel = [&](sdk::EPaintChannel paint_channel,
-                                   const std::vector<std::uint8_t>* base_bytes,
-                                   const char* label,
-                                   MeshFirstChannelBytes& channel) -> bool {
-            if (base_bytes && !base_bytes->empty())
-            {
-                channel.ok = true;
-                channel.bytes = *base_bytes;
-                channel.failure = "ok";
-            }
-            else
-            {
-                channel = mesh_first_export_channel_bytes(ref, component, paint_channel);
-            }
-            if (!channel.ok)
-            {
-                out.failure = std::string(label) + "_export_failed:" + channel.failure;
-                return false;
-            }
-            if (channel.bytes.size() != expected_bytes)
-            {
-                out.failure = std::string(label) + "_export_size_mismatch";
-                return false;
-            }
-            out.source_bytes += static_cast<int>(channel.bytes.size());
-            return true;
-        };
-
-        out.export_ok =
-            prepare_channel(sdk::EPaintChannel::Albedo, base_albedo_bytes, "albedo", albedo) &&
-            prepare_channel(sdk::EPaintChannel::Metallic, base_metallic_bytes, "metallic", metallic) &&
-            prepare_channel(sdk::EPaintChannel::Roughness, base_roughness_bytes, "roughness", roughness);
-        if (!out.export_ok)
+        if (albedo_bytes.size() != expected_bytes ||
+            metallic_bytes.size() != expected_bytes ||
+            roughness_bytes.size() != expected_bytes)
         {
+            out.failure = "incremental_texture_buffer_size_mismatch";
             return out;
         }
-        out.before_hash = mesh_first_hash_channel_bytes(albedo.bytes);
-        out.before_hash ^= mesh_first_hash_channel_bytes(metallic.bytes);
-        out.before_hash *= 1099511628211ULL;
-        out.before_hash ^= mesh_first_hash_channel_bytes(roughness.bytes);
-        out.before_hash *= 1099511628211ULL;
-
-        for (const auto& stroke : strokes)
+        if (stroke_offset > strokes.size())
         {
+            out.failure = "incremental_stroke_offset_out_of_range";
+            return out;
+        }
+        const std::size_t stroke_end = stroke_offset +
+                                       std::min(stroke_count, strokes.size() - stroke_offset);
+        out.export_ok = true;
+        out.source_bytes = static_cast<int>(albedo_bytes.size() +
+                                            metallic_bytes.size() +
+                                            roughness_bytes.size());
+        if (capture_before_hash)
+        {
+            out.before_hash = mesh_first_hash_channel_bytes(albedo_bytes);
+            out.before_hash ^= mesh_first_hash_channel_bytes(metallic_bytes);
+            out.before_hash *= 1099511628211ULL;
+            out.before_hash ^= mesh_first_hash_channel_bytes(roughness_bytes);
+            out.before_hash *= 1099511628211ULL;
+        }
+
+        const auto compose_started = std::chrono::steady_clock::now();
+        for (std::size_t stroke_index = stroke_offset; stroke_index < stroke_end; ++stroke_index)
+        {
+            const auto& stroke = strokes[stroke_index];
             const bool paint_albedo = stroke.TargetChannel == sdk::EPaintChannel::Albedo ||
                                       stroke.TargetChannel == sdk::EPaintChannel::All;
             const bool paint_metallic = stroke.TargetChannel == sdk::EPaintChannel::Metallic ||
@@ -6868,38 +6859,38 @@ namespace
                     if (paint_albedo)
                     {
                         changed = changed ||
-                                  albedo.bytes[offset + 0] != r ||
-                                  albedo.bytes[offset + 1] != g ||
-                                  albedo.bytes[offset + 2] != b ||
-                                  albedo.bytes[offset + 3] != 255;
-                        albedo.bytes[offset + 0] = r;
-                        albedo.bytes[offset + 1] = g;
-                        albedo.bytes[offset + 2] = b;
-                        albedo.bytes[offset + 3] = 255;
+                                  albedo_bytes[offset + 0] != r ||
+                                  albedo_bytes[offset + 1] != g ||
+                                  albedo_bytes[offset + 2] != b ||
+                                  albedo_bytes[offset + 3] != 255;
+                        albedo_bytes[offset + 0] = r;
+                        albedo_bytes[offset + 1] = g;
+                        albedo_bytes[offset + 2] = b;
+                        albedo_bytes[offset + 3] = 255;
                     }
                     if (paint_metallic)
                     {
                         changed = changed ||
-                                  metallic.bytes[offset + 0] != m ||
-                                  metallic.bytes[offset + 1] != m ||
-                                  metallic.bytes[offset + 2] != m ||
-                                  metallic.bytes[offset + 3] != 255;
-                        metallic.bytes[offset + 0] = m;
-                        metallic.bytes[offset + 1] = m;
-                        metallic.bytes[offset + 2] = m;
-                        metallic.bytes[offset + 3] = 255;
+                                  metallic_bytes[offset + 0] != m ||
+                                  metallic_bytes[offset + 1] != m ||
+                                  metallic_bytes[offset + 2] != m ||
+                                  metallic_bytes[offset + 3] != 255;
+                        metallic_bytes[offset + 0] = m;
+                        metallic_bytes[offset + 1] = m;
+                        metallic_bytes[offset + 2] = m;
+                        metallic_bytes[offset + 3] = 255;
                     }
                     if (paint_roughness)
                     {
                         changed = changed ||
-                                  roughness.bytes[offset + 0] != ro ||
-                                  roughness.bytes[offset + 1] != ro ||
-                                  roughness.bytes[offset + 2] != ro ||
-                                  roughness.bytes[offset + 3] != 255;
-                        roughness.bytes[offset + 0] = ro;
-                        roughness.bytes[offset + 1] = ro;
-                        roughness.bytes[offset + 2] = ro;
-                        roughness.bytes[offset + 3] = 255;
+                                  roughness_bytes[offset + 0] != ro ||
+                                  roughness_bytes[offset + 1] != ro ||
+                                  roughness_bytes[offset + 2] != ro ||
+                                  roughness_bytes[offset + 3] != 255;
+                        roughness_bytes[offset + 0] = ro;
+                        roughness_bytes[offset + 1] = ro;
+                        roughness_bytes[offset + 2] = ro;
+                        roughness_bytes[offset + 3] = 255;
                     }
                     ++out.pixels_touched;
                     if (changed)
@@ -6914,13 +6905,19 @@ namespace
                 ++out.strokes_painted;
             }
         }
+        out.compose_elapsed_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - compose_started)
+                                     .count();
 
-        out.preview_hash = mesh_first_hash_channel_bytes(albedo.bytes);
-        out.preview_hash ^= mesh_first_hash_channel_bytes(metallic.bytes);
-        out.preview_hash *= 1099511628211ULL;
-        out.preview_hash ^= mesh_first_hash_channel_bytes(roughness.bytes);
-        out.preview_hash *= 1099511628211ULL;
-        if (out.pixels_changed <= 0 || out.preview_hash == out.before_hash)
+        if (capture_after_hash)
+        {
+            out.preview_hash = mesh_first_hash_channel_bytes(albedo_bytes);
+            out.preview_hash ^= mesh_first_hash_channel_bytes(metallic_bytes);
+            out.preview_hash *= 1099511628211ULL;
+            out.preview_hash ^= mesh_first_hash_channel_bytes(roughness_bytes);
+            out.preview_hash *= 1099511628211ULL;
+        }
+        if (out.pixels_changed <= 0)
         {
             out.import_ok = true;
             out.ok = true;
@@ -6941,10 +6938,14 @@ namespace
             }
             return true;
         };
+        const auto channel_import_started = std::chrono::steady_clock::now();
         out.import_ok =
-            import_channel(sdk::EPaintChannel::Albedo, albedo.bytes, "albedo") &&
-            import_channel(sdk::EPaintChannel::Metallic, metallic.bytes, "metallic") &&
-            import_channel(sdk::EPaintChannel::Roughness, roughness.bytes, "roughness");
+            import_channel(sdk::EPaintChannel::Albedo, albedo_bytes, "albedo") &&
+            import_channel(sdk::EPaintChannel::Metallic, metallic_bytes, "metallic") &&
+            import_channel(sdk::EPaintChannel::Roughness, roughness_bytes, "roughness");
+        out.channel_import_elapsed_ms = std::chrono::duration<double, std::milli>(
+                                            std::chrono::steady_clock::now() - channel_import_started)
+                                            .count();
         if (!out.import_ok)
         {
             out.failure = import_failure;
@@ -6954,6 +6955,66 @@ namespace
         out.failure.clear();
         out.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         return out;
+    }
+
+    auto mesh_first_apply_local_material_import_preview(Reflection& ref,
+                                                        std::uintptr_t component,
+                                                        const std::vector<sdk::FPaintStroke>& strokes,
+                                                        int texture_size,
+                                                        const std::vector<std::uint8_t>* base_albedo_bytes = nullptr,
+                                                        const std::vector<std::uint8_t>* base_metallic_bytes = nullptr,
+                                                        const std::vector<std::uint8_t>* base_roughness_bytes = nullptr) -> MeshFirstLocalTextureImportResult
+    {
+        MeshFirstLocalTextureImportResult out{};
+        out.texture_size = texture_size;
+        const int size = std::max(1, texture_size);
+        const std::size_t expected_bytes = static_cast<std::size_t>(size) * static_cast<std::size_t>(size) * 4U;
+        MeshFirstChannelBytes albedo{};
+        MeshFirstChannelBytes metallic{};
+        MeshFirstChannelBytes roughness{};
+        auto prepare_channel = [&](sdk::EPaintChannel paint_channel,
+                                   const std::vector<std::uint8_t>* base_bytes,
+                                   const char* label,
+                                   MeshFirstChannelBytes& channel) -> bool {
+            if (base_bytes && !base_bytes->empty())
+            {
+                channel.ok = true;
+                channel.bytes = *base_bytes;
+                channel.failure = "ok";
+            }
+            else
+            {
+                channel = mesh_first_export_channel_bytes(ref, component, paint_channel);
+            }
+            if (!channel.ok)
+            {
+                out.failure = std::string(label) + "_export_failed:" + channel.failure;
+                return false;
+            }
+            if (channel.bytes.size() != expected_bytes)
+            {
+                out.failure = std::string(label) + "_export_size_mismatch";
+                return false;
+            }
+            return true;
+        };
+        if (!prepare_channel(sdk::EPaintChannel::Albedo, base_albedo_bytes, "albedo", albedo) ||
+            !prepare_channel(sdk::EPaintChannel::Metallic, base_metallic_bytes, "metallic", metallic) ||
+            !prepare_channel(sdk::EPaintChannel::Roughness, base_roughness_bytes, "roughness", roughness))
+        {
+            return out;
+        }
+        return mesh_first_apply_local_material_import_increment(ref,
+                                                                 component,
+                                                                 strokes,
+                                                                 0,
+                                                                 strokes.size(),
+                                                                 texture_size,
+                                                                 albedo.bytes,
+                                                                 metallic.bytes,
+                                                                 roughness.bytes,
+                                                                 true,
+                                                                 true);
     }
 
     enum class MeshFirstRegion
@@ -9404,6 +9465,8 @@ namespace
         bool local_texture_import_ok{false};
         bool local_texture_import_export_ok{false};
         bool local_texture_import_import_ok{false};
+        bool local_texture_import_incremental_enabled{false};
+        int local_texture_import_calls{0};
         int local_texture_import_texture_size{0};
         int local_texture_import_source_bytes{0};
         int local_texture_import_strokes_considered{0};
@@ -9412,8 +9475,13 @@ namespace
         int local_texture_import_pixels_changed{0};
         std::uint64_t local_texture_import_before_hash{1469598103934665603ULL};
         std::uint64_t local_texture_import_preview_hash{1469598103934665603ULL};
+        double local_texture_import_compose_elapsed_ms{0.0};
+        double local_texture_import_channel_elapsed_ms{0.0};
         double local_texture_import_elapsed_ms{-1.0};
         std::string local_texture_import_failure{};
+        std::vector<std::uint8_t> local_texture_albedo_bytes{};
+        std::vector<std::uint8_t> local_texture_metallic_bytes{};
+        std::vector<std::uint8_t> local_texture_roughness_bytes{};
         bool server_texture_sync_started{false};
         bool server_texture_sync_request_full_available{false};
         bool server_texture_sync_server_request_available{false};
@@ -10839,6 +10907,31 @@ namespace
         out += ",\"local_visual_sync_elapsed_ms\":" + std::to_string(local_elapsed_ms);
         out += ",\"local_elapsed_ms\":" + std::to_string(local_elapsed_ms);
         out += ",\"local_eta_ms\":" + std::to_string(local_eta_ms);
+        out += ",\"local_texture_import_started\":" +
+               std::string(json_bool(job && job->local_texture_import_started));
+        out += ",\"local_texture_import_ok\":" +
+               std::string(json_bool(job && job->local_texture_import_ok));
+        out += ",\"local_texture_import_incremental_enabled\":" +
+               std::string(json_bool(job && job->local_texture_import_incremental_enabled));
+        out += ",\"local_texture_import_calls\":" +
+               std::to_string(job ? job->local_texture_import_calls : 0);
+        out += ",\"local_texture_import_pacing_ms\":" +
+               std::to_string(runtime_contract::IncrementalTextureImportPacingMs);
+        out += ",\"local_texture_import_chunk_limit\":" +
+               std::to_string(job
+                                  ? runtime_contract::incremental_texture_import_chunk_limit(
+                                        job->server_batch_limit)
+                                  : runtime_contract::IncrementalTextureImportMinimumStrokes);
+        out += ",\"local_texture_import_strokes_painted\":" +
+               std::to_string(job ? job->local_texture_import_strokes_painted : 0);
+        out += ",\"local_texture_import_compose_elapsed_ms\":" +
+               std::to_string(job ? job->local_texture_import_compose_elapsed_ms : 0.0);
+        out += ",\"local_texture_import_channel_elapsed_ms\":" +
+               std::to_string(job ? job->local_texture_import_channel_elapsed_ms : 0.0);
+        out += ",\"local_texture_import_elapsed_ms\":" +
+               std::to_string(job ? job->local_texture_import_elapsed_ms : -1.0);
+        out += ",\"local_texture_import_failure\":\"" +
+               json_escape(job ? job->local_texture_import_failure : std::string{}) + "\"";
         if (job && job->server_packed_fallback)
         {
             out += ",\"local_route_mode\":\"server_packed_fallback\"";
@@ -10970,7 +11063,7 @@ namespace
                             json_bool_field(request,
                                             "replication_pacing_enabled",
                                             json_bool_field(request, "adaptive_batch_enabled", true)));
-        const bool production_direct_local_requested = runtime_contract::production_paint_uses_direct_local(
+        const bool production_texture_import_requested = runtime_contract::production_paint_uses_texture_import(
             tuning_replication_pacing_enabled,
             normal_paint_requires_packed,
             local_visual_sync_requested,
@@ -10985,8 +11078,8 @@ namespace
         bool use_internal_no_resend_local_apply = runtime_contract::requires_internal_no_resend(
             preview_only,
             unpreview_only,
-            research_local_only,
-            research_packed_only) &&
+            research_artifacts,
+            research_combined_no_resend) &&
             !use_packed_local_queue;
         const bool tuning_brush_1_enabled =
             json_bool_field(request, "brush_1_enabled", false);
@@ -10995,7 +11088,7 @@ namespace
         const bool tuning_brush_2_enabled =
             json_bool_field(request, "brush_2_enabled", true);
         const double tuning_brush_2_size_texels =
-            clamp_range(json_number_field(request, "brush_2_size_texels", 7.5), 1.0, 10.0);
+            clamp_range(json_number_field(request, "brush_2_size_texels", 5.0), 1.0, 10.0);
         const double tuning_coverage_step_texels =
             tuning_brush_1_enabled && tuning_brush_2_enabled
                 ? std::min(tuning_brush_1_size_texels, tuning_brush_2_size_texels)
@@ -12858,57 +12951,16 @@ namespace
             metadata += ",\"no_resend_common_rva\":\"" + hex_address(rva(no_resend_route.common)) + "\"";
             if (!no_resend_route.resolved)
             {
-                if (production_direct_local_requested)
-                {
-                    activate_server_packed_fallback(
-                        "the bounded local no-resend route could not be resolved: " +
-                        no_resend_route.failure);
-                }
-                else
-                {
-                    return response_json(false,
-                                         "mesh_internal_no_resend_resolver_failed",
-                                         0,
-                                         1,
-                                         "internal no-resend route validation failed for this game build: " + no_resend_route.failure,
-                                         metadata + ",\"replay_blocked\":true");
-                }
+                return response_json(false,
+                                     "mesh_internal_no_resend_resolver_failed",
+                                     0,
+                                     1,
+                                     "internal no-resend route validation failed for this game build: " + no_resend_route.failure,
+                                     metadata + ",\"replay_blocked\":true");
             }
-            else if (production_direct_local_requested)
+            else
             {
-                std::vector<std::pair<std::uintptr_t, int>> validated_descriptors{};
-                for (const auto& stroke : strokes)
-                {
-                    const auto descriptor = std::make_pair(
-                        reinterpret_cast<std::uintptr_t>(stroke.BrushSettings.BrushTexture),
-                        static_cast<int>(stroke.TargetChannel));
-                    if (std::find(validated_descriptors.begin(),
-                                  validated_descriptors.end(),
-                                  descriptor) != validated_descriptors.end())
-                    {
-                        continue;
-                    }
-                    std::string preflight_failure{};
-                    if (!sdk_validate_internal_common_no_resend_preconditions(
-                            ctx.component,
-                            no_resend_route.stroke_constructor,
-                            no_resend_route.common,
-                            stroke,
-                            preflight_failure))
-                    {
-                        activate_server_packed_fallback(
-                            "the bounded local no-resend preflight failed: " +
-                            preflight_failure);
-                        break;
-                    }
-                    validated_descriptors.push_back(descriptor);
-                }
-                if (!server_packed_fallback)
-                {
-                    metadata += ",\"local_route_mode\":\"bounded_no_resend_direct\"";
-                    metadata += ",\"direct_local_preflight_descriptors\":" +
-                                std::to_string(validated_descriptors.size());
-                }
+                metadata += ",\"local_route_mode\":\"research_no_resend_direct\"";
             }
         }
         if (use_internal_no_resend_local_apply)
@@ -13043,9 +13095,12 @@ namespace
         const bool fast_apply_component_strokes = false;
         const bool fast_apply_manager_strokes = false;
         const bool fast_apply_manager_writes = false;
-        const bool production_direct_local_active =
-            production_direct_local_requested && use_internal_no_resend_local_apply;
+        const bool local_texture_import_available =
+            ref.find_function(ctx.component, "ExportChannelToBytes") != 0 &&
+            ref.find_function(ctx.component, "ImportChannelFromBytes") != 0;
         metadata += ",\"server_paint_target_channel\":\"all\"";
+        bool production_local_texture_import_prepared = false;
+        std::string production_local_texture_import_prepare_failure{"not_requested"};
         if (preview_only)
         {
             metadata += ",\"local_paint_rpc\":\"ImportChannelFromBytes\"";
@@ -13058,6 +13113,27 @@ namespace
             metadata += ",\"local_visual_sync_lockstep_with_server_batch\":false";
             metadata += ",\"local_texture_import_required\":true";
             metadata += ",\"authoritative_replay\":\"local_texture_preview_only\"";
+        }
+        else if (production_texture_import_requested)
+        {
+            metadata += ",\"local_paint_rpc\":\"ImportChannelFromBytes\"";
+            metadata += ",\"local_paint_available\":" +
+                        std::string(json_bool(local_texture_import_available));
+            metadata += ",\"local_visual_sync_mode\":\"coalesced_incremental_local_texture_import\"";
+            metadata += ",\"local_batch_strategy\":\"three_channel_texture_import_coalesced\"";
+            metadata += ",\"local_paint_target_channel\":\"all\"";
+            metadata += ",\"local_texture_import_byte_order\":\"rgba\"";
+            metadata += ",\"local_visual_sync_required\":true";
+            metadata += ",\"local_visual_sync_after_server_success\":true";
+            metadata += ",\"local_visual_sync_after_each_server_stroke\":false";
+            metadata += ",\"local_visual_sync_after_each_server_batch\":false";
+            metadata += ",\"local_visual_sync_lockstep_with_server_batch\":false";
+            metadata += ",\"local_texture_import_required\":true";
+            metadata += ",\"local_texture_import_pacing_ms\":" +
+                        std::to_string(runtime_contract::IncrementalTextureImportPacingMs);
+            metadata += ",\"local_texture_import_minimum_strokes\":" +
+                        std::to_string(runtime_contract::IncrementalTextureImportMinimumStrokes);
+            metadata += ",\"authoritative_replay\":\"server_packed_with_incremental_local_texture_import\"";
         }
         else if (local_visual_sync_enabled)
         {
@@ -13075,9 +13151,7 @@ namespace
                         std::string(use_packed_local_queue
                                         ? "native_packed_receiver_queue"
                                         : (use_internal_no_resend_local_apply
-                                        ? (production_direct_local_active
-                                               ? "internal_common_no_resend_independent"
-                                               : "internal_common_no_resend_lockstep")
+                                        ? "internal_common_no_resend_lockstep"
                                         : (use_packed_server_batch
                                         ? "paint_at_uv_with_brush_lockstep"
                                         : "paint_at_uv_with_brush_native_replication"))) + "\"";
@@ -13085,21 +13159,18 @@ namespace
                         std::string(use_packed_local_queue
                                         ? "packed_receiver_same_limit_and_pacing"
                                         : (use_internal_no_resend_local_apply
-                                        ? (production_direct_local_active
-                                               ? "bounded_internal_no_resend_independent"
-                                               : "single_stroke_internal_no_resend_lockstep")
+                                        ? "single_stroke_internal_no_resend_lockstep"
                                         : (use_packed_server_batch ? "single_stroke_lockstep" : "single_stroke_local_only"))) + "\"";
             metadata += ",\"local_paint_target_channel\":\"all\"";
             metadata += ",\"local_visual_sync_required\":true";
             metadata += ",\"local_visual_sync_after_server_success\":" + std::string(json_bool(use_packed_server_batch));
             metadata += ",\"local_visual_sync_after_each_server_stroke\":" +
                         std::string(json_bool(use_packed_server_batch &&
-                                              !use_packed_local_queue &&
-                                              !production_direct_local_active));
+                                              !use_packed_local_queue));
             metadata += ",\"local_visual_sync_after_each_server_batch\":" +
                         std::string(json_bool(use_packed_server_batch && use_packed_local_queue));
             metadata += ",\"local_visual_sync_lockstep_with_server_batch\":" +
-                        std::string(json_bool(use_packed_server_batch && !production_direct_local_active));
+                        std::string(json_bool(use_packed_server_batch));
             metadata += ",\"local_texture_import_required\":false";
             metadata += ",\"authoritative_replay\":\"" +
                         std::string(use_packed_local_queue
@@ -13107,9 +13178,7 @@ namespace
                                                ? "research_server_packed_with_native_local_receiver_queue"
                                                : "server_packed_with_native_local_receiver_queue")
                                         : (use_internal_no_resend_local_apply
-                                        ? (production_direct_local_active
-                                               ? "server_packed_with_internal_no_resend_local_independent"
-                                               : "server_packed_with_internal_no_resend_local_lockstep")
+                                        ? "server_packed_with_internal_no_resend_local_lockstep"
                                         : (use_packed_server_batch
                                         ? (use_packed_relay_route
                                                ? "server_relay_packed_replay_with_local_lockstep"
@@ -13237,7 +13306,9 @@ namespace
         MeshFirstPreviewSnapshot existing_preview_snapshot{};
         bool preview_snapshot_reused = false;
         bool preview_snapshot_component_mismatch = false;
-        if (preview_only)
+        const bool local_texture_base_required =
+            preview_only || production_texture_import_requested;
+        if (local_texture_base_required)
         {
             existing_preview_snapshot = mesh_first_preview_snapshot_copy();
             if (existing_preview_snapshot.available && !existing_preview_snapshot.albedo_bytes.empty() &&
@@ -13265,7 +13336,10 @@ namespace
                 roughness_before_bytes = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Roughness);
             }
         }
-        if (preview_only && albedo_before_bytes.ok && metallic_before_bytes.ok && roughness_before_bytes.ok)
+        if (local_texture_base_required &&
+            albedo_before_bytes.ok &&
+            metallic_before_bytes.ok &&
+            roughness_before_bytes.ok)
         {
             albedo_before.ok = true;
             albedo_before.bytes = static_cast<int>(albedo_before_bytes.bytes.size());
@@ -13278,7 +13352,7 @@ namespace
         }
         else
         {
-            albedo_before.failure = preview_only
+            albedo_before.failure = local_texture_base_required
                                         ? ("albedo:" + albedo_before_bytes.failure +
                                            ";metallic:" + metallic_before_bytes.failure +
                                            ";roughness:" + roughness_before_bytes.failure)
@@ -13295,7 +13369,9 @@ namespace
         metadata += ",\"preview_snapshot_reused\":" + std::string(json_bool(preview_snapshot_reused));
         metadata += ",\"preview_snapshot_component_mismatch_before\":" + std::string(json_bool(preview_snapshot_component_mismatch));
         metadata += ",\"albedo_before_source\":\"" +
-                    std::string(preview_snapshot_reused ? "preview_snapshot" : (preview_only ? "export_channel" : "skipped")) + "\"";
+                    std::string(preview_snapshot_reused
+                                    ? "preview_snapshot"
+                                    : (local_texture_base_required ? "export_channel" : "skipped")) + "\"";
         if (!albedo_before.ok)
         {
             metadata += ",\"albedo_export_before_failure\":\"" + json_escape(albedo_before.failure) + "\"";
@@ -13394,6 +13470,40 @@ namespace
                                  result.ok ? "local preview material texture imported" : "local preview material texture import failed: " + result.failure,
                                  metadata);
         }
+        if (production_texture_import_requested)
+        {
+            const std::size_t expected_texture_bytes =
+                static_cast<std::size_t>(std::max(1, active_texture_size)) *
+                static_cast<std::size_t>(std::max(1, active_texture_size)) * 4U;
+            production_local_texture_import_prepared =
+                local_texture_import_available &&
+                albedo_before_bytes.ok &&
+                metallic_before_bytes.ok &&
+                roughness_before_bytes.ok &&
+                albedo_before_bytes.bytes.size() == expected_texture_bytes &&
+                metallic_before_bytes.bytes.size() == expected_texture_bytes &&
+                roughness_before_bytes.bytes.size() == expected_texture_bytes;
+            if (production_local_texture_import_prepared)
+            {
+                production_local_texture_import_prepare_failure.clear();
+                metadata += ",\"local_route_mode\":\"local_texture_import_incremental\"";
+                metadata += ",\"local_texture_import_completion\":\"coalesced_after_server_submission\"";
+            }
+            else
+            {
+                production_local_texture_import_prepare_failure =
+                    !local_texture_import_available
+                        ? "channel_texture_import_schema_unavailable"
+                        : (!albedo_before.ok
+                               ? albedo_before.failure
+                               : "channel_texture_import_buffer_size_mismatch");
+                metadata += ",\"local_texture_import_preflight_failure\":\"" +
+                            json_escape(production_local_texture_import_prepare_failure) + "\"";
+                activate_server_packed_fallback(
+                    "the painter-local texture import failed before server submission: " +
+                    production_local_texture_import_prepare_failure);
+            }
+        }
 
         if (queued_job)
         {
@@ -13449,6 +13559,19 @@ namespace
             async_job->server_packed_fallback_reason = server_packed_fallback_reason;
             async_job->strokes = std::move(strokes);
             async_job->initial_stroke_count = static_cast<int>(async_job->strokes.size());
+            if (production_local_texture_import_prepared)
+            {
+                async_job->local_texture_import_incremental_enabled = true;
+                async_job->local_texture_import_export_ok = true;
+                async_job->local_texture_import_texture_size = active_texture_size;
+                async_job->local_texture_import_source_bytes = static_cast<int>(
+                    albedo_before_bytes.bytes.size() +
+                    metallic_before_bytes.bytes.size() +
+                    roughness_before_bytes.bytes.size());
+                async_job->local_texture_albedo_bytes = std::move(albedo_before_bytes.bytes);
+                async_job->local_texture_metallic_bytes = std::move(metallic_before_bytes.bytes);
+                async_job->local_texture_roughness_bytes = std::move(roughness_before_bytes.bytes);
+            }
             if (async_job->internal_no_resend_local_apply_enabled)
             {
                 for (std::size_t index = 0; index < async_job->strokes.size(); ++index)
@@ -13474,9 +13597,11 @@ namespace
                 }
             }
             async_job->metadata = metadata +
-                                  std::string(use_packed_local_queue
-                                                  ? ",\"server_batch_schedule\":\"same_pacing_packed_lanes\""
-                                                  : ",\"server_batch_schedule\":\"independent_lanes\"");
+                                  std::string(production_local_texture_import_prepared
+                                                  ? ",\"server_batch_schedule\":\"independent_server_with_coalesced_local_import\""
+                                                  : (use_packed_local_queue
+                                                         ? ",\"server_batch_schedule\":\"same_pacing_packed_lanes\""
+                                                         : ",\"server_batch_schedule\":\"independent_lanes\""));
             async_job->albedo_before = albedo_before;
             async_job->replication_before = replication_before;
             async_job->local_packed_queue_initial_queue =
@@ -14114,12 +14239,14 @@ namespace
                 job->local_texture_import_started &&
                 job->local_texture_import_ok &&
                 job->local_texture_import_failure.empty();
-            const bool server_only_replay_ok =
-                !job->local_visual_sync_enabled &&
-                !job->local_texture_import_started &&
-                !job->server_texture_sync_started &&
-                job->server_batch_failures == 0 &&
-                job->server_strokes_sent == static_cast<int>(job->strokes.size());
+            const bool server_only_replay_ok = runtime_contract::server_only_replay_complete(
+                job->local_visual_sync_enabled,
+                job->local_texture_import_started,
+                job->server_texture_sync_started,
+                job->server_packed_fallback,
+                job->server_batch_failures,
+                job->server_strokes_sent,
+                static_cast<int>(job->strokes.size()));
             const bool visual_sync_ok =
                 server_only_replay_ok ||
                 (job->local_visual_sync_enabled ? local_visual_sync_ok : (local_texture_import_ok || server_texture_sync_ok));
@@ -14164,6 +14291,15 @@ namespace
             metadata += ",\"local_texture_import_ok\":" + std::string(json_bool(job->local_texture_import_ok));
             metadata += ",\"local_texture_import_export_ok\":" + std::string(json_bool(job->local_texture_import_export_ok));
             metadata += ",\"local_texture_import_import_ok\":" + std::string(json_bool(job->local_texture_import_import_ok));
+            metadata += ",\"local_texture_import_incremental_enabled\":" +
+                        std::string(json_bool(job->local_texture_import_incremental_enabled));
+            metadata += ",\"local_texture_import_calls\":" +
+                        std::to_string(job->local_texture_import_calls);
+            metadata += ",\"local_texture_import_pacing_ms\":" +
+                        std::to_string(runtime_contract::IncrementalTextureImportPacingMs);
+            metadata += ",\"local_texture_import_chunk_limit\":" +
+                        std::to_string(runtime_contract::incremental_texture_import_chunk_limit(
+                            job->server_batch_limit));
             metadata += ",\"local_texture_import_texture_size\":" + std::to_string(job->local_texture_import_texture_size);
             metadata += ",\"local_texture_import_source_bytes\":" + std::to_string(job->local_texture_import_source_bytes);
             metadata += ",\"local_texture_import_strokes_considered\":" + std::to_string(job->local_texture_import_strokes_considered);
@@ -14172,6 +14308,10 @@ namespace
             metadata += ",\"local_texture_import_pixels_changed\":" + std::to_string(job->local_texture_import_pixels_changed);
             metadata += ",\"local_texture_import_before_hash\":\"" + std::to_string(job->local_texture_import_before_hash) + "\"";
             metadata += ",\"local_texture_import_preview_hash\":\"" + std::to_string(job->local_texture_import_preview_hash) + "\"";
+            metadata += ",\"local_texture_import_compose_elapsed_ms\":" +
+                        std::to_string(job->local_texture_import_compose_elapsed_ms);
+            metadata += ",\"local_texture_import_channel_elapsed_ms\":" +
+                        std::to_string(job->local_texture_import_channel_elapsed_ms);
             metadata += ",\"local_texture_import_elapsed_ms\":" + std::to_string(job->local_texture_import_elapsed_ms);
             metadata += ",\"local_texture_import_failure\":\"" + json_escape(job->local_texture_import_failure) + "\"";
             metadata += ",\"server_texture_sync_started\":" + std::string(json_bool(job->server_texture_sync_started));
@@ -15230,12 +15370,33 @@ namespace
                 }
             }
 
+            std::size_t incremental_texture_import_pass_boundary = job->strokes.size();
+            if (job->local_offset < job->replay_fill_end)
+            {
+                incremental_texture_import_pass_boundary = job->replay_fill_end;
+            }
+            else if (job->local_offset < job->replay_coarse_end)
+            {
+                incremental_texture_import_pass_boundary = job->replay_coarse_end;
+            }
+            const int incremental_texture_import_chunk_limit =
+                runtime_contract::incremental_texture_import_chunk_limit(job->server_batch_limit);
+            const std::size_t incremental_texture_import_pending =
+                runtime_contract::incremental_texture_import_count(
+                    job->server_offset,
+                    job->local_offset,
+                    job->strokes.size(),
+                    static_cast<std::size_t>(incremental_texture_import_chunk_limit),
+                    incremental_texture_import_pass_boundary);
             const bool local_due = job->local_packed_queue_enabled
                                        ? paired_local_packed_count > 0
-                                       : local_due_by_time;
+                                       : (local_due_by_time &&
+                                          (!job->local_texture_import_incremental_enabled ||
+                                           incremental_texture_import_pending > 0));
             if (local_due)
             {
                 if (!job->local_packed_queue_enabled &&
+                    !job->local_texture_import_incremental_enabled &&
                     !job->internal_no_resend_local_apply_enabled &&
                     !job->local_paint_at_uv_function)
                 {
@@ -15253,12 +15414,85 @@ namespace
                 const std::size_t local_count_cap = std::min<std::size_t>(
                     job->local_packed_queue_enabled
                         ? paired_local_packed_count
-                        : static_cast<std::size_t>(std::max(1, job->local_visual_sync_batch_limit)),
+                        : (job->local_texture_import_incremental_enabled
+                               ? incremental_texture_import_pending
+                               : static_cast<std::size_t>(std::max(1, job->local_visual_sync_batch_limit))),
                     job->strokes.size() - job->local_offset);
                 const auto local_dispatch_started = std::chrono::steady_clock::now();
                 std::size_t local_count = 0;
                 int local_render_target_writes = 0;
-                if (job->local_packed_queue_enabled)
+                if (job->local_texture_import_incremental_enabled)
+                {
+                    Reflection ref{};
+                    std::string init_failure{};
+                    MeshFirstLocalTextureImportResult result{};
+                    if (!ref.init(init_failure))
+                    {
+                        result.failure = "reflection_unavailable:" + init_failure;
+                    }
+                    else
+                    {
+                        result = mesh_first_apply_local_material_import_increment(
+                            ref,
+                            job->component,
+                            job->strokes,
+                            job->local_offset,
+                            local_count_cap,
+                            job->texture_size,
+                            job->local_texture_albedo_bytes,
+                            job->local_texture_metallic_bytes,
+                            job->local_texture_roughness_bytes,
+                            job->local_texture_import_calls == 0,
+                            job->local_offset + local_count_cap >= job->strokes.size());
+                    }
+                    job->local_texture_import_started = true;
+                    ++job->local_texture_import_calls;
+                    job->local_texture_import_ok = result.ok;
+                    job->local_texture_import_export_ok = result.export_ok;
+                    job->local_texture_import_import_ok = result.import_ok;
+                    job->local_texture_import_texture_size = result.texture_size;
+                    job->local_texture_import_source_bytes = result.source_bytes;
+                    job->local_texture_import_strokes_considered += result.strokes_considered;
+                    job->local_texture_import_strokes_painted += result.strokes_painted;
+                    job->local_texture_import_pixels_touched += result.pixels_touched;
+                    job->local_texture_import_pixels_changed += result.pixels_changed;
+                    if (job->local_texture_import_calls == 1)
+                    {
+                        job->local_texture_import_before_hash = result.before_hash;
+                    }
+                    job->local_texture_import_preview_hash = result.preview_hash;
+                    job->local_texture_import_compose_elapsed_ms += result.compose_elapsed_ms;
+                    job->local_texture_import_channel_elapsed_ms += result.channel_import_elapsed_ms;
+                    job->local_texture_import_elapsed_ms =
+                        std::max(0.0, job->local_texture_import_elapsed_ms) + result.elapsed_ms;
+                    job->local_texture_import_failure = result.failure;
+                    if (!result.ok)
+                    {
+                        job->local_stroke_failures += static_cast<int>(local_count_cap);
+                        job->local_visual_sync_failure = result.failure.empty()
+                                                             ? "incremental_texture_import_failed"
+                                                             : result.failure;
+                        activate_server_packed_fallback(
+                            "the painter-local incremental texture import failed after a server batch was submitted: " +
+                            job->local_visual_sync_failure);
+                        job->local_texture_import_incremental_enabled = false;
+                        job->local_texture_albedo_bytes.clear();
+                        job->local_texture_metallic_bytes.clear();
+                        job->local_texture_roughness_bytes.clear();
+                    }
+                    else
+                    {
+                        if (job->local_texture_import_calls == 1)
+                        {
+                            mesh_first_clear_preview_snapshot();
+                        }
+                        local_count = local_count_cap;
+                        job->local_stroke_calls += static_cast<int>(local_count);
+                        job->local_stroke_success += static_cast<int>(local_count);
+                        local_render_target_writes = result.import_ok ? 3 : 0;
+                    }
+                }
+                else if (job->local_packed_queue_enabled)
                 {
                     if (local_count_cap == 0 || !live_uobject_not_destroyed(job->replication_manager) ||
                         !job->replication_component_queued_count_function)
@@ -15477,13 +15711,17 @@ namespace
                 job->local_dispatch_max_ms = std::max(job->local_dispatch_max_ms,
                                                        local_dispatch_elapsed_ms);
                 job->local_visual_sync_elapsed_ms = mesh_first_local_elapsed_ms(job);
-                job->local_next_dispatch_time = job->local_packed_queue_enabled
+                job->local_next_dispatch_time = job->local_texture_import_incremental_enabled
+                                                    ? std::chrono::steady_clock::now() +
+                                                          std::chrono::milliseconds(
+                                                              runtime_contract::IncrementalTextureImportPacingMs)
+                                                    : (job->local_packed_queue_enabled
                                                     ? job->server_next_dispatch_time
                                                     : (job->internal_no_resend_local_apply_enabled
                                                            ? std::chrono::steady_clock::now()
                                                            : std::chrono::steady_clock::now() +
                                                           std::chrono::milliseconds(
-                                                              std::max(1, job->local_visual_sync_delay_ms)));
+                                                              std::max(1, job->local_visual_sync_delay_ms))));
             }
 
             if (job->local_packed_queue_enabled &&

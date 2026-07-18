@@ -18,6 +18,8 @@ namespace runtime_contract
     constexpr int DirectLocalImmediateRepostsPerDeferredWakeup = 1;
     constexpr int MaximumNetworkBatchLimit = 500;
     constexpr int FastLocalCadenceMs = 17;
+    constexpr int IncrementalTextureImportPacingMs = 100;
+    constexpr int IncrementalTextureImportMinimumStrokes = 40;
     constexpr int FallbackOutgoingStrokesPerBatch = 20;
     constexpr int FallbackOutgoingBatchesPerSecond = 20;
     constexpr int FallbackReplicatedStrokesPerTick = 24;
@@ -265,15 +267,57 @@ namespace runtime_contract
                 false};
     }
 
-    constexpr bool production_paint_uses_direct_local(bool auto_adapt,
-                                                      bool normal_paint_requires_packed,
-                                                      bool local_visual_sync_requested,
-                                                      bool research_artifacts)
+    constexpr bool production_paint_uses_texture_import(bool auto_adapt,
+                                                        bool normal_paint_requires_packed,
+                                                        bool local_visual_sync_requested,
+                                                        bool research_artifacts)
     {
         (void)auto_adapt;
         return normal_paint_requires_packed &&
                local_visual_sync_requested &&
                !research_artifacts;
+    }
+
+    constexpr int incremental_texture_import_chunk_limit(int server_batch_limit)
+    {
+        return max_value(IncrementalTextureImportMinimumStrokes,
+                         clamp_value(server_batch_limit, 1, MaximumNetworkBatchLimit));
+    }
+
+    constexpr std::size_t incremental_texture_import_count(std::size_t server_offset,
+                                                           std::size_t local_offset,
+                                                           std::size_t total_strokes,
+                                                           std::size_t max_strokes,
+                                                           std::size_t pass_boundary)
+    {
+        const std::size_t submitted = std::min(server_offset, total_strokes);
+        const std::size_t imported = std::min(local_offset, total_strokes);
+        if (submitted <= imported)
+        {
+            return 0;
+        }
+        const std::size_t available = submitted - imported;
+        const std::size_t bounded_max = std::max<std::size_t>(1, max_strokes);
+        const std::size_t boundary = std::min(pass_boundary, total_strokes);
+        const std::size_t before_boundary = boundary > imported
+                                                ? boundary - imported
+                                                : available;
+        return std::min(available, std::min(bounded_max, before_boundary));
+    }
+
+    constexpr bool server_only_replay_complete(bool local_visual_sync_enabled,
+                                               bool local_texture_import_started,
+                                               bool server_texture_sync_started,
+                                               bool server_packed_fallback,
+                                               int server_batch_failures,
+                                               int server_strokes_sent,
+                                               int total_strokes)
+    {
+        return !local_visual_sync_enabled &&
+               (server_packed_fallback ||
+                (!local_texture_import_started && !server_texture_sync_started)) &&
+               server_batch_failures == 0 &&
+               server_strokes_sent == total_strokes;
     }
 
     constexpr bool uses_fast_local_dispatch_wakeup(bool internal_no_resend_local_apply,
@@ -675,11 +719,12 @@ namespace runtime_contract
 
     constexpr bool requires_internal_no_resend(bool preview_only,
                                                 bool unpreview_only,
-                                                bool research_local_only,
-                                                bool research_packed_only)
+                                                bool research_artifacts,
+                                                bool research_combined_no_resend)
     {
-        const bool packed_server_route = !preview_only && !unpreview_only && !research_local_only;
-        const bool local_visual_apply = !preview_only && !unpreview_only && !research_packed_only;
-        return packed_server_route && local_visual_apply;
+        return !preview_only &&
+               !unpreview_only &&
+               research_artifacts &&
+               research_combined_no_resend;
     }
 }

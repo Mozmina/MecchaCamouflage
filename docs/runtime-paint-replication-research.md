@@ -14,16 +14,14 @@ Issue #87 investigation, see
 Normal paint uses the direct component route:
 
 - `RuntimePaintableComponent.ServerPackedPaintBatch`
-- painter-side application through the validated internal-common no-resend
-  routine, independently capped at 6 calls and a 4-ms CPU budget per dispatch
-- Auto Adapt defaults ON and derives only the server batch boundary and pacing
+- painter-side application by coalescing successfully submitted strokes into
+  working Albedo, Metallic, and Roughness bytes, then importing those channels
+  no more often than every 100 ms
+- Auto Adapt defaults ON and derives the server batch boundary and pacing
   from readable game limits (fixed 20/50 fallback). When OFF, manual controls
-  accept 1--500 strokes and 1--500 ms for the server lane. Local scheduling is
-  bounded identically in both modes
-- reflected payload layout plus a unique machine-code/call-chain resolution of
-  the UFunction thunk, vtable slot, decoder, component-to-manager resolver, and
-  enqueue chain before the first local packed submission; PE/text identity is
-  diagnostic metadata rather than a version gate
+  accept 1--500 strokes and 1--500 ms. Local imports use at least 40 strokes,
+  or one larger configured server batch, to avoid a full texture upload per
+  small network batch
 - packed-wire UV radius scale `1.0`; each Fill/Brush 1/Brush 2 anchor derives a
   world radius from that triangle's UV-to-world Jacobian and serializes it per
   stroke, without sharing the batch maximum
@@ -33,13 +31,13 @@ Normal paint uses the direct component route:
 - the effective subdivision tail is exactly `level=0`, `pixel-size=0`,
   `template-resolution=0`, allowing receiver preflight to select the component
   defaults. These fields are not brush diameter bytes
-- if the local no-resend resolver or read-only preflight becomes unavailable,
-  local calls stop and `ServerPackedPaintBatch` continues at the fixed
+- if painter-local texture export/import fails, local work stops and
+  `ServerPackedPaintBatch` continues at the fixed
   20 strokes / 50 ms fallback rate
 - no fallback to old compact/adaptive `SendCustom` path
-- no automatic fallback to the packed receiver queue or reflected
-  `PaintAtUVWithBrush` route. The packed receiver remains an explicit research
-  A/B mode
+- no automatic fallback to internal-common no-resend, the packed receiver
+  queue, or reflected `PaintAtUVWithBrush`; they remain explicit research A/B
+  modes
 - server packed schema/payload/source-ID failure still stops paint with explicit
   metadata
 
@@ -55,12 +53,13 @@ Different camouflage colors therefore commonly turn one packed network batch
 into per-stroke surface generation. Network batch size and render batch size
 must not be treated as equivalent in FPS analysis.
 
-Painter-local receiver backlog is not remote-peer pressure and does not back
-off the outgoing server lane. The game-owned receiver/render budgets drain it
-asynchronously without modifying any game limit. The production route must
-remain small and deterministic. Research probes and artifact collection must
-not change normal route selection; research mode names explicitly choose their
-A/B route.
+Painter-local texture import is not remote-peer pressure and does not back off
+the outgoing server lane, but it follows the successfully submitted stroke
+cursor so the painter sees Fill and Brush passes progress in order. Remote
+game-owned receiver/render budgets still drain asynchronously. The production
+route must remain small and deterministic.
+Research probes and artifact collection must not change normal route selection;
+research mode names explicitly choose their A/B route.
 
 ## Research Entry Points
 

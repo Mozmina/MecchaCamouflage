@@ -28,30 +28,29 @@ research build script when those capabilities are required.
 Normal multiplayer paint uses independent server and painter-local lanes:
 
 - `RuntimePaintableComponent.ServerPackedPaintBatch` sends the server batch.
-- The painter uses the validated `internal common no-resend` direct lane at
-  most 6 calls and a 4-ms game-thread CPU budget per dispatch.
+- The painter coalesces only successfully submitted strokes into working
+  Albedo, Metallic, and Roughness bytes and calls `ImportChannelFromBytes` at
+  most every 100 ms. The local chunk is at least 40 strokes, or one larger
+  configured server batch, and never crosses a Fill/Brush pass boundary. This
+  preserves pass order without applying the completed Preview texture at paint
+  start.
 - The game module identity and resolved RVAs are diagnostics, not version gates.
-- If the local resolver or its read-only preflight is unavailable, no local
-  call is made. `ServerPackedPaintBatch` continues at the fixed
+- If local texture export/import fails, no per-stroke local fallback is used.
+  `ServerPackedPaintBatch` continues at the fixed
   fallback rate of 20 strokes / 50 ms.
-- Normal paint never falls back automatically to the packed receiver queue,
-  reflected `PaintAtUVWithBrush`, compact/adaptive routes, or a texture-sync
-  route.
+- Normal paint never falls back automatically to internal-common no-resend,
+  the packed receiver queue, reflected `PaintAtUVWithBrush`, compact/adaptive
+  routes, or a texture-sync transport.
 - Auto Adapt defaults ON and derives the fastest safe batch/pacing values from
   readable game-owned limits, falling back to 20 strokes / 50 ms when those
   properties are unavailable. Its controls are disabled while ON. With Auto
-  Adapt OFF, both server controls are editable from 1--500. Local scheduling
-  remains bounded and independent in both modes. It permits one immediate
-  repost after each deferred wakeup, then returns to an out-of-thread
-  timer-queue wakeup. Its resolver validates the reflected parameter schema,
-  masked machine-code signatures, relative calls, and a unique candidate;
-  PE/text identity and fixed RVAs are diagnostic only. If the direct route or
-  its read-only preflight is unavailable before submission, paint continues
-  server-only at 20/50 and emits one WARN with the fallback values.
+  Adapt OFF, both server controls are editable from 1--500. Painter-local
+  import is identical in both modes. If it fails before submission, paint
+  continues server-only at 20/50 and emits one WARN with the fallback values.
 
 Brush 1 and Brush 2 are independently enabled. Brush 1 ranges from 10--50
 texels, defaults to 25, and defaults OFF. Brush 2 ranges from 1--10 texels,
-defaults to 7.5, and defaults ON. At least one brush must remain enabled. The
+defaults to 5, and defaults ON. At least one brush must remain enabled. The
 planner emits one 100-texel Fill pass over all mesh regions if any region
 selects `Fill`, including regions configured as Paint or Skip. It then emits
 only the enabled paint passes for Paint regions in Brush 1 then Brush 2 order.
@@ -68,10 +67,10 @@ does not reuse its largest triangle radius. A live Brush 2 size-5 check changed
 for the old uniform 3.5 wire scale. Uniform scale and mesh-average calibration
 remain research-only A/B controls and cannot block normal paint.
 
-On the local route, completion means that every bounded no-resend call returned
-with its dispatch postcondition. It does not prove final pixel presentation. In
-server fallback, completion and progress mean server batch submission completed.
-Neither result proves that another client has presented its final pixels.
+On the local route, completion means all three channel imports succeeded and
+server batch submission completed. In server fallback, completion and progress
+mean server batch submission completed. Neither result proves that another
+client has presented its final pixels.
 
 ## Packed Receiver Research Cancellation
 

@@ -89,9 +89,9 @@ stroke for a controlled footprint comparison; its index is the full replay
 order, before the selector reduces the emitted plan to one entry.
 
 `--paint-mode` and `--stroke-limit` are research-only A/B controls.
-`combined-no-resend` is the production-shaped local-application comparison:
-server packed submission and bounded internal-common no-resend application use
-independent lanes. `packed-local-queue` remains an explicit receiver-queue A/B
+`combined-no-resend` preserves the former per-stroke production local primitive
+for comparison with the current texture-import route. `packed-local-queue`
+remains an explicit receiver-queue A/B
 mode and is selected when `--paint-mode` is omitted by the research runner.
 `combined` retains the superseded reflected local route for controlled
 comparison. `local-only` keeps the reflected `PaintAtUVWithBrush`
@@ -134,9 +134,8 @@ unavailable. To reproduce the former conservative
 comparison without a special mode, pass `--batch-limit 6 --batch-pacing-ms 75`.
 Research route selection remains explicit: batch overrides alone do not switch
 the runner away from `packed-local-queue`; use `--paint-mode combined-no-resend`
-to measure the same bounded no-resend local primitive selected by production
-in both Auto Adapt and manual modes, including one immediate slice repost
-followed by a deferred wakeup. The packed local route uses the same batch limit
+to measure the bounded no-resend research primitive, including one immediate
+slice repost followed by a deferred wakeup. The packed local route uses the same batch limit
 and pacing as the server lane only for its explicit research comparison.
 The legacy `combined` A/B route still has its 6-call/4-ms CPU yield. Deferred
 scheduler wakeups are always delayed by at least 1 ms. These controls change
@@ -174,18 +173,19 @@ terminate as cancelled, and requires event-watch to reach
 runner skips its normal `finally` shutdown even when the result is
 indeterminate; it does not obscure the evidence with an automatic retry.
 
-Normal production paint keeps the explicit server packed RPC and applies the
-painter-local copy through the bounded internal-common no-resend route. It does
-not invoke the packed receiver queue or reflected `PaintAtUVWithBrush`. If the
-no-resend resolver or read-only preflight fails, local calls stop and the server
-packed route continues at 20 strokes / 50 ms. The packed receiver resolver and
-its exact queue checks remain available only in explicit research mode.
+Normal production paint submits packed server batches, coalesces already
+submitted strokes into the painter's working Albedo, Metallic, and Roughness
+bytes, then imports the three channels at most every 100 ms. It does not invoke
+internal-common no-resend, the packed receiver queue, or reflected
+`PaintAtUVWithBrush`. If local texture import fails, the server packed route
+continues at 20 strokes / 50 ms. Per-stroke and packed receiver paths remain
+available only in explicit research modes.
 
 The planner uses `Fill`, `CoarsePaint`, then `FinePaint`; each pass retains
 only the enabled Brushes. If any region selects Fill, one 100-texel Fill pass
 covers every mesh region, including Paint and Skip. Paint regions then receive
 an optional deduplicated Brush 1 pass (10--50, default 25 and OFF) and/or the
-full Brush 2 pass (1--10, default 7.5 and ON). With no Fill region, no Fill pass
+full Brush 2 pass (1--10, default 5 and ON). With no Fill region, no Fill pass
 is emitted. Pass boundaries never share a packed RPC. Within each pass, all
 regions are ordered together from top to bottom and left to right using
 current-pose world positions projected into

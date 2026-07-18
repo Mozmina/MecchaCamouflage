@@ -119,20 +119,19 @@ Collect these separately for painter-as-host and painter-as-joining-client:
   - `PaintAtUVWithBrush == 0`
   - legacy full-stroke multicast calls are `0`
 - production-route metadata:
-  - either the local route resolves uniquely, or
+  - either `local_route_mode == "local_texture_import"`, or
     `local_route_mode == "server_packed_fallback"`
   - for the local route:
-    - `local_packed_queue_exact_manager_class_ok == true`
-    - packed/local batch boundaries and stroke totals are identical
-    - `local_packed_queue_strokes_submitted == server_strokes_sent`
-    - `local_packed_queue_delta_mismatches == 0`
-    - `local_packed_queue_call_exceptions == 0`
-    - `server_local_diverged == false` on interrupted runs
+    - `local_texture_import_ok == true`
+    - `local_texture_import_export_ok == true`
+    - `local_texture_import_import_ok == true`
+    - `local_texture_import_strokes_painted` equals the planned stroke count
+    - `local_apply_calls_validated == 0`
   - for fallback:
     - `fallback_reason` preserves the triggering local error
     - `fallback_batch_limit == 20`
     - `fallback_pacing_ms == 50`
-    - no local enqueue or local queue-drain phase starts after fallback
+    - no per-stroke local apply, enqueue, or queue-drain phase starts after fallback
   - `packed_mesh_radius_scale_effective == 1.0` in production
   - `packed_mesh_radius_scale_source == production_triangle_world_radius_per_stroke`
   - `replay_triangle_world_radius_normalization == per_stroke`
@@ -140,13 +139,19 @@ Collect these separately for painter-as-host and painter-as-joining-client:
   - per-pass effective subdivision level/pixel-size/template-resolution are
     all zero sentinels before packed decode
 - before/after texture probes show a nontrivial changed-texel area on the
-  painter's resolved component after queue drain. Record
+  painter's resolved component after terminal completion. Record
   `texture_delta.pixels_changed_any_channel` and its ratio; checksum inequality
   alone is insufficient because a few tiny dots also change the hash. Collect
   corresponding remote-client changed-texel evidence after replication and
   require both replication queues to return to zero. Inspect the coordinate
   dump or the character as well: a regular point grid with gaps is a failure
   even when changed-texel count is nontrivial
+- normal Paint must not apply the completed Preview texture at start. Confirm
+  `local_texture_import_calls` advances with successful server batches and the
+  painter visibly progresses through Fill and enabled Brush passes.
+  Record `local_texture_import_compose_elapsed_ms` and
+  `local_texture_import_channel_elapsed_ms`; channel import must not be confused
+  with CPU-only stroke composition when investigating FPS drops.
 
 Do not release if joining-client paint crashes the server, or if other clients
 finish closer to the old multi-minute replication drain path than to the new

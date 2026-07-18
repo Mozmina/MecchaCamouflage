@@ -45,11 +45,11 @@ int main()
         return 3;
     }
 
-    if (!runtime_contract::requires_internal_no_resend(false, false, false, false) ||
-        runtime_contract::requires_internal_no_resend(true, false, false, false) ||
-        runtime_contract::requires_internal_no_resend(false, true, false, false) ||
-        runtime_contract::requires_internal_no_resend(false, false, true, false) ||
+    if (!runtime_contract::requires_internal_no_resend(false, false, true, true) ||
+        runtime_contract::requires_internal_no_resend(true, false, true, true) ||
+        runtime_contract::requires_internal_no_resend(false, true, true, true) ||
         runtime_contract::requires_internal_no_resend(false, false, false, true) ||
+        runtime_contract::requires_internal_no_resend(false, false, true, false) ||
         runtime_contract::InternalNoResendMaxCallsPerTick != 6)
     {
         return 4;
@@ -120,11 +120,31 @@ int main()
         return 8;
     }
 
-    if (!runtime_contract::production_paint_uses_direct_local(false, true, true, false) ||
-        !runtime_contract::production_paint_uses_direct_local(true, true, true, false) ||
-        runtime_contract::production_paint_uses_direct_local(false, false, true, false) ||
-        runtime_contract::production_paint_uses_direct_local(false, true, false, false) ||
-        runtime_contract::production_paint_uses_direct_local(false, true, true, true))
+    if (!runtime_contract::production_paint_uses_texture_import(false, true, true, false) ||
+        !runtime_contract::production_paint_uses_texture_import(true, true, true, false) ||
+        runtime_contract::production_paint_uses_texture_import(false, false, true, false) ||
+        runtime_contract::production_paint_uses_texture_import(false, true, false, false) ||
+        runtime_contract::production_paint_uses_texture_import(false, true, true, true))
+    {
+        return 8;
+    }
+    if (runtime_contract::incremental_texture_import_chunk_limit(20) != 40 ||
+        runtime_contract::incremental_texture_import_chunk_limit(500) != 500 ||
+        runtime_contract::IncrementalTextureImportPacingMs != 100 ||
+        runtime_contract::incremental_texture_import_count(0, 0, 7'506, 40, 332) != 0 ||
+        runtime_contract::incremental_texture_import_count(20, 0, 7'506, 40, 332) != 20 ||
+        runtime_contract::incremental_texture_import_count(60, 20, 7'506, 40, 332) != 40 ||
+        runtime_contract::incremental_texture_import_count(500, 320, 7'506, 500, 332) != 12 ||
+        runtime_contract::incremental_texture_import_count(8'000, 7'506, 7'506, 500, 7'506) != 0)
+    {
+        return 8;
+    }
+    if (!runtime_contract::server_only_replay_complete(
+            false, true, false, true, 0, 7'506, 7'506) ||
+        runtime_contract::server_only_replay_complete(
+            false, true, false, false, 0, 7'506, 7'506) ||
+        runtime_contract::server_only_replay_complete(
+            false, false, false, true, 1, 7'506, 7'506))
     {
         return 8;
     }
