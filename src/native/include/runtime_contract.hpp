@@ -15,6 +15,7 @@ namespace runtime_contract
     // ElementSize@0x34, PropertyFlags@0x38.
     constexpr std::size_t FPropertyElementSizeOffset = 0x34;
     constexpr int InternalNoResendMaxCallsPerTick = 6;
+    constexpr int DirectLocalImmediateRepostsPerDeferredWakeup = 1;
     constexpr int MaximumNetworkBatchLimit = 500;
     constexpr int FastLocalCadenceMs = 17;
     constexpr int FallbackOutgoingStrokesPerBatch = 20;
@@ -233,6 +234,71 @@ namespace runtime_contract
                 local_batch,
                 FastLocalCadenceMs,
                 fallback};
+    }
+
+    constexpr PacingDecision resolve_configured_pacing(
+        bool auto_adapt,
+        int requested_batch_limit,
+        int requested_pacing_ms,
+        int max_outgoing_strokes_per_batch,
+        int max_outgoing_network_batches_per_second,
+        int max_replicated_strokes_per_tick,
+        int max_render_target_writes_per_frame)
+    {
+        if (auto_adapt)
+        {
+            return resolve_pacing(MaximumNetworkBatchLimit,
+                                  MinimumNetworkPacingMs,
+                                  max_outgoing_strokes_per_batch,
+                                  max_outgoing_network_batches_per_second,
+                                  max_replicated_strokes_per_tick,
+                                  max_render_target_writes_per_frame);
+        }
+        const int manual_delay_ms = clamp_value(requested_pacing_ms,
+                                                MinimumNetworkPacingMs,
+                                                MaximumManualNetworkPacingMs);
+        return {clamp_value(requested_batch_limit, 1, MaximumNetworkBatchLimit),
+                manual_delay_ms,
+                min_value(InternalNoResendMaxCallsPerTick,
+                          positive_or(max_render_target_writes_per_frame, FallbackRenderTargetWritesPerFrame)),
+                min_value(FastLocalCadenceMs, manual_delay_ms),
+                false};
+    }
+
+    constexpr bool manual_batch_uses_direct_local(bool auto_adapt,
+                                                  bool normal_paint_requires_packed,
+                                                  bool local_visual_sync_requested,
+                                                  bool research_artifacts)
+    {
+        return !auto_adapt &&
+               normal_paint_requires_packed &&
+               local_visual_sync_requested &&
+               !research_artifacts;
+    }
+
+    constexpr bool uses_fast_local_dispatch_wakeup(bool internal_no_resend_local_apply,
+                                                   bool local_packed_queue,
+                                                   bool local_work_remaining)
+    {
+        return internal_no_resend_local_apply &&
+               !local_packed_queue &&
+               local_work_remaining;
+    }
+
+    constexpr bool should_immediately_repost_direct_local(
+        bool fast_local_dispatch_wakeup,
+        int immediate_reposts_since_deferred_wakeup)
+    {
+        return fast_local_dispatch_wakeup &&
+               immediate_reposts_since_deferred_wakeup <
+                   DirectLocalImmediateRepostsPerDeferredWakeup;
+    }
+
+    constexpr double parallel_lane_eta_ms(double server_eta_ms, double local_eta_ms)
+    {
+        return server_eta_ms < 0.0 || local_eta_ms < 0.0
+                   ? -1.0
+                   : (server_eta_ms > local_eta_ms ? server_eta_ms : local_eta_ms);
     }
 
     // EPaintChannel: 0..3 address one render target, All addresses four, and

@@ -40,8 +40,9 @@ public sealed class PaintSettings
     public bool Brush1Enabled { get; set; } = false;
     public double Brush1SizeTexels { get; set; } = 25.0;
     public bool Brush2Enabled { get; set; } = true;
-    public double Brush2SizeTexels { get; set; } = 5.0;
-    public double CoverageStepTexels { get; set; } = 5.0;
+    public double Brush2SizeTexels { get; set; } = 7.5;
+    public double CoverageStepTexels { get; set; } = 7.5;
+    public bool BatchAutoAdapt { get; set; } = true;
     public int PackedBatchLimit { get; set; } = 20;
     public int PackedBatchPacingMs { get; set; } = 50;
     public double SideSourceMaxUv { get; set; } = 0.08;

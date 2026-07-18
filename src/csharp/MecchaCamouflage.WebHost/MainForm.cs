@@ -19,8 +19,17 @@ public sealed class MainForm : Form
     private const int HotkeyPreview = 2;
     private const int HotkeyUnPreview = 3;
     private const int HotkeyStop = 4;
-    private const int WmHotkey = 0x0312;
-    private const uint ModNoRepeat = 0x4000;
+    private const int WmInput = 0x00FF;
+    private const uint RidInput = 0x10000003;
+    private const uint RimTypeKeyboard = 1;
+    private const uint RidevRemove = 0x00000001;
+    private const uint RidevInputSink = 0x00000100;
+    private const ushort HidUsagePageGeneric = 0x01;
+    private const ushort HidUsageGenericKeyboard = 0x06;
+    private const uint WmKeyDown = 0x0100;
+    private const uint WmKeyUp = 0x0101;
+    private const uint WmSystemKeyDown = 0x0104;
+    private const uint WmSystemKeyUp = 0x0105;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -37,8 +46,8 @@ public sealed class MainForm : Form
     private bool guiInitializedLogged;
     private bool settingsEditing;
     private bool hotkeyRecording;
-    private bool hotkeysRegistered;
-    private string lastHotkeyRegistrationFailure = "";
+    private readonly HotkeyKeyState hotkeyKeyState = new();
+    private bool rawKeyboardRegistered;
     private bool webViewRetryUsed;
     private bool webViewRecoveryInProgress;
 
@@ -79,7 +88,8 @@ public sealed class MainForm : Form
             webReady = false;
             CancelUiReadyTimeout();
             PersistWindowSnapshot();
-            UnregisterHotkeys();
+            UnregisterRawKeyboardInput();
+            hotkeyKeyState.Clear();
         };
         ResizeEnd += (_, _) => PersistWindowSnapshot();
         Move += (_, _) => PersistWindowSnapshot();
@@ -97,26 +107,18 @@ public sealed class MainForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        // Hotkeys are bound to a concrete HWND. A recreated form handle must register again
-        // after the controller bridge is attached instead of trusting the old handle's state.
-        hotkeysRegistered = false;
         ApplyDarkTitleBar();
         ApplyWindowSettings("handle-created");
-        if (session.Runtime.IsConnected)
-            RequestHotkeyRegistrationAfterAttach();
+        if (!TryRegisterRawKeyboardInput(out var message))
+            session.Log.Warn(message);
     }
 
     protected override void WndProc(ref Message message)
     {
-        if (message.Msg == WmHotkey)
+        if (message.Msg == WmInput)
         {
-            if (settingsEditing)
-            {
-                if (!hotkeyRecording)
-                    SendToast(session.Localization.Text(session.Settings.Language, "toast.editing.hotkey.blocked"), "warn");
-                return;
-            }
-            _ = HandleHotkeyAsync(message.WParam.ToInt32());
+            HandleRawKeyboardInput(message.LParam);
+            base.WndProc(ref message);
             return;
         }
         base.WndProc(ref message);
@@ -381,8 +383,6 @@ public sealed class MainForm : Form
             try
             {
                 await session.WarmupBridgeAsync();
-                if (session.Runtime.IsConnected)
-                    RequestHotkeyRegistrationAfterAttach();
             }
             catch (OperationCanceledException)
             {
@@ -811,62 +811,21 @@ public sealed class MainForm : Form
     private object HandleUpdateSetting(JsonElement payload)
     {
         var key = payload.GetProperty("key").GetString() ?? "";
-        var oldHotkeys = HotkeySet.From(session.Settings);
         var result = session.UpdateSetting(key, payload.GetProperty("value"));
-        var hotkeyChanged = key.Contains("Hotkey", StringComparison.OrdinalIgnoreCase);
-        if (result.Success && hotkeyChanged && session.Runtime.IsConnected && !TryRegisterHotkeys(out var message))
-        {
-            oldHotkeys.ApplyTo(session.Settings);
-            session.UpdateSetting("app.startHotkey", JsonSerializer.SerializeToElement(oldHotkeys.Start));
-            session.UpdateSetting("app.previewHotkey", JsonSerializer.SerializeToElement(oldHotkeys.Preview));
-            session.UpdateSetting("app.unpreviewHotkey", JsonSerializer.SerializeToElement(oldHotkeys.UnPreview));
-            session.UpdateSetting("app.stopHotkey", JsonSerializer.SerializeToElement(oldHotkeys.Stop));
-            TryRegisterHotkeys(out _);
-            result = new HostCommandResult(false, message);
-        }
-        else if (result.Success && hotkeyChanged && !session.Runtime.IsConnected)
-        {
-            // The old registrations belong to the prior settings. Do not leave them active
-            // while the bridge is disconnected and the new values wait for attach.
-            UnregisterHotkeys();
-            lastHotkeyRegistrationFailure = "";
-        }
-        else if (result.Success && hotkeyChanged)
-        {
-            lastHotkeyRegistrationFailure = "";
-        }
         ApplyWindowSettings();
         return ApplyResult(result);
     }
 
     private object HandleUpdateSettings(JsonElement payload)
     {
-        var oldHotkeys = HotkeySet.From(session.Settings);
         var changes = new List<SettingChange>();
-        var hasHotkeyChange = false;
         foreach (var item in payload.GetProperty("changes").EnumerateArray())
         {
             var key = item.GetProperty("key").GetString() ?? "";
             changes.Add(new SettingChange(key, item.GetProperty("value")));
-            hasHotkeyChange |= key.Contains("Hotkey", StringComparison.OrdinalIgnoreCase);
         }
 
         var result = session.UpdateSettings(changes);
-        if (result.Success && hasHotkeyChange && session.Runtime.IsConnected && !TryRegisterHotkeys(out var message))
-        {
-            session.UpdateSettings(HotkeyRevertChanges(oldHotkeys));
-            TryRegisterHotkeys(out _);
-            result = new HostCommandResult(false, message);
-        }
-        else if (result.Success && hasHotkeyChange && !session.Runtime.IsConnected)
-        {
-            UnregisterHotkeys();
-            lastHotkeyRegistrationFailure = "";
-        }
-        else if (result.Success && hasHotkeyChange)
-        {
-            lastHotkeyRegistrationFailure = "";
-        }
         ApplyWindowSettings();
         return ApplyResult(result);
     }
@@ -874,10 +833,7 @@ public sealed class MainForm : Form
     private object HandleResetSetting(JsonElement payload)
     {
         var key = payload.GetProperty("key").GetString() ?? "";
-        var oldHotkeys = HotkeySet.From(session.Settings);
         var result = session.ResetSetting(key);
-        if (result.Success && key.Contains("Hotkey", StringComparison.OrdinalIgnoreCase))
-            result = ReconcileChangedHotkeys(oldHotkeys);
         ApplyWindowSettings();
         return ApplyResult(result);
     }
@@ -885,42 +841,16 @@ public sealed class MainForm : Form
     private object HandleResetSection(JsonElement payload)
     {
         var section = payload.GetProperty("section").GetString() ?? "";
-        var oldHotkeys = HotkeySet.From(session.Settings);
         var result = session.ResetSection(section);
-        if (result.Success && section.Equals("app", StringComparison.OrdinalIgnoreCase))
-            result = ReconcileChangedHotkeys(oldHotkeys);
         ApplyWindowSettings();
         return ApplyResult(result);
     }
 
     private object HandleResetAllSettings()
     {
-        var oldHotkeys = HotkeySet.From(session.Settings);
         var result = session.ResetAllSettings();
-        if (result.Success)
-            result = ReconcileChangedHotkeys(oldHotkeys);
         ApplyWindowSettings();
         return ApplyResult(result);
-    }
-
-    private HostCommandResult ReconcileChangedHotkeys(HotkeySet oldHotkeys)
-    {
-        if (!session.Runtime.IsConnected)
-        {
-            // The next successful bridge attach owns the deferred registration. Never leave the
-            // old OS registrations live after persisting a new hotkey set.
-            UnregisterHotkeys();
-            lastHotkeyRegistrationFailure = "";
-            return new HostCommandResult(true);
-        }
-        if (TryRegisterHotkeys(out var message))
-        {
-            lastHotkeyRegistrationFailure = "";
-            return new HostCommandResult(true);
-        }
-        session.UpdateSettings(HotkeyRevertChanges(oldHotkeys));
-        TryRegisterHotkeys(out _);
-        return new HostCommandResult(false, message);
     }
 
     private object ApplyResult(HostCommandResult result)
@@ -1101,52 +1031,44 @@ public sealed class MainForm : Form
         session.SetWindowSnapshot(Width, Height, Left, Top);
     }
 
-    private void RequestHotkeyRegistrationAfterAttach(bool force = false)
+    private void HandleRawKeyboardInput(IntPtr rawInputHandle)
     {
-        if (IsDisposed || Disposing || !IsHandleCreated || !session.Runtime.IsConnected)
+        var size = (uint)Marshal.SizeOf<RawInput>();
+        var headerSize = (uint)Marshal.SizeOf<RawInputHeader>();
+        if (GetRawInputData(rawInputHandle, RidInput, out var input, ref size, headerSize) == uint.MaxValue ||
+            input.Header.Type != RimTypeKeyboard)
+        {
             return;
-        void RegisterAfterAttach()
-        {
-            if (IsDisposed || Disposing || !IsHandleCreated || !session.Runtime.IsConnected ||
-                (!force && hotkeysRegistered))
-            {
-                return;
-            }
-            if (TryRegisterHotkeys(out var message))
-            {
-                lastHotkeyRegistrationFailure = "";
-                return;
-            }
-            if (!string.Equals(lastHotkeyRegistrationFailure, message, StringComparison.Ordinal))
-            {
-                lastHotkeyRegistrationFailure = message;
-                session.Log.Warn(message);
-            }
         }
-        try
+
+        var virtualKey = (uint)input.Keyboard.VirtualKey;
+        if (input.Keyboard.Message is WmKeyUp or WmSystemKeyUp)
         {
-            if (InvokeRequired)
-            {
-                BeginInvoke((MethodInvoker)RegisterAfterAttach);
-                return;
-            }
-            RegisterAfterAttach();
+            hotkeyKeyState.EndPress(virtualKey);
+            return;
         }
-        catch (InvalidOperationException) when (IsDisposed || Disposing || !IsHandleCreated)
+        if (input.Keyboard.Message is not (WmKeyDown or WmSystemKeyDown) ||
+            !hotkeyKeyState.TryBeginPress(virtualKey))
         {
-            // The form closed while a background bridge warmup was completing.
+            return;
         }
+        if (!session.Runtime.IsConnected)
+            return;
+
+        var hotkeyId = ResolveHotkeyId(virtualKey);
+        if (hotkeyId == 0)
+            return;
+        if (settingsEditing)
+        {
+            if (!hotkeyRecording)
+                SendToast(session.Localization.Text(session.Settings.Language, "toast.editing.hotkey.blocked"), "warn");
+            return;
+        }
+        _ = HandleHotkeyAsync(hotkeyId);
     }
 
-    private bool TryRegisterHotkeys(out string message)
+    private int ResolveHotkeyId(uint virtualKey)
     {
-        message = "";
-        if (!IsHandleCreated)
-        {
-            message = "Hotkey registration failed: form handle is unavailable.";
-            return false;
-        }
-        UnregisterHotkeys();
         var keys = new[]
         {
             (HotkeyStart, session.Settings.StartHotkey),
@@ -1156,32 +1078,56 @@ public sealed class MainForm : Form
         };
         foreach (var (id, key) in keys)
         {
-            var virtualKey = ParseVirtualKey(key);
-            if (virtualKey == 0)
-            {
-                message = $"Hotkey registration failed: {key} (invalid function key).";
-                UnregisterHotkeys();
-                return false;
-            }
-            if (!RegisterHotKey(Handle, id, ModNoRepeat, virtualKey))
-            {
-                var error = Marshal.GetLastWin32Error();
-                message = $"Hotkey registration failed: {key} (Win32 error {error})";
-                UnregisterHotkeys();
-                return false;
-            }
+            if (ParseVirtualKey(key) == virtualKey)
+                return id;
         }
-        hotkeysRegistered = true;
+        return 0;
+    }
+
+    private bool TryRegisterRawKeyboardInput(out string message)
+    {
+        message = "";
+        if (!IsHandleCreated)
+        {
+            message = "Raw keyboard registration failed: form handle is unavailable.";
+            return false;
+        }
+        var devices = new[]
+        {
+            new RawInputDevice
+            {
+                UsagePage = HidUsagePageGeneric,
+                Usage = HidUsageGenericKeyboard,
+                Flags = RidevInputSink,
+                Target = Handle
+            }
+        };
+        if (!RegisterRawInputDevices(devices, 1, (uint)Marshal.SizeOf<RawInputDevice>()))
+        {
+            message = $"Raw keyboard registration failed (Win32 error {Marshal.GetLastWin32Error()}).";
+            rawKeyboardRegistered = false;
+            return false;
+        }
+        rawKeyboardRegistered = true;
         return true;
     }
 
-    private void UnregisterHotkeys()
+    private void UnregisterRawKeyboardInput()
     {
-        hotkeysRegistered = false;
-        if (!IsHandleCreated)
+        if (!rawKeyboardRegistered)
             return;
-        for (var id = 1; id <= 4; ++id)
-            UnregisterHotKey(Handle, id);
+        var devices = new[]
+        {
+            new RawInputDevice
+            {
+                UsagePage = HidUsagePageGeneric,
+                Usage = HidUsageGenericKeyboard,
+                Flags = RidevRemove,
+                Target = IntPtr.Zero
+            }
+        };
+        RegisterRawInputDevices(devices, 1, (uint)Marshal.SizeOf<RawInputDevice>());
+        rawKeyboardRegistered = false;
     }
 
     private static uint ParseVirtualKey(string text)
@@ -1192,19 +1138,55 @@ public sealed class MainForm : Form
         return 0;
     }
 
-    private static IEnumerable<SettingChange> HotkeyRevertChanges(HotkeySet oldHotkeys)
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawInputDevice
     {
-        yield return new SettingChange("app.startHotkey", JsonSerializer.SerializeToElement(oldHotkeys.Start, JsonOptions));
-        yield return new SettingChange("app.previewHotkey", JsonSerializer.SerializeToElement(oldHotkeys.Preview, JsonOptions));
-        yield return new SettingChange("app.unpreviewHotkey", JsonSerializer.SerializeToElement(oldHotkeys.UnPreview, JsonOptions));
-        yield return new SettingChange("app.stopHotkey", JsonSerializer.SerializeToElement(oldHotkeys.Stop, JsonOptions));
+        public ushort UsagePage;
+        public ushort Usage;
+        public uint Flags;
+        public IntPtr Target;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawInputHeader
+    {
+        public uint Type;
+        public uint Size;
+        public IntPtr Device;
+        public IntPtr WParam;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawKeyboard
+    {
+        public ushort MakeCode;
+        public ushort Flags;
+        public ushort Reserved;
+        public ushort VirtualKey;
+        public uint Message;
+        public uint ExtraInformation;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawInput
+    {
+        public RawInputHeader Header;
+        public RawKeyboard Keyboard;
     }
 
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+    private static extern bool RegisterRawInputDevices(
+        [In] RawInputDevice[] devices,
+        uint deviceCount,
+        uint deviceSize);
 
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    private static extern uint GetRawInputData(
+        IntPtr rawInput,
+        uint command,
+        out RawInput data,
+        ref uint size,
+        uint headerSize);
 
     private const int DwmwaUseImmersiveDarkMode = 20;
     private const int DwmwaCaptionColor = 35;

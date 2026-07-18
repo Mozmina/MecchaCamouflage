@@ -39,6 +39,7 @@ public sealed record PaintSnapshot(
     double Brush1SizeTexels,
     bool Brush2Enabled,
     double Brush2SizeTexels,
+    bool BatchAutoAdapt,
     int PackedBatchLimit,
     int PackedBatchPacingMs,
     bool AutoMaterial,
@@ -153,4 +154,15 @@ public sealed record HotkeySet(string Start, string Preview, string UnPreview, s
     }
 
     public static string Normalize(string? value) => (value ?? "").Trim().ToUpperInvariant();
+}
+
+public sealed class HotkeyKeyState
+{
+    private readonly HashSet<uint> pressedKeys = [];
+
+    public bool TryBeginPress(uint virtualKey) => pressedKeys.Add(virtualKey);
+
+    public void EndPress(uint virtualKey) => pressedKeys.Remove(virtualKey);
+
+    public void Clear() => pressedKeys.Clear();
 }

@@ -108,6 +108,45 @@ int main()
         return 8;
     }
 
+    const auto auto_adapted = runtime_contract::resolve_configured_pacing(
+        true, 7, 125, 20, 20, 24, 6);
+    const auto manual = runtime_contract::resolve_configured_pacing(
+        false, 500, 1, 20, 20, 24, 6);
+    if (auto_adapted.remote_batch_limit != 20 || auto_adapted.remote_delay_ms != 50 ||
+        auto_adapted.local_delay_ms != runtime_contract::FastLocalCadenceMs ||
+        manual.remote_batch_limit != 500 || manual.remote_delay_ms != 1 ||
+        manual.local_delay_ms != 1)
+    {
+        return 8;
+    }
+
+    if (!runtime_contract::manual_batch_uses_direct_local(false, true, true, false) ||
+        runtime_contract::manual_batch_uses_direct_local(true, true, true, false) ||
+        runtime_contract::manual_batch_uses_direct_local(false, false, true, false) ||
+        runtime_contract::manual_batch_uses_direct_local(false, true, false, false) ||
+        runtime_contract::manual_batch_uses_direct_local(false, true, true, true))
+    {
+        return 8;
+    }
+    if (!runtime_contract::uses_fast_local_dispatch_wakeup(true, false, true) ||
+        runtime_contract::uses_fast_local_dispatch_wakeup(false, false, true) ||
+        runtime_contract::uses_fast_local_dispatch_wakeup(true, true, true) ||
+        runtime_contract::uses_fast_local_dispatch_wakeup(true, false, false))
+    {
+        return 8;
+    }
+    if (!runtime_contract::should_immediately_repost_direct_local(true, 0) ||
+        runtime_contract::should_immediately_repost_direct_local(true, 1) ||
+        runtime_contract::should_immediately_repost_direct_local(false, 0))
+    {
+        return 8;
+    }
+    if (runtime_contract::parallel_lane_eta_ms(15.0, 20'000.0) != 20'000.0 ||
+        runtime_contract::parallel_lane_eta_ms(-1.0, 500.0) != -1.0)
+    {
+        return 8;
+    }
+
     if (!runtime_contract::event_watch_generation_active(true, 7, 7) ||
         runtime_contract::event_watch_generation_active(false, 7, 7) ||
         runtime_contract::event_watch_generation_active(true, 8, 7))

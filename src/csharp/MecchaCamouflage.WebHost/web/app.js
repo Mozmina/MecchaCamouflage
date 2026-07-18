@@ -269,6 +269,7 @@ function renderSettings(snapshot) {
   setNumberPair("brush-1-size", "brush-1-size-number", paint.brush1SizeTexels);
   setChecked("brush-2-enabled", paint.brush2Enabled);
   setNumberPair("brush-2-size", "brush-2-size-number", paint.brush2SizeTexels);
+  setChecked("batch-auto-adapt", paint.batchAutoAdapt);
   setNumberPair("packed-batch-limit", "packed-batch-limit-number", paint.packedBatchLimit);
   setNumberPair("packed-batch-pacing", "packed-batch-pacing-number", paint.packedBatchPacingMs);
   setChecked("auto-material", paint.autoMaterial);
@@ -326,7 +327,7 @@ function renderSettings(snapshot) {
     "packed-batch-limit-number",
     "packed-batch-pacing",
     "packed-batch-pacing-number"
-  ], !editing);
+  ], !editing || paint.batchAutoAdapt);
 
   const fillLocked = !editing || !usesFill(paint);
   byId("fill-section").classList.toggle("disabled", !usesFill(paint));
@@ -556,6 +557,7 @@ function diffSnapshots(before, after) {
     "paint.brush1SizeTexels",
     "paint.brush2Enabled",
     "paint.brush2SizeTexels",
+    "paint.batchAutoAdapt",
     "paint.packedBatchLimit",
     "paint.packedBatchPacingMs",
     "paint.autoMaterial",
@@ -768,6 +770,7 @@ document.addEventListener("DOMContentLoaded", () => {
   bindRangePair("brush-1-size", "brush-1-size-number", "paint.brush1SizeTexels");
   bindCheckbox("brush-2-enabled", "paint.brush2Enabled");
   bindRangePair("brush-2-size", "brush-2-size-number", "paint.brush2SizeTexels");
+  bindCheckbox("batch-auto-adapt", "paint.batchAutoAdapt");
   bindRangePair("packed-batch-limit", "packed-batch-limit-number", "paint.packedBatchLimit");
   bindRangePair("packed-batch-pacing", "packed-batch-pacing-number", "paint.packedBatchPacingMs");
   bindCheckbox("auto-material", "paint.autoMaterial");

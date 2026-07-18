@@ -103,11 +103,16 @@ directory.
 
 ## Paint Replication Rules
 
-Normal paint uses the packed component route plus the dynamically validated
-native packed receiver queue for painter-local submission. Do not invoke the
+Auto Adapt paint uses the packed component route plus the dynamically
+validated native packed receiver queue for painter-local submission. Manual
+batching explicitly selects the independently scheduled, dynamically validated
+internal-common no-resend local route; it must never call reflected
+`PaintAtUVWithBrush`, which can re-enter replication. Do not invoke the
 reflected multicast UFunction for local application, and do not reintroduce
-automatic fallback to the per-stroke internal-common,
-compact/adaptive/send-custom, or reflected `PaintAtUVWithBrush` routes.
+automatic fallback to per-stroke internal-common, compact/adaptive/send-custom,
+or reflected `PaintAtUVWithBrush` from Auto mode. Manual direct scheduling may
+immediately repost one additional 4-ms slice, but must then use a deferred
+wakeup so the game message pump cannot be held continuously.
 
 The server schema, packed payload, and source ID remain fatal requirements. If
 only the local route or exact local queue is unavailable, stop local calls and

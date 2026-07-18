@@ -400,6 +400,14 @@ namespace
         post_paint_dispatch_message();
     }
 
+    void CALLBACK paint_dispatch_timer_queue_proc(PVOID, BOOLEAN)
+    {
+        // This callback runs outside the game thread. It only makes the next
+        // bounded slice eligible; UObject/render work remains on the game
+        // thread after the posted message is consumed.
+        post_paint_dispatch_message();
+    }
+
     template <typename T>
     auto safe_read(std::uintptr_t address, T fallback = T{}) -> T
     {
@@ -9455,6 +9463,11 @@ namespace
         std::chrono::steady_clock::time_point server_next_dispatch_time{};
         std::chrono::steady_clock::time_point local_next_dispatch_time{};
         UINT_PTR dispatch_timer_id{0};
+        HANDLE dispatch_timer_queue_timer{nullptr};
+        int direct_fast_wakeup_count{0};
+        int direct_fast_wakeup_fallback_count{0};
+        int direct_immediate_reposts_since_deferred_wakeup{0};
+        int direct_immediate_repost_count{0};
         MeshFirstBatchPhase phase{MeshFirstBatchPhase::Planning};
         // The job is intended to advance on the game thread. ProcessEvent hooks can
         // be entered by more than one caller, so retain evidence of, and suppress,
@@ -9617,6 +9630,15 @@ namespace
                    std::to_string(runtime_contract::LocalDispatchCpuBudgetUs) +
                ",\"local_cpu_budget_yields\":" +
                    std::to_string(job->local_cpu_budget_yields) +
+               ",\"local_dispatch_wakeup\":\"bounded_immediate_repost_then_timer_queue\"" +
+               ",\"local_direct_fast_wakeup_count\":" +
+                   std::to_string(job->direct_fast_wakeup_count) +
+               ",\"local_direct_fast_wakeup_fallback_count\":" +
+                   std::to_string(job->direct_fast_wakeup_fallback_count) +
+               ",\"local_direct_immediate_repost_count\":" +
+                   std::to_string(job->direct_immediate_repost_count) +
+               ",\"local_direct_immediate_reposts_per_deferred_wakeup\":" +
+                   std::to_string(runtime_contract::DirectLocalImmediateRepostsPerDeferredWakeup) +
                ",\"local_common_call_total_ms\":" +
                    std::to_string(job->local_common_call_total_ms) +
                ",\"local_common_call_max_ms\":" +
@@ -10023,7 +10045,16 @@ namespace
                std::to_string(job ? mesh_first_replication_pacing_resolved_pacing(job) : PackedReplicationDefaultPacingMs);
         out += ",\"replication_pacing_batch_limit\":" + std::to_string(job ? std::max(1, job->server_batch_limit) : PackedReplicationDefaultBatchLimit);
         out += ",\"replication_pacing_ms\":" + std::to_string(job ? std::max(0, job->server_batch_delay_ms) : PackedReplicationDefaultPacingMs);
-        out += ",\"replication_pacing_control\":\"batch_sliders\"";
+        const std::string pacing_control = !job
+                                               ? "auto_adapt"
+                                               : (job->pacing_source == "manual"
+                                                      ? "manual"
+                                                      : (job->pacing_source == "server_packed_fallback"
+                                                             ? "server_packed_fallback"
+                                                             : (job->pacing_source == "packed_receiver_fallback"
+                                                                    ? "packed_receiver_fallback"
+                                                                    : "auto_adapt")));
+        out += ",\"replication_pacing_control\":\"" + pacing_control + "\"";
         out += ",\"replication_pacing_source\":\"" +
                json_escape(job ? job->pacing_source : "game_limits") + "\"";
         out += ",\"replication_pacing_used_contract_fallback\":" +
@@ -10481,6 +10512,7 @@ namespace
         // so its queue cursor is the visual progress source from the first
         // paired batch onward, not only after submission has finished.
         const bool receiver_drain_progress = job && job->local_packed_queue_enabled;
+        const bool direct_local_progress = job && job->internal_no_resend_local_apply_enabled;
         const std::size_t completed_offset = static_cast<std::size_t>(
             std::max(0, mesh_first_rendered_strokes(job)));
         const auto server_window = runtime_contract::replay_pass_window(
@@ -10499,7 +10531,10 @@ namespace
         };
         return std::string(",\"replay_pass_order\":\"fill,coarse_paint,fine_paint\"") +
                ",\"replay_progress_source\":\"" +
-               std::string(receiver_drain_progress ? "receiver_queue_drain" : "submission") + "\"" +
+               std::string(receiver_drain_progress
+                               ? "receiver_queue_drain"
+                               : (direct_local_progress ? "local_direct_submission" : "submission")) +
+               "\"" +
                ",\"replay_fill_end\":" + std::to_string(std::min(fill_end, total)) +
                ",\"replay_coarse_end\":" + std::to_string(std::min(std::max(coarse_end, fill_end), total)) +
                ",\"replay_fine_begin\":" + std::to_string(std::min(std::max(coarse_end, fill_end), total)) +
@@ -10559,7 +10594,11 @@ namespace
             return std::max(delay_floor_ms, observed_ms_per_unit * static_cast<double>(remaining_units));
         };
 
-        const bool lockstep_local_sync = server_route_enabled && local_route_enabled;
+        const bool lockstep_local_sync = server_route_enabled &&
+                                         local_route_enabled &&
+                                         job &&
+                                         job->local_packed_queue_enabled;
+        const bool independent_direct_local = job && job->internal_no_resend_local_apply_enabled;
         const int remaining_server_strokes = server_route_enabled ? std::max(0, total_strokes - server_strokes_sent) : 0;
         const int remaining_local_strokes = std::max(0, total_strokes - local_strokes_synced);
         const int remaining_server_batches = mesh_first_div_ceil(remaining_server_strokes, server_batch_limit);
@@ -10588,7 +10627,9 @@ namespace
             {
                 local_eta_ms = lockstep_local_sync ? server_eta_ms
                                                    : std::max(0, local_batches_total - 1) * static_cast<double>(local_batch_delay_ms);
-                paint_eta_ms = lockstep_local_sync ? server_eta_ms : server_eta_ms + local_eta_ms;
+                paint_eta_ms = lockstep_local_sync
+                                   ? server_eta_ms
+                                   : runtime_contract::parallel_lane_eta_ms(server_eta_ms, local_eta_ms);
             }
             else
             {
@@ -10655,10 +10696,17 @@ namespace
             }
             else
             {
-                local_eta_ms = local_route_enabled
-                                   ? std::max(0, remaining_local_batches - 1) * static_cast<double>(local_batch_delay_ms)
-                                   : 0.0;
-                paint_eta_ms = server_eta_ms + local_eta_ms;
+                local_eta_ms = independent_direct_local
+                                   ? eta_from_observed_rate(local_elapsed_ms,
+                                                            local_strokes_synced,
+                                                            total_strokes,
+                                                            std::max(0, remaining_local_batches - 1),
+                                                            local_batch_delay_ms)
+                                   : (local_route_enabled
+                                          ? std::max(0, remaining_local_batches - 1) *
+                                                static_cast<double>(local_batch_delay_ms)
+                                          : 0.0);
+                paint_eta_ms = runtime_contract::parallel_lane_eta_ms(server_eta_ms, local_eta_ms);
                 paint_eta_source = job && job->replication_pacing_enabled ? "queue_drain_model" : "observed_rate";
             }
         }
@@ -10724,6 +10772,19 @@ namespace
                           std::max(0, current_pass_total - current_pass_completed)) /
                           receiver_rate
                     : -1.0;
+        }
+        else if (independent_direct_local)
+        {
+            const int pass_remaining = std::max(0, current_pass_total - current_pass_completed);
+            const int pass_batches = mesh_first_div_ceil(pass_remaining, local_batch_limit);
+            const double delay_floor_ms = static_cast<double>(std::max(0, pass_batches - 1)) *
+                                          static_cast<double>(local_batch_delay_ms);
+            current_pass_eta_ms = local_strokes_synced > 0 && local_elapsed_ms > 0.0
+                                      ? std::max(delay_floor_ms,
+                                                 (local_elapsed_ms /
+                                                  static_cast<double>(local_strokes_synced)) *
+                                                     static_cast<double>(pass_remaining))
+                                      : delay_floor_ms;
         }
         else if (phase == MeshFirstBatchPhase::ServerBatch)
         {
@@ -10905,13 +10966,27 @@ namespace
             research_artifacts && json_bool_field(request, "research_uv_replay_atlas", false);
         const bool normal_paint_requires_packed = !preview_only && !unpreview_only && !research_local_only;
         const bool local_visual_sync_requested = !preview_only && !unpreview_only && !research_packed_only;
+        const bool tuning_replication_pacing_enabled =
+            json_bool_field(request,
+                            "server_batch_auto_adapt",
+                            json_bool_field(request,
+                                            "replication_pacing_enabled",
+                                            json_bool_field(request, "adaptive_batch_enabled", true)));
+        const bool manual_direct_local_requested = runtime_contract::manual_batch_uses_direct_local(
+            tuning_replication_pacing_enabled,
+            normal_paint_requires_packed,
+            local_visual_sync_requested,
+            research_artifacts);
         bool use_packed_local_queue = normal_paint_requires_packed &&
                                       local_visual_sync_requested &&
-                                      (research_packed_local_queue || !research_artifacts);
+                                      (research_packed_local_queue || !research_artifacts) &&
+                                      !manual_direct_local_requested;
         bool local_visual_sync_enabled = local_visual_sync_requested;
         bool server_packed_fallback = false;
         std::string server_packed_fallback_reason{};
-        const bool use_internal_no_resend_local_apply = runtime_contract::requires_internal_no_resend(
+        bool manual_direct_packed_fallback = false;
+        std::string manual_direct_fallback_reason{};
+        bool use_internal_no_resend_local_apply = runtime_contract::requires_internal_no_resend(
             preview_only,
             unpreview_only,
             research_local_only,
@@ -10924,7 +10999,7 @@ namespace
         const bool tuning_brush_2_enabled =
             json_bool_field(request, "brush_2_enabled", true);
         const double tuning_brush_2_size_texels =
-            clamp_range(json_number_field(request, "brush_2_size_texels", 5.0), 1.0, 10.0);
+            clamp_range(json_number_field(request, "brush_2_size_texels", 7.5), 1.0, 10.0);
         const double tuning_coverage_step_texels =
             tuning_brush_1_enabled && tuning_brush_2_enabled
                 ? std::min(tuning_brush_1_size_texels, tuning_brush_2_size_texels)
@@ -10949,8 +11024,6 @@ namespace
             clamp_range(json_number_field(request, "research_paint_color_g", 1.0), 0.0, 1.0);
         const double research_paint_color_b =
             clamp_range(json_number_field(request, "research_paint_color_b", 0.0), 0.0, 1.0);
-        const bool tuning_replication_pacing_enabled =
-            json_bool_field(request, "replication_pacing_enabled", json_bool_field(request, "adaptive_batch_enabled", true));
         // New payloads expose two direct sliders.  The old mode/delay fields are
         // accepted only as migration defaults so a staged older controller does
         // not accidentally select a zero-delay scheduler loop.
@@ -10979,7 +11052,8 @@ namespace
                                                                   legacy_batch_pacing_ms,
                                                                   PackedReplicationMinPacingMs,
                                                                   PackedReplicationMaxPacingMs);
-        const auto requested_pacing_decision = runtime_contract::resolve_pacing(
+        const auto requested_pacing_decision = runtime_contract::resolve_configured_pacing(
+            tuning_replication_pacing_enabled,
             tuning_server_batch_limit,
             tuning_server_batch_pacing_ms,
             runtime_contract::FallbackOutgoingStrokesPerBatch,
@@ -11076,8 +11150,10 @@ namespace
         metadata += ",\"fill_metallic\":" + std::to_string(fill_metallic);
         metadata += ",\"fill_roughness\":" + std::to_string(fill_roughness);
         metadata += ",\"replication_pacing_requested_enabled\":" + std::string(json_bool(tuning_replication_pacing_enabled));
-        metadata += ",\"replication_pacing_enabled\":" + std::string(json_bool(normal_paint_requires_packed));
-        metadata += ",\"server_batch_control\":\"sliders\"";
+        metadata += ",\"replication_pacing_enabled\":" +
+                    std::string(json_bool(normal_paint_requires_packed && tuning_replication_pacing_enabled));
+        metadata += ",\"server_batch_control\":\"" +
+                    std::string(tuning_replication_pacing_enabled ? "auto_adapt" : "manual") + "\"";
         metadata += ",\"server_batch_limit\":" +
                     std::to_string(normal_paint_requires_packed
                                        ? requested_pacing_decision.remote_batch_limit
@@ -12743,14 +12819,19 @@ namespace
         metadata += ",\"server_packed_source_id_offset\":\"" + hex_address(RuntimePaintableComponentPackedSourceIdOffset) + "\"";
         metadata += ",\"server_packed_source_id_available\":" + std::string(json_bool(packed_source_id_available));
         metadata += ",\"server_packed_source_id_failure\":\"" + json_escape(packed_source_id_failure) + "\"";
-        metadata += ",\"server_packed_batch_limit_cap\":" + std::to_string(PackedReplicationBatchSize);
+        metadata += ",\"server_packed_batch_limit_cap\":" +
+                    std::to_string(PackedReplicationMaxBatchLimit);
         metadata += ",\"server_batch_limit_requested\":" + std::to_string(tuning_server_batch_limit);
         metadata += ",\"server_batch_limit_ignored_for_packed\":false";
         metadata += ",\"server_batch_limit_contract_estimate\":" +
                     std::to_string(effective_replay_server_batch_limit);
-        metadata += ",\"internal_no_resend_max_calls_per_tick\":" +
-                    std::to_string(use_internal_no_resend_local_apply ? InternalNoResendMaxCallsPerTick : 0);
         metadata += ",\"server_packed_paint_batch_ignored\":\"" + json_escape(packed_ignored_reason) + "\"";
+        auto activate_manual_direct_packed_fallback = [&](const std::string& reason) {
+            manual_direct_packed_fallback = true;
+            manual_direct_fallback_reason = "manual direct local route unavailable: " + reason;
+            use_internal_no_resend_local_apply = false;
+            use_packed_local_queue = true;
+        };
         InternalNoResendRoute no_resend_route{};
         if (use_internal_no_resend_local_apply)
         {
@@ -12768,21 +12849,67 @@ namespace
             metadata += ",\"no_resend_ctor_rva\":\"" +
                         hex_address(rva(no_resend_route.stroke_constructor)) + "\"";
             metadata += ",\"no_resend_common_rva\":\"" + hex_address(rva(no_resend_route.common)) + "\"";
+            if (!no_resend_route.resolved)
+            {
+                if (manual_direct_local_requested)
+                {
+                    activate_manual_direct_packed_fallback(no_resend_route.failure);
+                }
+                else
+                {
+                    return response_json(false,
+                                         "mesh_internal_no_resend_resolver_failed",
+                                         0,
+                                         1,
+                                         "internal no-resend route validation failed for this game build: " + no_resend_route.failure,
+                                         metadata + ",\"replay_blocked\":true");
+                }
+            }
+            else if (manual_direct_local_requested)
+            {
+                std::vector<std::pair<std::uintptr_t, int>> validated_descriptors{};
+                for (const auto& stroke : strokes)
+                {
+                    const auto descriptor = std::make_pair(
+                        reinterpret_cast<std::uintptr_t>(stroke.BrushSettings.BrushTexture),
+                        static_cast<int>(stroke.TargetChannel));
+                    if (std::find(validated_descriptors.begin(),
+                                  validated_descriptors.end(),
+                                  descriptor) != validated_descriptors.end())
+                    {
+                        continue;
+                    }
+                    std::string preflight_failure{};
+                    if (!sdk_validate_internal_common_no_resend_preconditions(
+                            ctx.component,
+                            no_resend_route.stroke_constructor,
+                            no_resend_route.common,
+                            stroke,
+                            preflight_failure))
+                    {
+                        activate_manual_direct_packed_fallback(preflight_failure);
+                        break;
+                    }
+                    validated_descriptors.push_back(descriptor);
+                }
+                if (!manual_direct_packed_fallback)
+                {
+                    metadata += ",\"local_route_mode\":\"manual_direct\"";
+                    metadata += ",\"manual_direct_preflight_descriptors\":" +
+                                std::to_string(validated_descriptors.size());
+                }
+            }
+        }
+        if (use_internal_no_resend_local_apply)
+        {
             metadata += ",\"local_apply_route\":\"internal_common_no_resend\"";
             metadata += ",\"per_call_no_resend\":true";
             metadata += ",\"global_property_mutation\":false";
             metadata += ",\"local_apply_postcondition\":\"internal_common_postdispatch_counter_advanced_once\"";
             metadata += ",\"local_apply_completion_semantics\":\"common_returned_after_nonempty_geometry_and_postdispatch_increment;channel_write_pixel_change_and_render_completion_not_verified\"";
-            if (!no_resend_route.resolved)
-            {
-                return response_json(false,
-                                     "mesh_internal_no_resend_resolver_failed",
-                                     0,
-                                     1,
-                                     "internal no-resend route validation failed for this game build: " + no_resend_route.failure,
-                                     metadata + ",\"replay_blocked\":true");
-            }
         }
+        metadata += ",\"internal_no_resend_max_calls_per_tick\":" +
+                    std::to_string(use_internal_no_resend_local_apply ? InternalNoResendMaxCallsPerTick : 0);
         auto activate_server_packed_fallback = [&](const std::string& reason) {
             if (server_packed_fallback)
             {
@@ -12921,6 +13048,8 @@ namespace
         const bool fast_apply_component_strokes = false;
         const bool fast_apply_manager_strokes = false;
         const bool fast_apply_manager_writes = false;
+        const bool manual_direct_local_active =
+            manual_direct_local_requested && use_internal_no_resend_local_apply;
         metadata += ",\"server_paint_target_channel\":\"all\"";
         if (preview_only)
         {
@@ -12951,7 +13080,9 @@ namespace
                         std::string(use_packed_local_queue
                                         ? "native_packed_receiver_queue"
                                         : (use_internal_no_resend_local_apply
-                                        ? "internal_common_no_resend_lockstep"
+                                        ? (manual_direct_local_active
+                                               ? "internal_common_no_resend_independent"
+                                               : "internal_common_no_resend_lockstep")
                                         : (use_packed_server_batch
                                         ? "paint_at_uv_with_brush_lockstep"
                                         : "paint_at_uv_with_brush_native_replication"))) + "\"";
@@ -12959,16 +13090,21 @@ namespace
                         std::string(use_packed_local_queue
                                         ? "packed_receiver_same_limit_and_pacing"
                                         : (use_internal_no_resend_local_apply
-                                        ? "single_stroke_internal_no_resend_lockstep"
+                                        ? (manual_direct_local_active
+                                               ? "bounded_internal_no_resend_independent"
+                                               : "single_stroke_internal_no_resend_lockstep")
                                         : (use_packed_server_batch ? "single_stroke_lockstep" : "single_stroke_local_only"))) + "\"";
             metadata += ",\"local_paint_target_channel\":\"all\"";
             metadata += ",\"local_visual_sync_required\":true";
             metadata += ",\"local_visual_sync_after_server_success\":" + std::string(json_bool(use_packed_server_batch));
             metadata += ",\"local_visual_sync_after_each_server_stroke\":" +
-                        std::string(json_bool(use_packed_server_batch && !use_packed_local_queue));
+                        std::string(json_bool(use_packed_server_batch &&
+                                              !use_packed_local_queue &&
+                                              !manual_direct_local_active));
             metadata += ",\"local_visual_sync_after_each_server_batch\":" +
                         std::string(json_bool(use_packed_server_batch && use_packed_local_queue));
-            metadata += ",\"local_visual_sync_lockstep_with_server_batch\":" + std::string(json_bool(use_packed_server_batch));
+            metadata += ",\"local_visual_sync_lockstep_with_server_batch\":" +
+                        std::string(json_bool(use_packed_server_batch && !manual_direct_local_active));
             metadata += ",\"local_texture_import_required\":false";
             metadata += ",\"authoritative_replay\":\"" +
                         std::string(use_packed_local_queue
@@ -12976,7 +13112,9 @@ namespace
                                                ? "research_server_packed_with_native_local_receiver_queue"
                                                : "server_packed_with_native_local_receiver_queue")
                                         : (use_internal_no_resend_local_apply
-                                        ? "server_packed_with_internal_no_resend_local_lockstep"
+                                        ? (manual_direct_local_active
+                                               ? "server_packed_with_internal_no_resend_local_independent"
+                                               : "server_packed_with_internal_no_resend_local_lockstep")
                                         : (use_packed_server_batch
                                         ? (use_packed_relay_route
                                                ? "server_relay_packed_replay_with_local_lockstep"
@@ -13366,11 +13504,14 @@ namespace
                 replication_before.manager_max_outgoing_network_batches_per_second;
             async_job->replication_manager_coalesce_outgoing_strokes =
                 replication_before.manager_coalesce_outgoing_strokes;
+            const bool effective_auto_adapt =
+                tuning_replication_pacing_enabled || manual_direct_packed_fallback;
             const int observed_max_replicated_strokes =
                 replication_before.manager_max_replicated_strokes_per_tick > 0
                     ? replication_before.manager_max_replicated_strokes_per_tick
                     : replication_before.component_max_replicated_strokes_per_tick;
-            const auto effective_pacing_decision = runtime_contract::resolve_pacing(
+            const auto effective_pacing_decision = runtime_contract::resolve_configured_pacing(
+                effective_auto_adapt,
                 tuning_server_batch_limit,
                 tuning_server_batch_pacing_ms,
                 replication_before.manager_max_outgoing_strokes_per_batch,
@@ -13378,24 +13519,48 @@ namespace
                 observed_max_replicated_strokes,
                 replication_before.manager_max_render_target_writes_per_frame);
             async_job->pacing_used_contract_fallback =
-                server_packed_fallback || effective_pacing_decision.used_contract_fallback;
+                server_packed_fallback ||
+                (effective_auto_adapt && effective_pacing_decision.used_contract_fallback);
             async_job->pacing_source = server_packed_fallback
                                            ? "server_packed_fallback"
-                                           : (effective_pacing_decision.used_contract_fallback
-                                                  ? "shipping_contract_fallback"
-                                                  : "game_limits");
+                                           : (manual_direct_packed_fallback
+                                                  ? "packed_receiver_fallback"
+                                                  : (!effective_auto_adapt
+                                                  ? "manual"
+                                                  : (effective_pacing_decision.used_contract_fallback
+                                                         ? "shipping_contract_fallback"
+                                                         : "game_limits")));
             async_job->pacing_fallback_reason = server_packed_fallback
                                                     ? server_packed_fallback_reason
-                                                    : (effective_pacing_decision.used_contract_fallback
+                                                    : (manual_direct_packed_fallback
+                                                           ? manual_direct_fallback_reason
+                                                           : (effective_auto_adapt &&
+                                                               effective_pacing_decision.used_contract_fallback
                                                            ? "game_limit_property_unavailable"
-                                                           : "");
-            async_job->metadata += ",\"replication_pacing_control\":\"batch_sliders\"";
+                                                           : ""));
+            async_job->metadata += ",\"replication_pacing_control\":\"" +
+                                   std::string(server_packed_fallback
+                                                   ? "server_packed_fallback"
+                                                   : (manual_direct_packed_fallback
+                                                          ? "packed_receiver_fallback"
+                                                          : (effective_auto_adapt ? "auto_adapt" : "manual"))) +
+                                   "\"";
             async_job->metadata += ",\"replication_pacing_source\":\"" +
                                    async_job->pacing_source + "\"";
             async_job->metadata += ",\"replication_pacing_used_contract_fallback\":" +
                                    std::string(json_bool(async_job->pacing_used_contract_fallback));
             async_job->metadata += ",\"replication_pacing_fallback_reason\":\"" +
                                    async_job->pacing_fallback_reason + "\"";
+            if (manual_direct_packed_fallback && !server_packed_fallback)
+            {
+                async_job->metadata += ",\"local_route_mode\":\"packed_receiver_fallback\"";
+                async_job->metadata += ",\"fallback_reason\":\"" +
+                                       json_escape(manual_direct_fallback_reason) + "\"";
+                async_job->metadata += ",\"fallback_batch_limit\":" +
+                                       std::to_string(effective_pacing_decision.remote_batch_limit);
+                async_job->metadata += ",\"fallback_pacing_ms\":" +
+                                       std::to_string(effective_pacing_decision.remote_delay_ms);
+            }
             async_job->server_batch_limit = effective_pacing_decision.remote_batch_limit;
             async_job->server_batch_delay_ms = effective_pacing_decision.remote_delay_ms;
             async_job->local_visual_sync_batch_limit = use_packed_local_queue
@@ -13412,15 +13577,21 @@ namespace
                 std::max(1, effective_pacing_decision.local_batch_limit) *
                 runtime_contract::paint_channel_write_cost(static_cast<int>(sdk::EPaintChannel::All));
             async_job->replication_pacing_enabled =
-                normal_paint_requires_packed && !server_packed_fallback;
+                normal_paint_requires_packed &&
+                effective_auto_adapt &&
+                !server_packed_fallback;
             async_job->replication_pacing_requested_batch_limit =
                 server_packed_fallback
                     ? runtime_contract::ServerPackedFallbackBatchLimit
-                    : tuning_server_batch_limit;
+                    : (manual_direct_packed_fallback
+                           ? effective_pacing_decision.remote_batch_limit
+                           : tuning_server_batch_limit);
             async_job->replication_pacing_requested_delay_ms =
                 server_packed_fallback
                     ? runtime_contract::ServerPackedFallbackPacingMs
-                    : tuning_server_batch_pacing_ms;
+                    : (manual_direct_packed_fallback
+                           ? effective_pacing_decision.remote_delay_ms
+                           : tuning_server_batch_pacing_ms);
             mesh_first_update_replication_pacing_model(async_job, replication_before);
             if (server_packed_fallback)
             {
@@ -13517,6 +13688,12 @@ namespace
         {
             KillTimer(nullptr, job->dispatch_timer_id);
             job->dispatch_timer_id = 0;
+        }
+        if (job->dispatch_timer_queue_timer)
+        {
+            const auto timer = job->dispatch_timer_queue_timer;
+            job->dispatch_timer_queue_timer = nullptr;
+            DeleteTimerQueueTimer(nullptr, timer, INVALID_HANDLE_VALUE);
         }
         complete_queued_paint_job(job->queued, response);
         {
@@ -13734,11 +13911,34 @@ namespace
                 KillTimer(nullptr, job->dispatch_timer_id);
                 job->dispatch_timer_id = 0;
             }
+            if (job->dispatch_timer_queue_timer)
+            {
+                const auto timer = job->dispatch_timer_queue_timer;
+                job->dispatch_timer_queue_timer = nullptr;
+                DeleteTimerQueueTimer(nullptr, timer, INVALID_HANDLE_VALUE);
+            }
         };
         clear_dispatch_timer();
 
-        auto post_next_after = [&](int delay_ms) {
+        auto post_next_after = [&](int delay_ms, bool use_fast_local_wakeup = false) {
             const int safe_delay_ms = runtime_contract::recurring_scheduler_delay_ms(delay_ms);
+            if (use_fast_local_wakeup)
+            {
+                HANDLE timer = nullptr;
+                if (CreateTimerQueueTimer(&timer,
+                                          nullptr,
+                                          paint_dispatch_timer_queue_proc,
+                                          nullptr,
+                                          static_cast<DWORD>(safe_delay_ms),
+                                          0,
+                                          WT_EXECUTEONLYONCE | WT_EXECUTEINTIMERTHREAD))
+                {
+                    job->dispatch_timer_queue_timer = timer;
+                    ++job->direct_fast_wakeup_count;
+                    return;
+                }
+                ++job->direct_fast_wakeup_fallback_count;
+            }
             const auto timer_id = SetTimer(nullptr,
                                            0,
                                            static_cast<UINT>(safe_delay_ms),
@@ -15305,9 +15505,11 @@ namespace
                 job->local_visual_sync_elapsed_ms = mesh_first_local_elapsed_ms(job);
                 job->local_next_dispatch_time = job->local_packed_queue_enabled
                                                     ? job->server_next_dispatch_time
-                                                    : std::chrono::steady_clock::now() +
+                                                    : (job->internal_no_resend_local_apply_enabled
+                                                           ? std::chrono::steady_clock::now()
+                                                           : std::chrono::steady_clock::now() +
                                                           std::chrono::milliseconds(
-                                                              std::max(1, job->local_visual_sync_delay_ms));
+                                                              std::max(1, job->local_visual_sync_delay_ms)));
             }
 
             if (job->local_packed_queue_enabled &&
@@ -15371,7 +15573,17 @@ namespace
                                      ? std::max(1, static_cast<int>(std::ceil(
                                            std::chrono::duration<double, std::milli>(next_due - schedule_now).count())))
                                      : 1;
-            job->next_dispatch_time = schedule_now + std::chrono::milliseconds(delay_ms);
+            const bool fast_local_wakeup = runtime_contract::uses_fast_local_dispatch_wakeup(
+                job->internal_no_resend_local_apply_enabled,
+                job->local_packed_queue_enabled,
+                local_remaining);
+            const bool immediate_direct_repost =
+                runtime_contract::should_immediately_repost_direct_local(
+                    fast_local_wakeup,
+                    job->direct_immediate_reposts_since_deferred_wakeup);
+            job->next_dispatch_time = immediate_direct_repost
+                                          ? std::chrono::steady_clock::time_point{}
+                                          : schedule_now + std::chrono::milliseconds(delay_ms);
             write_mesh_progress(server_throttled
                                     ? "mesh_server_batch_throttle"
                                     : (paired_local_queue_capacity_wait
@@ -15390,7 +15602,17 @@ namespace
                                 MeshFirstBatchPhase::ServerBatch,
                                 false,
                                 "running");
-            post_next_after(delay_ms);
+            if (immediate_direct_repost)
+            {
+                ++job->direct_immediate_reposts_since_deferred_wakeup;
+                ++job->direct_immediate_repost_count;
+                post_paint_dispatch_message();
+            }
+            else
+            {
+                job->direct_immediate_reposts_since_deferred_wakeup = 0;
+                post_next_after(delay_ms, fast_local_wakeup);
+            }
             return;
         }
 
@@ -17301,48 +17523,14 @@ namespace
         const auto nt = safe_read<IMAGE_NT_HEADERS64>(module.base + static_cast<std::uintptr_t>(dos.e_lfanew));
         if (nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
         {
-            out.failure = "main_module_build_identity_mismatch";
+            out.failure = "main_module_nt_header_mismatch";
             return out;
         }
-        const bool legacy_shipping_build =
-            nt.FileHeader.TimeDateStamp == 0x534F2F4Bu &&
-            nt.OptionalHeader.SizeOfImage == 0x0AAFE000u &&
-            nt.OptionalHeader.CheckSum == 0x0A735A7Cu;
-        // Steam Shipping build captured from the single-host investigation on
-        // 2026-07-11.  The no-resend call chain is byte-identical to the legacy
-        // build at the verified offsets below after a uniform -0xBC0 RVA shift.
-        const bool steam_shipping_build =
-            nt.FileHeader.TimeDateStamp == 0xB76CD1AFu &&
-            nt.OptionalHeader.SizeOfImage == 0x0AAFD000u &&
-            nt.OptionalHeader.CheckSum == 0x0A7394E2u;
-        if (!legacy_shipping_build && !steam_shipping_build)
-        {
-            out.failure = "main_module_build_identity_mismatch";
-            return out;
-        }
-        static const auto text_file_identity = main_module_text_file_identity();
-        const bool text_identity_matches = text_file_identity.ok &&
-                                           ((legacy_shipping_build &&
-                                             text_file_identity.raw_size == 0x07AA3200u &&
-                                             text_file_identity.fnv1a64 == 0x085F72BE8C58A9E6ULL) ||
-                                            (steam_shipping_build &&
-                                             text_file_identity.raw_size == 0x07AA2800u &&
-                                             text_file_identity.fnv1a64 == 0x4200B2CAF330F8C3ULL));
-        if (!text_identity_matches)
-        {
-            out.failure = "main_module_text_identity_mismatch";
-            return out;
-        }
-
-        const std::uintptr_t ExpectedThunkRva = steam_shipping_build ? 0x50E4E20 : 0x50E59E0;
-        const std::uintptr_t ExpectedImplRva = steam_shipping_build ? 0x50FEA90 : 0x50FF650;
-        const std::uintptr_t ExpectedConstructorRva = steam_shipping_build ? 0x50DA6A0 : 0x50DB260;
-        const std::uintptr_t ExpectedCommonRva = steam_shipping_build ? 0x50EE0C0 : 0x50EEC80;
         std::vector<InternalNoResendRoute> matches{};
         for (std::uintptr_t slot = 0; slot <= 0x180; slot += sizeof(std::uintptr_t))
         {
             const auto thunk = safe_read<std::uintptr_t>(paint_at_uv_with_brush_function + slot);
-            if (!address_in_main_module_code(thunk) || thunk - module.base != ExpectedThunkRva)
+            if (!address_in_main_module_code(thunk))
             {
                 continue;
             }
@@ -17356,7 +17544,7 @@ namespace
                 continue;
             }
             const auto impl = internal_rel32_call_target(thunk + 0x1A2);
-            if (!address_in_main_module_code(impl) || impl - module.base != ExpectedImplRva ||
+            if (!address_in_main_module_code(impl) ||
                 !internal_code_matches(impl,
                                        {0x48, 0x89, 0x5C, 0x24, 0x08,
                                         0x48, 0x89, 0x6C, 0x24, 0x10,
@@ -17370,9 +17558,7 @@ namespace
             const auto stroke_constructor = internal_rel32_call_target(impl + 0x28);
             const auto common = internal_rel32_call_target(impl + 0x8B);
             if (!address_in_main_module_code(stroke_constructor) ||
-                !address_in_main_module_code(common) ||
-                stroke_constructor - module.base != ExpectedConstructorRva ||
-                common - module.base != ExpectedCommonRva)
+                !address_in_main_module_code(common))
             {
                 continue;
             }

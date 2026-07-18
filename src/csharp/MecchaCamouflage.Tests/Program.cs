@@ -16,6 +16,7 @@ var tests = new List<(string Name, Action Run)>
     ("payload sends active brushes", PayloadSendsTwoPassBrushPipeline),
     ("native accepts the Brush 1 configured range", NativeAcceptsBrush1ConfiguredRange),
     ("native local route is signature resolved instead of build gated", NativeLocalRouteIsSignatureResolvedInsteadOfBuildGated),
+    ("native manual direct route is signature resolved instead of build gated", NativeManualDirectRouteIsSignatureResolvedInsteadOfBuildGated),
     ("native local failures use fixed server packed fallback", NativeLocalFailuresUseFixedServerPackedFallback),
     ("native production radius follows each triangle and fill stays fixed", NativeProductionRadiusFollowsEachTriangleAndFillStaysFixed),
     ("native spatial replay follows the current pose and camera", NativeSpatialReplayFollowsCurrentPoseAndCamera),
@@ -49,13 +50,14 @@ var tests = new List<(string Name, Action Run)>
     ("front region defaults to fill", FrontRegionDefaultsToFill),
     ("bridge messages are user friendly", BridgeMessagesAreUserFriendly),
     ("paint fallback warning preserves native reason and fixed pacing", PaintFallbackWarningPreservesNativeReasonAndFixedPacing),
+    ("manual direct fallback warning preserves native reason and effective pacing", ManualDirectFallbackWarningPreservesNativeReasonAndEffectivePacing),
     ("settings detect supported system language", SettingsDetectSupportedSystemLanguage),
     ("ui snapshot exposes two-pass brushes and batch sliders", UiSnapshotExposesTwoPassBrushesAndBatchSliders),
     ("web ui exposes two-pass brush sliders", WebUiExposesTwoPassBrushSliders),
     ("web UI keeps theme color on readonly range and checkbox controls", WebUiKeepsThemeColorOnReadonlyControls),
     ("web ui renders pass progress and total eta", WebUiRendersPassProgressAndTotalEta),
-    ("global hotkeys suppress key repeat", GlobalHotkeysSuppressKeyRepeat),
-    ("global hotkeys wait for bridge attach and report OS failure", GlobalHotkeysWaitForBridgeAttachAndReportOsFailure),
+    ("raw hotkeys suppress repeat until key-up", RawHotkeysSuppressRepeatUntilKeyUp),
+    ("raw hotkeys do not reserve system keys", RawHotkeysDoNotReserveSystemKeys),
     ("native progress exposes replay pass state", NativeProgressExposesReplayPassState),
     ("hotkey validation rejects duplicates", HotkeyValidationRejectsDuplicates),
     ("host session reset restores setting default", HostSessionResetRestoresDefault),
@@ -121,7 +123,7 @@ static void PaintDefaultsExposeCoarseAndDetailBrushes()
     Assert(!paint.Brush1Enabled, "brush 1 should default off");
     Assert(paint.Brush2Enabled, "brush 2 should default on");
     Assert(Math.Abs(paint.Brush1SizeTexels - 25.0) < 0.000001, "brush 1 should default to 25 texels");
-    Assert(Math.Abs(paint.Brush2SizeTexels - 5.0) < 0.000001, "brush 2 should default to 5 texels");
+    Assert(Math.Abs(paint.Brush2SizeTexels - 7.5) < 0.000001, "brush 2 should default to 7.5 texels");
     Assert(Math.Abs(paint.CoverageStepTexels - paint.Brush2SizeTexels) < 0.000001, "coverage compatibility should follow brush 2");
 }
 
@@ -134,16 +136,19 @@ static void BrushSelectionPersists()
     settings.Paint.Brush1SizeTexels = 42.5;
     settings.Paint.Brush2Enabled = false;
     settings.Paint.Brush2SizeTexels = 2.5;
+    settings.Paint.BatchAutoAdapt = false;
 
     new SettingsStore(paths).Save(settings);
     var loaded = new SettingsStore(paths).Load();
     Assert(loaded.Paint.Brush1Enabled && !loaded.Paint.Brush2Enabled, "enabled brushes should round-trip");
     Assert(Math.Abs(loaded.Paint.Brush1SizeTexels - 42.5) < 0.000001, "brush 1 size should round-trip");
     Assert(Math.Abs(loaded.Paint.Brush2SizeTexels - 2.5) < 0.000001, "brush 2 size should round-trip");
+    Assert(!loaded.Paint.BatchAutoAdapt, "batch auto adapt should round-trip");
     Assert(Math.Abs(loaded.Paint.CoverageStepTexels - 42.5) < 0.000001, "coverage should follow the only active brush");
     using var saved = JsonDocument.Parse(File.ReadAllText(paths.ConfigPath));
     Assert(saved.RootElement.GetProperty("brush_1_enabled").GetBoolean(), "brush 1 enabled should persist");
     Assert(!saved.RootElement.GetProperty("brush_2_enabled").GetBoolean(), "brush 2 enabled should persist");
+    Assert(!saved.RootElement.GetProperty("batch_auto_adapt").GetBoolean(), "batch auto adapt should persist");
     Assert(!saved.RootElement.TryGetProperty("stroke_size_texels", out _), "the legacy brush key should not be persisted");
 }
 
@@ -178,6 +183,7 @@ static void PaintDefaultsExposeBatchSliders()
 {
     var paint = new AppSettings().Paint;
 
+    Assert(paint.BatchAutoAdapt, "batch auto adapt should default on");
     Assert(paint.PackedBatchLimit == 20, "batch limit should retain its default");
     Assert(paint.PackedBatchPacingMs == 50, "batch pacing should default to the fastest safe interval");
 }
@@ -199,6 +205,7 @@ static void PayloadSendsTwoPassBrushPipeline()
     settings.Paint.Brush2SizeTexels = 7.5;
     settings.Paint.Brush1Enabled = true;
     settings.Paint.Brush2Enabled = false;
+    settings.Paint.BatchAutoAdapt = false;
 
     var payload = BridgePayloadBuilder.BuildPaintPayload(settings, 42, "Game.exe", new PaintRequestOptions());
     using var doc = JsonDocument.Parse(payload);
@@ -208,6 +215,7 @@ static void PayloadSendsTwoPassBrushPipeline()
     Assert(Math.Abs(tuning.GetProperty("brush_1_size_texels").GetDouble() - 17.5) < 0.000001, "payload should send brush 1");
     Assert(!tuning.GetProperty("brush_2_enabled").GetBoolean(), "payload should disable brush 2");
     Assert(Math.Abs(tuning.GetProperty("brush_2_size_texels").GetDouble() - 7.5) < 0.000001, "payload should send brush 2");
+    Assert(!tuning.GetProperty("server_batch_auto_adapt").GetBoolean(), "payload should send the batch auto-adapt mode");
     Assert(!tuning.TryGetProperty("brush_pipeline_version", out _), "payload should not version the brush pipeline");
     Assert(!tuning.TryGetProperty("stroke_size_texels", out _), "payload should not send the legacy stroke size");
     Assert(Math.Abs(tuning.GetProperty("coverage_step_texels").GetDouble() - 17.5) < 0.000001, "coverage should follow the only active brush");
@@ -242,6 +250,27 @@ static void NativeLocalRouteIsSignatureResolvedInsteadOfBuildGated()
            resolver.Contains("slot <= 0x800", StringComparison.Ordinal) &&
            resolver.Contains("candidates.size() != 1", StringComparison.Ordinal),
         "local route must retain schema validation and require one signature/call-chain candidate");
+}
+
+static void NativeManualDirectRouteIsSignatureResolvedInsteadOfBuildGated()
+{
+    var bridge = File.ReadAllText(Path.Combine(
+        FindRepositoryRoot(),
+        "src", "native", "bridge", "bridge.cpp"));
+    var start = bridge.LastIndexOf("auto resolve_internal_no_resend_route(", StringComparison.Ordinal);
+    var end = bridge.IndexOf("auto sdk_validate_internal_common_no_resend_preconditions(", start, StringComparison.Ordinal);
+    Assert(start >= 0 && end > start, "manual direct resolver should be present");
+    var resolver = bridge[start..end];
+
+    Assert(!resolver.Contains("TimeDateStamp ==", StringComparison.Ordinal) &&
+           !resolver.Contains("ExpectedThunkRva", StringComparison.Ordinal) &&
+           !resolver.Contains("main_module_build_identity_mismatch", StringComparison.Ordinal) &&
+           !resolver.Contains("main_module_text_identity_mismatch", StringComparison.Ordinal),
+        "manual direct route must not reject a build solely because its identity or RVAs changed");
+    Assert(resolver.Contains("PaintAtUVWithBrush_param_layout_mismatch", StringComparison.Ordinal) &&
+           resolver.Contains("internal_rel32_call_target", StringComparison.Ordinal) &&
+           resolver.Contains("matches.size() != 1", StringComparison.Ordinal),
+        "manual direct route must retain schema, signature, relative-call, and uniqueness validation");
 }
 
 static void NativeLocalFailuresUseFixedServerPackedFallback()
@@ -431,6 +460,7 @@ static void LegacyCompatibilityPacingMigratesToSliders()
 static void PayloadSendsBatchSliderValues()
 {
     var settings = new AppSettings();
+    settings.Paint.BatchAutoAdapt = false;
     settings.Paint.PackedBatchLimit = 7;
     settings.Paint.PackedBatchPacingMs = 125;
 
@@ -438,8 +468,17 @@ static void PayloadSendsBatchSliderValues()
     using var document = JsonDocument.Parse(payload);
     var tuning = document.RootElement.GetProperty("tuning");
 
+    Assert(!tuning.GetProperty("server_batch_auto_adapt").GetBoolean(), "manual batch mode should map directly");
     Assert(tuning.GetProperty("server_batch_limit").GetInt32() == 7, "batch limit should map directly");
     Assert(tuning.GetProperty("server_batch_pacing_ms").GetInt32() == 125, "batch pacing should map directly");
+
+    var bridge = File.ReadAllText(Path.Combine(
+        FindRepositoryRoot(),
+        "src", "native", "bridge", "bridge.cpp"));
+    Assert(bridge.Contains("json_bool_field(request,\n                            \"server_batch_auto_adapt\"", StringComparison.Ordinal),
+        "native bridge should read the batch auto-adapt flag");
+    Assert(bridge.Contains("runtime_contract::resolve_configured_pacing(", StringComparison.Ordinal),
+        "native bridge should select automatic or manual pacing from the flag");
 }
 
 static void LocalesHaveCompleteKeys()
@@ -648,8 +687,8 @@ static void BridgeMessagesAreUserFriendly()
     Assert(completed == "Paint: completed.", "completed message should be friendly");
     Assert(alreadyFriendlyCompleted == "Paint: completed.", "already-friendly completed message should be normalized");
     Assert(localOnlyCompletion == "Paint: completed.", "non-replicated completion should retain the simple local message");
-    Assert(replicatedCompletion.Contains("joined clients may still be rendering", StringComparison.Ordinal),
-        "replicated completion must not claim that a joining client has already presented its final pixels");
+    Assert(replicatedCompletion.Contains("other clients may still be rendering", StringComparison.Ordinal),
+        "replicated completion must not claim that another client has already presented its final pixels");
     Assert(preview == "Preview: applied.", "preview message should be friendly");
     Assert(noPreview == "Preview: no active preview to restore.", "missing preview snapshot should be a guard warning");
     Assert(contextChanged == "Paint: stopped because the game paint component changed.", "paint context change should be friendly");
@@ -694,6 +733,32 @@ static void PaintFallbackWarningPreservesNativeReasonAndFixedPacing()
         "normal paint replies should not emit a fallback warning");
 }
 
+static void ManualDirectFallbackWarningPreservesNativeReasonAndEffectivePacing()
+{
+    const string reason = "manual direct local route unavailable: signature mismatch";
+    var reply = new BridgeReply(
+        true,
+        true,
+        "mesh_first_paint_done",
+        "mesh-first paint completed",
+        $$"""
+        {
+          "success": true,
+          "metadata": {
+            "local_route_mode": "packed_receiver_fallback",
+            "fallback_reason": "{{reason}}",
+            "fallback_batch_limit": 20,
+            "fallback_pacing_ms": 50
+          }
+        }
+        """);
+
+    var warning = HostSession.PaintFallbackWarning(reply);
+
+    Assert(warning == reason + " (packed receiver fallback: 20 strokes / 50 ms)",
+        "manual direct fallback warning should preserve the reason and effective safe pacing");
+}
+
 static void SettingsDetectSupportedSystemLanguage()
 {
     var previous = System.Globalization.CultureInfo.CurrentUICulture;
@@ -716,6 +781,7 @@ static void UiSnapshotExposesTwoPassBrushesAndBatchSliders()
         17.5,
         false,
         7.5,
+        true,
         20,
         50,
         false,
@@ -738,6 +804,7 @@ static void UiSnapshotExposesTwoPassBrushesAndBatchSliders()
     Assert(Math.Abs(doc.RootElement.GetProperty("brush1SizeTexels").GetDouble() - 17.5) < 0.000001, "snapshot should expose brush 1");
     Assert(!doc.RootElement.GetProperty("brush2Enabled").GetBoolean(), "snapshot should expose brush 2 enabled");
     Assert(Math.Abs(doc.RootElement.GetProperty("brush2SizeTexels").GetDouble() - 7.5) < 0.000001, "snapshot should expose brush 2");
+    Assert(doc.RootElement.GetProperty("batchAutoAdapt").GetBoolean(), "snapshot should expose batch auto adapt");
     Assert(doc.RootElement.GetProperty("packedBatchLimit").GetInt32() == 20, "snapshot should expose packedBatchLimit for editing");
     Assert(doc.RootElement.GetProperty("packedBatchPacingMs").GetInt32() == 50, "snapshot should expose packedBatchPacingMs for editing");
     Assert(!doc.RootElement.TryGetProperty("brushSizeTexels", out _), "snapshot should not expose the removed single-brush field");
@@ -763,12 +830,15 @@ static void WebUiExposesTwoPassBrushSliders()
     Assert(index.IndexOf("id=\"brush-1-size\"", StringComparison.Ordinal) < index.IndexOf("id=\"brush-2-size\"", StringComparison.Ordinal), "brush 1 should appear above brush 2");
     Assert(index.Contains("min=\"10\" max=\"50\" step=\"0.5\"", StringComparison.Ordinal), "brush 1 should expose the 10-50 range");
     Assert(index.Contains("min=\"1\" max=\"10\" step=\"0.5\"", StringComparison.Ordinal), "brush 2 should expose the 1-10 range");
+    Assert(index.Contains("id=\"batch-auto-adapt\"", StringComparison.Ordinal),
+        "geometry controls should expose batch auto adapt");
     Assert(index.Contains("id=\"packed-batch-limit\" class=\"setting-control\" disabled type=\"range\" min=\"1\" max=\"500\" step=\"1\"", StringComparison.Ordinal),
-        "batch limit should expose the 1-500 range");
+        "manual batch limit should expose the 1-500 range");
     Assert(index.Contains("id=\"packed-batch-pacing\" class=\"setting-control\" disabled type=\"range\" min=\"1\" max=\"500\" step=\"1\"", StringComparison.Ordinal),
-        "batch pacing should expose the 1-500 ms range in the normal direction");
-    Assert(!index.Contains("reverse-range", StringComparison.Ordinal),
-        "batch pacing should increase from left to right");
+        "manual batch pacing should expose the 1-500 ms range");
+    Assert(app.Contains("paint.batchAutoAdapt", StringComparison.Ordinal) &&
+           app.Contains("!editing || paint.batchAutoAdapt", StringComparison.Ordinal),
+        "manual batch controls should lock while auto adapt is on");
     Assert(app.Contains("paint.brush1Enabled", StringComparison.Ordinal), "web UI should bind brush 1 enabled");
     Assert(app.Contains("paint.brush1SizeTexels", StringComparison.Ordinal), "web UI should bind brush 1");
     Assert(app.Contains("paint.brush2Enabled", StringComparison.Ordinal), "web UI should bind brush 2 enabled");
@@ -825,35 +895,28 @@ static void WebUiRendersPassProgressAndTotalEta()
     Assert(app.Contains("Paint: overall", StringComparison.Ordinal), "live progress should distinguish overall progress from pass progress");
 }
 
-static void GlobalHotkeysSuppressKeyRepeat()
+static void RawHotkeysSuppressRepeatUntilKeyUp()
 {
-    var repository = FindRepositoryRoot();
-    var mainForm = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
-
-    Assert(mainForm.Contains("private const uint ModNoRepeat = 0x4000;", StringComparison.Ordinal),
-        "global hotkeys should define the Win32 no-repeat modifier");
-    Assert(mainForm.Contains("RegisterHotKey(Handle, id, ModNoRepeat, virtualKey)", StringComparison.Ordinal),
-        "every registered global hotkey should suppress keyboard auto-repeat");
-    Assert(!mainForm.Contains("RegisterHotKey(Handle, id, 0, virtualKey)", StringComparison.Ordinal),
-        "global hotkeys must not be registered without the no-repeat modifier");
+    var state = new HotkeyKeyState();
+    Assert(state.TryBeginPress(0x72), "the first F3 key-down should trigger");
+    Assert(!state.TryBeginPress(0x72), "a repeated F3 key-down should not trigger");
+    state.EndPress(0x72);
+    Assert(state.TryBeginPress(0x72), "F3 should trigger again after key-up");
 }
 
-static void GlobalHotkeysWaitForBridgeAttachAndReportOsFailure()
+static void RawHotkeysDoNotReserveSystemKeys()
 {
     var repository = FindRepositoryRoot();
     var mainForm = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
 
-    Assert(mainForm.Contains("RequestHotkeyRegistrationAfterAttach", StringComparison.Ordinal),
-        "hotkey registration should be scheduled only after bridge warmup has attached");
-    Assert(mainForm.Contains("Marshal.GetLastWin32Error()", StringComparison.Ordinal),
-        "a hotkey registration failure must retain the actionable Win32 error");
-    Assert(mainForm.Contains("Hotkey registration failed: {key} (Win32 error {error})", StringComparison.Ordinal),
-        "hotkey registration logs should name the key and OS error");
-    Assert(!mainForm.Contains("ApplyWindowSettings(\"handle-created\");\n        if (!TryRegisterHotkeys", StringComparison.Ordinal),
-        "the form must not try to register F1 before the controller bridge has attached");
-    Assert(mainForm.Contains("HandleResetAllSettings", StringComparison.Ordinal) &&
-           mainForm.Contains("ReconcileChangedHotkeys", StringComparison.Ordinal),
-        "reset flows must reconcile hotkeys with the current HWND instead of leaving stale registrations");
+    Assert(mainForm.Contains("RegisterRawInputDevices", StringComparison.Ordinal) &&
+           mainForm.Contains("RidevInputSink", StringComparison.Ordinal),
+        "hotkeys should observe background keyboard input without reserving a global key");
+    Assert(!mainForm.Contains("RegisterHotKey(", StringComparison.Ordinal) &&
+           !mainForm.Contains("WmHotkey", StringComparison.Ordinal),
+        "hotkeys must not use the exclusive Win32 global-hotkey registry");
+    Assert(mainForm.Contains("if (!session.Runtime.IsConnected)", StringComparison.Ordinal),
+        "raw hotkeys should remain inactive until the game bridge is connected");
 }
 
 static void NativeProgressExposesReplayPassState()
@@ -879,7 +942,12 @@ static void NativeProgressExposesReplayPassState()
     Assert(bridge.Contains("receiver_queue_idle_threshold_reached", StringComparison.Ordinal),
         "receiver drain should invalidate stale ETA and fail closed after an idle timeout");
     Assert(json.Contains("replay_current_pass", StringComparison.Ordinal), "compact progress metadata should retain the current pass");
-    Assert(bridge.Contains("use_packed_local_queue = normal_paint_requires_packed", StringComparison.Ordinal), "normal paint should select the packed local receiver queue");
+    Assert(bridge.Contains("manual_batch_uses_direct_local", StringComparison.Ordinal) &&
+           bridge.Contains("local_direct_submission", StringComparison.Ordinal) &&
+           bridge.Contains("parallel_lane_eta_ms", StringComparison.Ordinal),
+        "manual paint should expose independent direct-local progress and parallel-lane ETA");
+    Assert(bridge.Contains("!manual_direct_local_requested", StringComparison.Ordinal),
+        "Auto Adapt paint should retain the packed local receiver queue");
 }
 
 static void SettingsClampBatchSliders()
@@ -890,7 +958,7 @@ static void SettingsClampBatchSliders()
 
     var clamped = SettingsStore.Clamp(settings);
 
-    Assert(clamped.Paint.PackedBatchLimit == 500, "batch limit should clamp to the configured maximum");
+    Assert(clamped.Paint.PackedBatchLimit == 500, "manual batch limit should clamp to the configured maximum");
     Assert(clamped.Paint.PackedBatchPacingMs == 500, "batch pacing should clamp to maximum interval");
 
     settings.Paint.PackedBatchLimit = 0;
@@ -898,7 +966,7 @@ static void SettingsClampBatchSliders()
     clamped = SettingsStore.Clamp(settings);
 
     Assert(clamped.Paint.PackedBatchLimit == 1, "batch limit should clamp to one");
-    Assert(clamped.Paint.PackedBatchPacingMs == 1, "zero pacing must clamp to one millisecond");
+    Assert(clamped.Paint.PackedBatchPacingMs == 1, "zero manual pacing must clamp to one millisecond");
 }
 
 static void HotkeyValidationRejectsDuplicates()
@@ -978,15 +1046,18 @@ static void HostSessionUpdatesBatchSliders()
     var session = new HostSession("host-batch-slider-test");
 
     var update = session.UpdateSettings([
+        new SettingChange("paint.batchAutoAdapt", JsonSerializer.SerializeToElement(false)),
         new SettingChange("paint.packedBatchLimit", JsonSerializer.SerializeToElement(7)),
         new SettingChange("paint.packedBatchPacingMs", JsonSerializer.SerializeToElement(125))
     ]);
 
     Assert(update.Success, update.Message);
+    Assert(!session.Settings.Paint.BatchAutoAdapt, "batch auto adapt should be disabled");
     Assert(session.Settings.Paint.PackedBatchLimit == 7, "batch limit should be applied");
     Assert(session.Settings.Paint.PackedBatchPacingMs == 125, "batch pacing should be applied");
 
     var snapshot = session.GetSnapshotAsync().GetAwaiter().GetResult();
+    Assert(!snapshot.Settings.Paint.BatchAutoAdapt, "snapshot should expose manual batching");
     Assert(snapshot.Settings.Paint.PackedBatchLimit == 7, "snapshot should expose the batch limit slider");
     Assert(snapshot.Settings.Paint.PackedBatchPacingMs == 125, "snapshot should expose the batch pacing slider");
 }

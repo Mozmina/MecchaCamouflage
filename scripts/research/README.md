@@ -124,18 +124,23 @@ the research runner. They minimize a reproduction (for example, isolating
 Front Paint from camera-dependent unsafe Side/Back mappings) while still using
 the normal payload and native planner.
 
-`--batch-limit` and `--batch-pacing-ms` carry the same two remote-lane controls
-as the production sliders. The defaults are 20 strokes per packed RPC and 50 ms
-between remote dispatches. The accepted ranges are 1--500 strokes and 1--500
-ms; zero pacing is deliberately rejected because an immediate repost loop can
-monopolize the game thread. Readable game-owned limits may resolve a requested
-value downward. To reproduce the former conservative
+`--batch-limit` and `--batch-pacing-ms` select manual batching and carry the
+same two remote-lane controls as the production sliders. The accepted ranges
+are 1--500 strokes and 1--500 ms; zero pacing is deliberately rejected because
+an immediate repost loop can monopolize the game thread. Without either
+override, Auto Adapt remains enabled and derives the fastest safe values from
+readable game-owned limits, using 20 strokes / 50 ms when those properties are
+unavailable. To reproduce the former conservative
 comparison without a special mode, pass `--batch-limit 6 --batch-pacing-ms 75`.
+Research route selection remains explicit: batch overrides alone do not switch
+the runner away from `packed-local-queue`; use `--paint-mode combined-no-resend`
+to measure the same bounded no-resend local primitive selected by production
+manual mode, including one immediate slice repost followed by a deferred wakeup.
 The production-shaped packed local route uses the same batch limit and pacing
 as the server lane. Painter-local receiver backlog is observed but is not used
 as evidence of a remote peer's EOS/game queue and therefore does not slow the
 outgoing lane; the game's own receiver/render budgets drain it asynchronously.
-The legacy `combined` A/B route still has its 6-call/4-ms CPU yield. Recurring
+The legacy `combined` A/B route still has its 6-call/4-ms CPU yield. Deferred
 scheduler wakeups are always delayed by at least 1 ms. These controls change
 neither EOS settings nor game-owned component/manager limits.
 
@@ -189,7 +194,7 @@ The planner uses `Fill`, `CoarsePaint`, then `FinePaint`; each pass retains
 only the enabled Brushes. If any region selects Fill, one 100-texel Fill pass
 covers every mesh region, including Paint and Skip. Paint regions then receive
 an optional deduplicated Brush 1 pass (10--50, default 25 and OFF) and/or the
-full Brush 2 pass (1--10, default 5 and ON). With no Fill region, no Fill pass
+full Brush 2 pass (1--10, default 7.5 and ON). With no Fill region, no Fill pass
 is emitted. Pass boundaries never share a packed RPC. Within each pass, all
 regions are ordered together from top to bottom and left to right using
 current-pose world positions projected into

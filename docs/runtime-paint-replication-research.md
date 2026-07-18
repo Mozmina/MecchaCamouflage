@@ -17,8 +17,12 @@ Normal paint uses the direct component route:
 - painter-side submission through the native packed receiver implementation
   behind `MulticastPackedPaintBatch`, called directly rather than through the
   reflected multicast UFunction
-- identical server/local packed boundaries and pacing (1--500 strokes,
-  1--500 ms; default 20/50), bounded at runtime by readable game limits
+- Auto Adapt defaults ON and uses identical server/local packed boundaries and
+  pacing derived from readable game limits (fixed 20/50 fallback). When OFF,
+  manual controls accept 1--500 strokes and 1--500 ms for the independent
+  server lane, while painter-local rendering uses the bounded internal-common
+  no-resend direct lane. That lane allows one immediate 4-ms slice repost per
+  deferred wakeup before yielding back to the game message pump
 - reflected payload layout plus a unique machine-code/call-chain resolution of
   the UFunction thunk, vtable slot, decoder, component-to-manager resolver, and
   enqueue chain before the first local packed submission; PE/text identity is
@@ -38,8 +42,10 @@ Normal paint uses the direct component route:
   stop and `ServerPackedPaintBatch` continues at the fixed 20 strokes / 50 ms
   fallback rate
 - no fallback to old compact/adaptive `SendCustom` path
-- no fallback to the per-stroke internal common or reflected
-  `PaintAtUVWithBrush` routes when validation fails
+- no automatic fallback to the per-stroke internal common or reflected
+  `PaintAtUVWithBrush` routes when Auto Adapt validation fails. Auto Adapt OFF
+  explicitly selects the validated no-resend internal common; if it is
+  unavailable before submission, it returns to packed local pacing with WARN
 - server packed schema/payload/source-ID failure still stops paint with explicit
   metadata
 

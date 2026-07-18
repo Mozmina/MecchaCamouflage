@@ -52,6 +52,7 @@ public sealed class SettingsStore
         paint.Brush1SizeTexels = ReadDouble(root, "brush_1_size_texels", paint.Brush1SizeTexels);
         paint.Brush2Enabled = ReadBool(root, "brush_2_enabled", paint.Brush2Enabled);
         paint.Brush2SizeTexels = ReadDouble(root, "brush_2_size_texels", paint.Brush2SizeTexels);
+        paint.BatchAutoAdapt = ReadBool(root, "batch_auto_adapt", paint.BatchAutoAdapt);
         var hasLegacyPacingMode =
             root.TryGetPropertyValue("pacing_mode", out var legacyPacingModeValue) &&
             legacyPacingModeValue is not null;
@@ -162,6 +163,7 @@ public sealed class SettingsStore
         brush_1_size_texels = settings.Paint.Brush1SizeTexels,
         brush_2_enabled = settings.Paint.Brush2Enabled,
         brush_2_size_texels = settings.Paint.Brush2SizeTexels,
+        batch_auto_adapt = settings.Paint.BatchAutoAdapt,
         packed_batch_limit = settings.Paint.PackedBatchLimit,
         packed_batch_pacing_ms = settings.Paint.PackedBatchPacingMs,
         coverage_step_texels = settings.Paint.CoverageStepTexels,

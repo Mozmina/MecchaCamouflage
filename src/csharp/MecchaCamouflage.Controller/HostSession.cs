@@ -17,6 +17,7 @@ public sealed class HostSession
         "paint.brush1SizeTexels",
         "paint.brush2Enabled",
         "paint.brush2SizeTexels",
+        "paint.batchAutoAdapt",
         "paint.packedBatchLimit",
         "paint.packedBatchPacingMs",
         "paint.autoMaterial",
@@ -189,6 +190,7 @@ public sealed class HostSession
                 next.Paint.Brush2Enabled = defaults.Paint.Brush2Enabled;
                 next.Paint.Brush2SizeTexels = defaults.Paint.Brush2SizeTexels;
                 next.Paint.CoverageStepTexels = defaults.Paint.CoverageStepTexels;
+                next.Paint.BatchAutoAdapt = defaults.Paint.BatchAutoAdapt;
                 next.Paint.PackedBatchLimit = defaults.Paint.PackedBatchLimit;
                 next.Paint.PackedBatchPacingMs = defaults.Paint.PackedBatchPacingMs;
                 break;
@@ -605,7 +607,6 @@ public sealed class HostSession
             if (!doc.RootElement.TryGetProperty("metadata", out var metadata) ||
                 metadata.ValueKind != JsonValueKind.Object ||
                 !metadata.TryGetProperty("local_route_mode", out var routeMode) ||
-                routeMode.GetString() != "server_packed_fallback" ||
                 !metadata.TryGetProperty("fallback_reason", out var reasonElement) ||
                 string.IsNullOrWhiteSpace(reasonElement.GetString()) ||
                 !metadata.TryGetProperty("fallback_batch_limit", out var batchElement) ||
@@ -616,7 +617,15 @@ public sealed class HostSession
                 return null;
             }
 
-            return $"{reasonElement.GetString()} (server packed fallback: {batchLimit} strokes / {pacingMs} ms)";
+            var fallbackLabel = routeMode.GetString() switch
+            {
+                "server_packed_fallback" => "server packed fallback",
+                "packed_receiver_fallback" => "packed receiver fallback",
+                _ => null
+            };
+            return fallbackLabel is null
+                ? null
+                : $"{reasonElement.GetString()} ({fallbackLabel}: {batchLimit} strokes / {pacingMs} ms)";
         }
         catch
         {
@@ -746,7 +755,7 @@ public sealed class HostSession
     /// </summary>
     public static string DescribePaintCompletion(string message, bool serverPaint) =>
         serverPaint && string.Equals(message, "Paint: completed.", StringComparison.Ordinal)
-            ? "Paint: completed locally; joined clients may still be rendering."
+            ? "Paint: completed locally; other clients may still be rendering."
             : message;
 
     private static bool IsPaintCancellationMessage(string message) =>
@@ -809,6 +818,7 @@ public sealed class HostSession
                 paint.Brush1SizeTexels,
                 paint.Brush2Enabled,
                 paint.Brush2SizeTexels,
+                paint.BatchAutoAdapt,
                 paint.PackedBatchLimit,
                 paint.PackedBatchPacingMs,
                 paint.AutoMaterial,
@@ -899,7 +909,8 @@ public sealed class HostSession
         {
             ["paint.geometry"] = map["paint.brush1Enabled"] || map["paint.brush1SizeTexels"] ||
                                  map["paint.brush2Enabled"] || map["paint.brush2SizeTexels"] ||
-                                 map["paint.packedBatchLimit"] || map["paint.packedBatchPacingMs"],
+                                 map["paint.batchAutoAdapt"] || map["paint.packedBatchLimit"] ||
+                                 map["paint.packedBatchPacingMs"],
             ["paint.material"] = map["paint.autoMaterial"] || map["paint.metallic"] || map["paint.roughness"],
             ["regions"] = map["paint.frontRegionMode"] || map["paint.sideRegionMode"] || map["paint.backRegionMode"],
             ["fill.material"] = map["paint.fillColor"] || map["paint.fillMetallic"] || map["paint.fillRoughness"],
@@ -915,6 +926,7 @@ public sealed class HostSession
         "paint.brush1SizeTexels" => Nearly(left.Paint.Brush1SizeTexels, right.Paint.Brush1SizeTexels),
         "paint.brush2Enabled" => left.Paint.Brush2Enabled == right.Paint.Brush2Enabled,
         "paint.brush2SizeTexels" => Nearly(left.Paint.Brush2SizeTexels, right.Paint.Brush2SizeTexels),
+        "paint.batchAutoAdapt" => left.Paint.BatchAutoAdapt == right.Paint.BatchAutoAdapt,
         "paint.packedBatchLimit" => left.Paint.PackedBatchLimit == right.Paint.PackedBatchLimit,
         "paint.packedBatchPacingMs" => left.Paint.PackedBatchPacingMs == right.Paint.PackedBatchPacingMs,
         "paint.autoMaterial" => left.Paint.AutoMaterial == right.Paint.AutoMaterial,
@@ -948,6 +960,7 @@ public sealed class HostSession
                 settings.Paint.Brush2SizeTexels = defaults.Paint.Brush2SizeTexels;
                 settings.Paint.CoverageStepTexels = SettingsStore.CoverageStepFor(settings.Paint);
                 break;
+            case "paint.batchAutoAdapt": settings.Paint.BatchAutoAdapt = defaults.Paint.BatchAutoAdapt; break;
             case "paint.packedBatchLimit": settings.Paint.PackedBatchLimit = defaults.Paint.PackedBatchLimit; break;
             case "paint.packedBatchPacingMs": settings.Paint.PackedBatchPacingMs = defaults.Paint.PackedBatchPacingMs; break;
             case "paint.autoMaterial": settings.Paint.AutoMaterial = defaults.Paint.AutoMaterial; break;
@@ -982,6 +995,7 @@ public sealed class HostSession
                 settings.Paint.Brush2SizeTexels = value.GetDouble();
                 settings.Paint.CoverageStepTexels = SettingsStore.CoverageStepFor(settings.Paint);
                 break;
+            case "paint.batchAutoAdapt": settings.Paint.BatchAutoAdapt = value.GetBoolean(); break;
             case "paint.packedBatchLimit": settings.Paint.PackedBatchLimit = RoundedInteger(value); break;
             case "paint.packedBatchPacingMs": settings.Paint.PackedBatchPacingMs = RoundedInteger(value); break;
             case "paint.autoMaterial": settings.Paint.AutoMaterial = value.GetBoolean(); break;

@@ -31,6 +31,7 @@ public static class BridgePayloadBuilder
                 ["brush_1_size_texels"] = paint.Brush1SizeTexels,
                 ["brush_2_enabled"] = paint.Brush2Enabled,
                 ["brush_2_size_texels"] = paint.Brush2SizeTexels,
+                ["server_batch_auto_adapt"] = paint.BatchAutoAdapt,
                 ["server_batch_limit"] = paint.PackedBatchLimit,
                 ["server_batch_pacing_ms"] = paint.PackedBatchPacingMs,
                 ["coverage_step_texels"] = paint.CoverageStepTexels,
