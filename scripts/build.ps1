@@ -19,11 +19,19 @@ function Resolve-ProjectVersion {
         return $Requested
     }
     if (Get-Command git -ErrorAction SilentlyContinue) {
-        $exact = & git -C $Root describe --tags --exact-match 2>$null
+        try {
+            $exact = & git -C $Root describe --tags --exact-match 2>$null
+        } catch {
+            $exact = $null
+        }
         if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($exact)) {
             return $exact.Trim()
         }
-        $described = & git -C $Root describe --tags --dirty --always 2>$null
+        try {
+            $described = & git -C $Root describe --tags --dirty --always 2>$null
+        } catch {
+            $described = $null
+        }
         if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($described)) {
             return $described.Trim()
         }
