@@ -17188,8 +17188,12 @@ namespace
             return false;
         }
         packed.clear();
-        packed.reserve(21 + count * 27);
-        packed.push_back(1);
+        // Format 2, as the game itself emits since 2.9.0: the per-stroke record grew from 27 to
+        // 31 bytes with an emissive RGBA quad between roughness and the channel selector. The
+        // game still decodes format 1, but a format 1 record leaves the receiver's emissive
+        // input unwritten, so send the current format and clear emissive explicitly.
+        packed.reserve(21 + count * 31);
+        packed.push_back(2);
         const auto* source_bytes = reinterpret_cast<const std::uint8_t*>(&source_id);
         packed.insert(packed.end(), source_bytes, source_bytes + sizeof(source_id));
         sdk_append_i32_le(packed, static_cast<std::int32_t>(count));
@@ -17267,6 +17271,11 @@ namespace
             packed.push_back(sdk_unit_to_byte(stroke.ChannelData.AlbedoColor.A));
             packed.push_back(sdk_unit_to_byte(stroke.ChannelData.Metallic));
             packed.push_back(sdk_unit_to_byte(stroke.ChannelData.Roughness));
+            const auto emissive = sdk_unit_to_byte(stroke.ChannelData.EmissiveColor);
+            packed.push_back(emissive);
+            packed.push_back(emissive);
+            packed.push_back(emissive);
+            packed.push_back(255);
             packed.push_back(static_cast<std::uint8_t>(static_cast<std::uint8_t>(stroke.TargetChannel) + 1));
             sdk_append_f32_le(packed, stroke.EffectiveBrushWorldRadius);
             const auto subdivision_tail = runtime_contract::packed_mesh_anchor_auto_subdivision_tail();
