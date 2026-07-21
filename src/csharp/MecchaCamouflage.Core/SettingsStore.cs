@@ -5,6 +5,12 @@ namespace MecchaCamouflage.Core;
 
 public sealed class SettingsStore
 {
+    // v1.6.1 introduced dedicated Fill PBR controls with a mirror-like default.
+    // That was especially misleading because Front defaults to Fill while the
+    // normal material controls default to a dielectric surface.  Only migrate
+    // the exact old defaults; any custom Fill material remains authoritative.
+    private const int FillPbrDefaultsFixLayoutVersion = 39;
+
     private static readonly JsonSerializerOptions Options = new()
     {
         WriteIndented = true,
@@ -92,6 +98,20 @@ public sealed class SettingsStore
         paint.FillMetallic = ReadDouble(root, "fill_metallic", paint.FillMetallic);
         paint.FillRoughness = ReadDouble(root, "fill_roughness", paint.FillRoughness);
         paint.FillEmissive = ReadDouble(root, "fill_emissive", paint.FillEmissive);
+        var hasPersistedFillPbr =
+            root.TryGetPropertyValue("fill_metallic", out _) &&
+            root.TryGetPropertyValue("fill_roughness", out _) &&
+            root.TryGetPropertyValue("fill_emissive", out _);
+        if (settings.LayoutVersion < FillPbrDefaultsFixLayoutVersion &&
+            hasPersistedFillPbr &&
+            Math.Abs(paint.FillMetallic - 1.0) < 0.000001 &&
+            Math.Abs(paint.FillRoughness) < 0.000001 &&
+            Math.Abs(paint.FillEmissive) < 0.000001)
+        {
+            paint.FillMetallic = paint.Metallic;
+            paint.FillRoughness = paint.Roughness;
+            paint.FillEmissive = paint.Emissive;
+        }
 
         return Clamp(settings);
     }

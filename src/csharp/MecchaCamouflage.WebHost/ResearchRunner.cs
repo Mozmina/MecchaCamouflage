@@ -20,6 +20,9 @@ internal static class ResearchRunner
         string DeclaredRole,
         string ArtifactDirectory,
         bool Paint,
+        bool PreviewOnly,
+        bool UnPreviewOnly,
+        bool AutoMaterial,
         int HoldSeconds,
         int PressureSampleMs,
         bool TextureSnapshot,
@@ -32,16 +35,35 @@ internal static class ResearchRunner
         int? PackedBatchPacingOverrideMs,
         int StrokeLimit,
         int? ReplayStrokeIndex,
+        int? TargetChannelOverride,
+        int? ApplyModeOverride,
         int? CancelAfterMs,
+        bool CancelWhenActive,
         int? ShutdownAfterMs,
         RgbColor? FillColorOverride,
         RgbColor? PaintColorOverride,
+        double? MetallicOverride,
+        double? RoughnessOverride,
+        double? EmissiveOverride,
+        double? FillMetallicOverride,
+        double? FillRoughnessOverride,
+        double? FillEmissiveOverride,
         RegionMode? FrontRegionModeOverride,
         RegionMode? SideRegionModeOverride,
         RegionMode? BackRegionModeOverride);
 
     private sealed record ReplyArtifact(string Name, DateTimeOffset StartedUtc, DateTimeOffset CompletedUtc, BridgeReply Reply);
     private sealed record TimedReply(DateTimeOffset StartedUtc, DateTimeOffset CompletedUtc, BridgeReply Reply);
+    private sealed record ActivePaintObservation(bool Observed, string Stage, int Step);
+    private sealed record CancelTimedReply(TimedReply TimedReply, ActivePaintObservation? ActiveObservation);
+    private sealed record PaintProgressSample(
+        DateTimeOffset CapturedUtc,
+        string Stage,
+        bool Terminal,
+        int Step,
+        int Total,
+        double PaintEtaMs,
+        string PaintEtaSource);
 
     public static bool IsRequested(string[] args) =>
         args.Any(arg => string.Equals(arg, "--research-replication", StringComparison.Ordinal));
@@ -78,6 +100,9 @@ internal static class ResearchRunner
             ["declared_role"] = options.DeclaredRole,
             ["pid"] = options.ProcessId,
             ["paint_requested"] = options.Paint,
+            ["preview_only"] = options.PreviewOnly,
+            ["unpreview_only"] = options.UnPreviewOnly,
+            ["auto_material"] = options.AutoMaterial,
             ["hold_seconds"] = options.HoldSeconds,
             ["pressure_sample_ms"] = options.PressureSampleMs,
             ["texture_snapshot_requested"] = options.TextureSnapshot,
@@ -90,8 +115,16 @@ internal static class ResearchRunner
             ["packed_batch_pacing_override_ms"] = options.PackedBatchPacingOverrideMs,
             ["stroke_limit"] = options.StrokeLimit,
             ["replay_stroke_index"] = options.ReplayStrokeIndex,
+            ["target_channel_override"] = options.TargetChannelOverride,
+            ["apply_mode_override"] = options.ApplyModeOverride,
             ["fill_color_override"] = options.FillColorOverride?.ToHex(),
             ["paint_color_override"] = options.PaintColorOverride?.ToHex(),
+            ["metallic_override"] = options.MetallicOverride,
+            ["roughness_override"] = options.RoughnessOverride,
+            ["emissive_override"] = options.EmissiveOverride,
+            ["fill_metallic_override"] = options.FillMetallicOverride,
+            ["fill_roughness_override"] = options.FillRoughnessOverride,
+            ["fill_emissive_override"] = options.FillEmissiveOverride,
             ["front_region_mode_override"] = options.FrontRegionModeOverride is RegionMode frontMode
                 ? SettingsStore.RegionModeText(frontMode)
                 : null,
@@ -108,6 +141,11 @@ internal static class ResearchRunner
         if (options.CancelAfterMs is int configuredCancelAfterMs)
         {
             summary["cancel_after_ms"] = configuredCancelAfterMs;
+            summary["cancel_requested"] = true;
+        }
+        if (options.CancelWhenActive)
+        {
+            summary["cancel_when_active"] = true;
             summary["cancel_requested"] = true;
         }
         if (options.ShutdownAfterMs is int configuredShutdownAfterMs)
@@ -129,6 +167,20 @@ internal static class ResearchRunner
             session.Settings.Paint.PackedBatchPacingMs = packedBatchPacingOverrideMs;
         if (options.FillColorOverride is not null)
             session.Settings.Paint.FillColor = options.FillColorOverride;
+        if (options.MetallicOverride is double metallicOverride)
+            session.Settings.Paint.Metallic = metallicOverride;
+        if (options.RoughnessOverride is double roughnessOverride)
+            session.Settings.Paint.Roughness = roughnessOverride;
+        if (options.EmissiveOverride is double emissiveOverride)
+            session.Settings.Paint.Emissive = emissiveOverride;
+        if (options.FillMetallicOverride is double fillMetallicOverride)
+            session.Settings.Paint.FillMetallic = fillMetallicOverride;
+        if (options.FillRoughnessOverride is double fillRoughnessOverride)
+            session.Settings.Paint.FillRoughness = fillRoughnessOverride;
+        if (options.FillEmissiveOverride is double fillEmissiveOverride)
+            session.Settings.Paint.FillEmissive = fillEmissiveOverride;
+        if (options.AutoMaterial)
+            session.Settings.Paint.AutoMaterial = true;
         if (options.FrontRegionModeOverride is RegionMode frontRegionMode)
             session.Settings.Paint.FrontRegionMode = frontRegionMode;
         if (options.SideRegionModeOverride is RegionMode sideRegionMode)
@@ -219,7 +271,7 @@ internal static class ResearchRunner
                     session.Settings,
                     process.Id,
                     Path.GetFileName(executablePath),
-                    new PaintRequestOptions(ResearchArtifacts: true));
+                    new PaintRequestOptions(options.PreviewOnly, options.UnPreviewOnly, ResearchArtifacts: true));
                 payload = AddResearchPaintControls(payload, options);
                 WriteJson(
                     Path.Combine(runDirectory, "paint-request.json"),
@@ -231,9 +283,12 @@ internal static class ResearchRunner
                         payload
                     });
                 var paintTask = SendPaintWithTimingAsync(session.Runtime, payload);
-                Task<TimedReply>? cancelTask = options.CancelAfterMs is int cancelAfterMs
+                var progressTimelineTask = CapturePaintProgressTimelineAsync(session.Runtime.ProgressPath, paintTask);
+                Task<CancelTimedReply>? cancelTask = options.CancelAfterMs is int cancelAfterMs
                     ? CancelPaintAfterDelayAsync(session.Runtime, cancelAfterMs, paintTask)
-                    : null;
+                    : options.CancelWhenActive
+                        ? CancelPaintWhenActiveAsync(session.Runtime, session.Runtime.ProgressPath, paintTask)
+                        : null;
                 Task<TimedReply>? shutdownTask = options.ShutdownAfterMs is int shutdownAfterMs
                     ? ShutdownAfterDelayAsync(session.Runtime, shutdownAfterMs)
                     : null;
@@ -244,12 +299,47 @@ internal static class ResearchRunner
                     await Task.WhenAll(paintTask, shutdownTask);
                 var paint = await paintTask;
                 var reply = paint.Reply;
+                var progressTimeline = await progressTimelineTask;
+                WriteJson(Path.Combine(runDirectory, "paint-progress-timeline.json"), progressTimeline);
+                summary["paint_progress_sample_count"] = progressTimeline.Count;
+                summary["paint_progress_peak_eta_ms"] = progressTimeline.Count == 0
+                    ? null
+                    : progressTimeline.Max(sample => sample.PaintEtaMs);
+                summary["paint_progress_eta_sources"] = progressTimeline
+                    .Select(sample => sample.PaintEtaSource)
+                    .Where(source => !string.IsNullOrWhiteSpace(source))
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray();
                 WriteJson(
                     Path.Combine(runDirectory, "paint-reply.json"),
                     new ReplyArtifact("paint", paint.StartedUtc, paint.CompletedUtc, reply));
                 summary["paint_success"] = reply.Success;
                 summary["paint_stage"] = reply.Stage;
-                if (reply.Ok && reply.Success)
+                if (options.PreviewOnly && reply.Ok && reply.Success)
+                {
+                    // This runner creates a short-lived bridge.  The preview snapshot lives in
+                    // that bridge, so ending it before restoring the material leaves the game
+                    // looking previewed with no snapshot left to undo it.  Restore on the same
+                    // bridge before normal runner shutdown and retain the reply as evidence.
+                    summary["preview_cleanup_requested"] = true;
+                    var cleanupPayload = BridgePayloadBuilder.BuildPaintPayload(
+                        session.Settings,
+                        process.Id,
+                        Path.GetFileName(executablePath),
+                        new PaintRequestOptions(UnPreviewOnly: true, ResearchArtifacts: true));
+                    var cleanup = await SendPaintWithTimingAsync(session.Runtime, cleanupPayload);
+                    WriteJson(
+                        Path.Combine(runDirectory, "preview-cleanup-reply.json"),
+                        new ReplyArtifact("preview-cleanup", cleanup.StartedUtc, cleanup.CompletedUtc, cleanup.Reply));
+                    summary["preview_cleanup_reply"] = ReplySummary(cleanup.Reply);
+                    summary["preview_cleanup_success"] = cleanup.Reply.Ok && cleanup.Reply.Success;
+                    if (!cleanup.Reply.Ok || !cleanup.Reply.Success)
+                    {
+                        throw new InvalidOperationException(
+                            $"Preview cleanup failed at {cleanup.Reply.Stage}: {cleanup.Reply.Message}");
+                    }
+                }
+                if (reply.Ok && reply.Success && !options.PreviewOnly && !options.UnPreviewOnly)
                 {
                     var uvReplayArtifact = ResearchUvReplayArtifacts.StageAndRender(reply, runDirectory);
                     summary["uv_replay_plan_written"] = uvReplayArtifact.Success;
@@ -262,6 +352,11 @@ internal static class ResearchRunner
                             "Completed research paint did not produce a usable UV replay artifact: " + uvReplayArtifact.Error);
                     }
                 }
+                else if (reply.Ok && reply.Success)
+                {
+                    summary["uv_replay_plan_written"] = false;
+                    summary["uv_replay_plan_disposition"] = "not_applicable_preview_operation";
+                }
                 else
                 {
                     // Native writes this sidecar at planning time. A failed or cancelled paint
@@ -271,7 +366,8 @@ internal static class ResearchRunner
                 }
                 if (cancelTask is not null)
                 {
-                    var cancel = await cancelTask;
+                    var timedCancel = await cancelTask;
+                    var cancel = timedCancel.TimedReply;
                     WriteJson(
                         Path.Combine(runDirectory, "cancel-paint-reply.json"),
                         new ReplyArtifact("cancel-paint", cancel.StartedUtc, cancel.CompletedUtc, cancel.Reply));
@@ -283,6 +379,12 @@ internal static class ResearchRunner
                     summary["cancel_admission_latched"] = cancelAdmissionLatched;
                     summary["paint_terminal_result"] = ReplySummary(reply);
                     summary["paint_cancel_observed"] = paintCancelled;
+                    if (timedCancel.ActiveObservation is ActivePaintObservation activeObservation)
+                    {
+                        summary["cancel_active_progress_observed"] = activeObservation.Observed;
+                        summary["cancel_active_progress_stage"] = activeObservation.Stage;
+                        summary["cancel_active_progress_step"] = activeObservation.Step;
+                    }
                     if (!cancel.Reply.Ok || !cancel.Reply.Success)
                     {
                         throw new InvalidOperationException(
@@ -497,12 +599,33 @@ internal static class ResearchRunner
         return new TimedReply(started, DateTimeOffset.UtcNow, reply);
     }
 
-    private static async Task<TimedReply> CancelPaintAfterDelayAsync(
+    private static async Task<CancelTimedReply> CancelPaintAfterDelayAsync(
         RuntimeBridgeService runtime,
         int delayMs,
         Task paintTask)
     {
         await Task.Delay(delayMs);
+        return new CancelTimedReply(await CancelPaintAsync(runtime, paintTask), null);
+    }
+
+    private static async Task<CancelTimedReply> CancelPaintWhenActiveAsync(
+        RuntimeBridgeService runtime,
+        string progressPath,
+        Task paintTask)
+    {
+        var observation = await WaitForActivePaintProgressAsync(progressPath, paintTask, TimeSpan.FromSeconds(20));
+        if (!observation.Observed)
+        {
+            throw new InvalidOperationException(
+                $"Active paint progress was not observed before cancellation (last stage {observation.Stage}, step {observation.Step}).");
+        }
+        return new CancelTimedReply(await CancelPaintAsync(runtime, paintTask), observation);
+    }
+
+    private static async Task<TimedReply> CancelPaintAsync(
+        RuntimeBridgeService runtime,
+        Task paintTask)
+    {
         var started = DateTimeOffset.UtcNow;
         var reply = await runtime.CancelPaintAsync();
         for (var attempt = 0;
@@ -517,6 +640,86 @@ internal static class ResearchRunner
             reply = await runtime.CancelPaintAsync();
         }
         return new TimedReply(started, DateTimeOffset.UtcNow, reply);
+    }
+
+    private static async Task<ActivePaintObservation> WaitForActivePaintProgressAsync(
+        string progressPath,
+        Task paintTask,
+        TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        var stage = "missing";
+        var step = 0;
+        while (DateTimeOffset.UtcNow < deadline && !paintTask.IsCompleted)
+        {
+            if (TryReadEventWatch(progressPath, out var document))
+            {
+                using (document)
+                {
+                    var root = document.RootElement;
+                    stage = ReadStage(root);
+                    step = root.TryGetProperty("step", out var stepElement) && stepElement.TryGetInt32(out var parsedStep)
+                        ? parsedStep
+                        : 0;
+                    var terminal = root.TryGetProperty("terminal", out var terminalElement) &&
+                                   terminalElement.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                                   terminalElement.GetBoolean();
+                    // A nonzero completed count during the live batch stage proves the async
+                    // job has left planner admission and has begun real server/local work.
+                    if (!terminal && string.Equals(stage, "mesh_server_batch", StringComparison.Ordinal) && step > 0)
+                        return new ActivePaintObservation(true, stage, step);
+                }
+            }
+            await Task.Delay(10);
+        }
+        return new ActivePaintObservation(false, paintTask.IsCompleted ? "paint_completed" : stage, step);
+    }
+
+    private static async Task<IReadOnlyList<PaintProgressSample>> CapturePaintProgressTimelineAsync(
+        string progressPath,
+        Task paintTask)
+    {
+        var samples = new List<PaintProgressSample>();
+        while (!paintTask.IsCompleted)
+        {
+            if (TryReadEventWatch(progressPath, out var document))
+            {
+                using (document)
+                {
+                    var root = document.RootElement;
+                    var stage = ReadStage(root);
+                    var terminal = root.TryGetProperty("terminal", out var terminalElement) &&
+                                   terminalElement.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                                   terminalElement.GetBoolean();
+                    var step = root.TryGetProperty("step", out var stepElement) && stepElement.TryGetInt32(out var parsedStep)
+                        ? parsedStep
+                        : 0;
+                    var total = root.TryGetProperty("total_steps", out var totalElement) && totalElement.TryGetInt32(out var parsedTotal)
+                        ? parsedTotal
+                        : 0;
+                    var eta = root.TryGetProperty("paint_eta_ms", out var etaElement) && etaElement.TryGetDouble(out var parsedEta)
+                        ? parsedEta
+                        : -1.0;
+                    var etaSource = root.TryGetProperty("paint_eta_source", out var etaSourceElement) &&
+                                    etaSourceElement.ValueKind == JsonValueKind.String
+                        ? etaSourceElement.GetString() ?? ""
+                        : "";
+                    var sample = new PaintProgressSample(
+                        DateTimeOffset.UtcNow, stage, terminal, step, total, eta, etaSource);
+                    if (samples.Count == 0 ||
+                        samples[^1].Stage != sample.Stage ||
+                        samples[^1].Terminal != sample.Terminal ||
+                        samples[^1].Step != sample.Step ||
+                        Math.Abs(samples[^1].PaintEtaMs - sample.PaintEtaMs) >= 1.0 ||
+                        samples[^1].PaintEtaSource != sample.PaintEtaSource)
+                    {
+                        samples.Add(sample);
+                    }
+                }
+            }
+            await Task.Delay(10);
+        }
+        return samples;
     }
 
     private static async Task<TimedReply> ShutdownAfterDelayAsync(
@@ -768,7 +971,14 @@ internal static class ResearchRunner
             front_region_mode = SettingsStore.RegionModeText(paint.FrontRegionMode),
             side_region_mode = SettingsStore.RegionModeText(paint.SideRegionMode),
             back_region_mode = SettingsStore.RegionModeText(paint.BackRegionMode),
-            fill_color = paint.FillColor.ToHex()
+            fill_color = paint.FillColor.ToHex(),
+            auto_material = paint.AutoMaterial,
+            metallic = paint.Metallic,
+            roughness = paint.Roughness,
+            emissive = paint.Emissive,
+            fill_metallic = paint.FillMetallic,
+            fill_roughness = paint.FillRoughness,
+            fill_emissive = paint.FillEmissive
         };
     }
 
@@ -783,6 +993,10 @@ internal static class ResearchRunner
         root["research_uv_replay_atlas"] = true;
         if (options.ReplayStrokeIndex is int replayStrokeIndex)
             root["research_replay_stroke_index"] = replayStrokeIndex;
+        if (options.TargetChannelOverride is int targetChannel)
+            root["research_target_channel"] = targetChannel;
+        if (options.ApplyModeOverride is int applyMode)
+            root["research_apply_mode"] = applyMode;
         if (options.PackedRadiusScaleOverride is double packedRadiusScaleOverride)
             root["research_packed_radius_scale"] = packedRadiusScaleOverride;
         root["research_triangle_world_radius"] = options.TriangleWorldRadius;
@@ -800,6 +1014,9 @@ internal static class ResearchRunner
     {
         var values = new Dictionary<string, string>(StringComparer.Ordinal);
         var paint = false;
+        var previewOnly = false;
+        var unpreviewOnly = false;
+        var autoMaterial = false;
         var textureSnapshot = false;
         var triangleWorldRadius = false;
         var requested = false;
@@ -813,11 +1030,23 @@ internal static class ResearchRunner
                 case "--paint":
                     paint = true;
                     break;
+                case "--preview-only":
+                    previewOnly = true;
+                    break;
+                case "--unpreview-only":
+                    unpreviewOnly = true;
+                    break;
+                case "--auto-material":
+                    autoMaterial = true;
+                    break;
                 case "--texture-snapshot":
                     textureSnapshot = true;
                     break;
                 case "--triangle-world-radius":
                     triangleWorldRadius = true;
+                    break;
+                case "--cancel-when-active":
+                    values["--cancel-when-active"] = "true";
                     break;
                 case "--pid":
                 case "--role":
@@ -832,10 +1061,18 @@ internal static class ResearchRunner
                 case "--batch-pacing-ms":
                 case "--stroke-limit":
                 case "--replay-stroke-index":
+                case "--target-channel":
+                case "--apply-mode":
                 case "--cancel-after-ms":
                 case "--shutdown-after-ms":
                 case "--fill-color":
                 case "--paint-color":
+                case "--metallic":
+                case "--roughness":
+                case "--emissive":
+                case "--fill-metallic":
+                case "--fill-roughness":
+                case "--fill-emissive":
                 case "--front-mode":
                 case "--side-mode":
                 case "--back-mode":
@@ -850,6 +1087,10 @@ internal static class ResearchRunner
 
         if (!requested)
             throw new ArgumentException("--research-replication is required.");
+        if (previewOnly && unpreviewOnly)
+            throw new ArgumentException("--preview-only and --unpreview-only are mutually exclusive.");
+        if ((previewOnly || unpreviewOnly) && !paint)
+            throw new ArgumentException("--preview-only and --unpreview-only require --paint.");
         if (!values.TryGetValue("--pid", out var pidText) ||
             !int.TryParse(pidText, NumberStyles.None, CultureInfo.InvariantCulture, out var processId) || processId <= 0)
         {
@@ -979,6 +1220,32 @@ internal static class ResearchRunner
         if (replayStrokeIndex is not null && !paint)
             throw new ArgumentException("--replay-stroke-index requires --paint.");
 
+        int? targetChannelOverride = null;
+        if (values.TryGetValue("--target-channel", out var targetChannelText))
+        {
+            if (!int.TryParse(targetChannelText, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedTargetChannel) ||
+                parsedTargetChannel < 0 || parsedTargetChannel > 7)
+            {
+                throw new ArgumentException("--target-channel must be an integer from 0 through 7.");
+            }
+            targetChannelOverride = parsedTargetChannel;
+        }
+        if (targetChannelOverride is not null && !paint)
+            throw new ArgumentException("--target-channel requires --paint.");
+
+        int? applyModeOverride = null;
+        if (values.TryGetValue("--apply-mode", out var applyModeText))
+        {
+            if (!int.TryParse(applyModeText, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedApplyMode) ||
+                parsedApplyMode < 0 || parsedApplyMode > 2)
+            {
+                throw new ArgumentException("--apply-mode must be 0 (override), 1 (alpha blend), or 2 (additive).");
+            }
+            applyModeOverride = parsedApplyMode;
+        }
+        if (applyModeOverride is not null && !paint)
+            throw new ArgumentException("--apply-mode requires --paint.");
+
         int? cancelAfterMs = null;
         if (values.TryGetValue("--cancel-after-ms", out var cancelAfterText))
         {
@@ -1001,10 +1268,17 @@ internal static class ResearchRunner
             shutdownAfterMs = parsedShutdownAfterMs;
         }
 
-        if (cancelAfterMs is not null && shutdownAfterMs is not null)
-            throw new ArgumentException("--cancel-after-ms and --shutdown-after-ms are mutually exclusive.");
+        var cancelWhenActive = values.ContainsKey("--cancel-when-active");
+        if ((cancelAfterMs is not null && cancelWhenActive) ||
+            (cancelAfterMs is not null && shutdownAfterMs is not null) ||
+            (cancelWhenActive && shutdownAfterMs is not null))
+        {
+            throw new ArgumentException("--cancel-after-ms, --cancel-when-active, and --shutdown-after-ms are mutually exclusive.");
+        }
         if (cancelAfterMs is not null && !paint)
             throw new ArgumentException("--cancel-after-ms requires --paint.");
+        if (cancelWhenActive && !paint)
+            throw new ArgumentException("--cancel-when-active requires --paint.");
         if (shutdownAfterMs is not null && !paint)
             throw new ArgumentException("--shutdown-after-ms requires --paint.");
         if (textureSnapshot && shutdownAfterMs is not null)
@@ -1028,6 +1302,27 @@ internal static class ResearchRunner
             paintColorOverride = parsedPaintColor;
         }
 
+        static double? ParseUnitIntervalOverride(
+            IReadOnlyDictionary<string, string> parsedValues,
+            string option)
+        {
+            if (!parsedValues.TryGetValue(option, out var text))
+                return null;
+            if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value) ||
+                !double.IsFinite(value) || value < 0.0 || value > 1.0)
+            {
+                throw new ArgumentException($"{option} must be a number from 0 through 1.");
+            }
+            return value;
+        }
+
+        var metallicOverride = ParseUnitIntervalOverride(values, "--metallic");
+        var roughnessOverride = ParseUnitIntervalOverride(values, "--roughness");
+        var emissiveOverride = ParseUnitIntervalOverride(values, "--emissive");
+        var fillMetallicOverride = ParseUnitIntervalOverride(values, "--fill-metallic");
+        var fillRoughnessOverride = ParseUnitIntervalOverride(values, "--fill-roughness");
+        var fillEmissiveOverride = ParseUnitIntervalOverride(values, "--fill-emissive");
+
         static RegionMode? ParseRegionModeOverride(
             IReadOnlyDictionary<string, string> parsedValues,
             string option)
@@ -1048,6 +1343,9 @@ internal static class ResearchRunner
             role,
             Path.GetFullPath(output),
             paint,
+            previewOnly,
+            unpreviewOnly,
+            autoMaterial,
             holdSeconds,
             pressureSampleMs,
             textureSnapshot,
@@ -1060,10 +1358,19 @@ internal static class ResearchRunner
             packedBatchPacingOverrideMs,
             strokeLimit,
             replayStrokeIndex,
+            targetChannelOverride,
+            applyModeOverride,
             cancelAfterMs,
+            cancelWhenActive,
             shutdownAfterMs,
             fillColorOverride,
             paintColorOverride,
+            metallicOverride,
+            roughnessOverride,
+            emissiveOverride,
+            fillMetallicOverride,
+            fillRoughnessOverride,
+            fillEmissiveOverride,
             frontRegionModeOverride,
             sideRegionModeOverride,
             backRegionModeOverride);

@@ -48,7 +48,7 @@ int main()
     if (!runtime_contract::requires_internal_no_resend(false, false, true, true) ||
         runtime_contract::requires_internal_no_resend(true, false, true, true) ||
         runtime_contract::requires_internal_no_resend(false, true, true, true) ||
-        runtime_contract::requires_internal_no_resend(false, false, false, true) ||
+        !runtime_contract::requires_internal_no_resend(false, false, false, true) ||
         runtime_contract::requires_internal_no_resend(false, false, true, false) ||
         runtime_contract::InternalNoResendMaxCallsPerTick != 6)
     {
@@ -76,7 +76,8 @@ int main()
         24,
         6);
     if (fastest.remote_batch_limit != 20 || fastest.remote_delay_ms != 50 ||
-        fastest.local_batch_limit != 6 || fastest.local_delay_ms != 17)
+        fastest.local_batch_limit != 6 ||
+        fastest.local_delay_ms != runtime_contract::FastLocalCadenceMs)
     {
         return 6;
     }
@@ -89,21 +90,24 @@ int main()
         24,
         6);
     if (tuned.remote_batch_limit != 7 || tuned.remote_delay_ms != 125 ||
-        tuned.local_batch_limit != 6 || tuned.local_delay_ms != 17)
+        tuned.local_batch_limit != 6 ||
+        tuned.local_delay_ms != runtime_contract::FastLocalCadenceMs)
     {
         return 7;
     }
 
     const auto clamped = runtime_contract::resolve_pacing(0, 0, 20, 20, 24, 6);
     if (clamped.remote_batch_limit != 1 || clamped.remote_delay_ms != 50 ||
-        clamped.local_batch_limit != 6 || clamped.local_delay_ms != 17)
+        clamped.local_batch_limit != 6 ||
+        clamped.local_delay_ms != runtime_contract::FastLocalCadenceMs)
     {
         return 8;
     }
 
     const auto expanded = runtime_contract::resolve_pacing(500, 1, 500, 1000, 500, 6);
     if (expanded.remote_batch_limit != 500 || expanded.remote_delay_ms != 1 ||
-        expanded.local_batch_limit != 6 || expanded.local_delay_ms != 17)
+        expanded.local_batch_limit != 6 ||
+        expanded.local_delay_ms != runtime_contract::FastLocalCadenceMs)
     {
         return 8;
     }
@@ -155,7 +159,7 @@ int main()
     {
         return 8;
     }
-    if (!runtime_contract::should_immediately_repost_direct_local(true, 0) ||
+    if (runtime_contract::should_immediately_repost_direct_local(true, 0) ||
         runtime_contract::should_immediately_repost_direct_local(true, 1) ||
         runtime_contract::should_immediately_repost_direct_local(false, 0))
     {
@@ -176,6 +180,7 @@ int main()
 
     if (runtime_contract::paint_channel_write_cost(4) != 4 ||
         runtime_contract::paint_channel_write_cost(5) != 3 ||
+        runtime_contract::paint_channel_write_cost(7) != 1 ||
         runtime_contract::paint_channel_write_cost(0) != 1 ||
         !runtime_contract::local_dispatch_can_append(0, 0, 4, 6, 6) ||
         runtime_contract::local_dispatch_can_append(1, 4, 4, 6, 6) ||
@@ -499,17 +504,16 @@ int main()
         runtime_contract::PackedPaintRecordWorldRadiusOffset != 23 ||
         runtime_contract::PackedPaintRecordSubdivisionOffset != 27 ||
         runtime_contract::packed_paint_payload_size(3) != 114 ||
-        runtime_contract::production_material_stroke_count(3) != 6 ||
+        runtime_contract::production_material_stroke_count(3) != 3 ||
         runtime_contract::production_material_sample_index(0) != 0 ||
-        runtime_contract::production_material_sample_index(1) != 0 ||
-        runtime_contract::production_material_sample_index(2) != 1)
+        runtime_contract::production_material_sample_index(1) != 1 ||
+        runtime_contract::production_material_sample_index(2) != 2)
     {
         return 25;
     }
     if (runtime_contract::ProductionMaterialPaintChannels !=
-        std::array<std::uint8_t, 2>{
-            static_cast<std::uint8_t>(sdk::EPaintChannel::AlbedoMetallicRoughness),
-            static_cast<std::uint8_t>(sdk::EPaintChannel::Emissive)})
+        std::array<std::uint8_t, 1>{
+            static_cast<std::uint8_t>(sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive)})
     {
         return 26;
     }

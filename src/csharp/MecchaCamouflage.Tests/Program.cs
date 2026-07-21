@@ -30,6 +30,7 @@ var tests = new List<(string Name, Action Run)>
     ("legacy auto pacing migrates to fastest sliders", LegacyAutoPacingMigratesToFastestSliders),
     ("legacy manual pacing migrates to sliders", LegacyManualPacingMigratesToSliders),
     ("legacy compatibility pacing migrates to sliders", LegacyCompatibilityPacingMigratesToSliders),
+    ("legacy mirror-like Fill PBR defaults migrate to manual material", LegacyFillPbrDefaultsMigrateToManualMaterial),
     ("settings clamp batch sliders", SettingsClampBatchSliders),
     ("locales have complete keys", LocalesHaveCompleteKeys),
     ("color parser accepts rrggbb", ColorParserAcceptsHex),
@@ -271,9 +272,12 @@ static void NativeResearchNoResendRouteIsSignatureResolvedInsteadOfBuildGated()
            !resolver.Contains("main_module_text_identity_mismatch", StringComparison.Ordinal),
         "research no-resend route must not reject a build solely because its identity or RVAs changed");
     Assert(resolver.Contains("PaintAtUVWithBrush_param_layout_mismatch", StringComparison.Ordinal) &&
+           resolver.Contains("{\"channeldata\", 0x10, static_cast<int>(sizeof(sdk::FPaintChannelData))}", StringComparison.Ordinal) &&
+           resolver.Contains("{\"brushsettings\", 0x38, static_cast<int>(sizeof(sdk::FRuntimeBrushSettings))}", StringComparison.Ordinal) &&
+           resolver.Contains("{\"channel\", 0x60, 0x01}", StringComparison.Ordinal) &&
            resolver.Contains("internal_rel32_call_target", StringComparison.Ordinal) &&
            resolver.Contains("matches.size() != 1", StringComparison.Ordinal),
-        "research no-resend route must retain schema, signature, relative-call, and uniqueness validation");
+        "research no-resend route must validate the UE5.6 Emissive-aware parameter layout, signature, relative call, and uniqueness");
 }
 
 static void NativeLocalFailuresUseFixedServerPackedFallback()
@@ -373,8 +377,14 @@ static void NativeProductionLocalSyncUsesPerStrokePaint()
 
     Assert(policy.Contains("return false;", StringComparison.Ordinal),
         "normal packed paint must use the validated per-stroke local paint route, not texture import");
-    Assert(bridge.Contains("\\\"local_route_mode\\\":\\\"local_paint_at_uv\\\"", StringComparison.Ordinal),
-        "production metadata must identify the local per-stroke paint route");
+    Assert(bridge.Contains("\\\"local_route_mode\\\":\\\"validated_no_resend_direct\\\"", StringComparison.Ordinal) &&
+           bridge.Contains("\\\"local_apply_route\\\":\\\"internal_common_no_resend\\\"", StringComparison.Ordinal) &&
+           bridge.Contains("server_packed_with_internal_no_resend_local_lockstep", StringComparison.Ordinal) &&
+           bridge.Contains("suppress_nested_self_multicast_exact_payload_only", StringComparison.Ordinal) &&
+           bridge.Contains("self_packed_multicast_suppressions", StringComparison.Ordinal) &&
+           bridge.Contains("direct_no_resend_committed_local_pending", StringComparison.Ordinal) &&
+           bridge.Contains("direct_no_resend_cancel_completing_committed_batch", StringComparison.Ordinal),
+        "production metadata must identify the non-echo local paint route, exact self-multicast suppression, and bounded cancel pairing");
 }
 
 static void NativePreviewAppliesPbrAndEmissiveChannels()
@@ -385,10 +395,11 @@ static void NativePreviewAppliesPbrAndEmissiveChannels()
 
     Assert(bridge.Contains("paint_albedo_metallic_roughness", StringComparison.Ordinal) &&
            bridge.Contains("paint_emissive", StringComparison.Ordinal) &&
-           bridge.Contains("sdk::EPaintChannel::Emissive, emissive_bytes", StringComparison.Ordinal) &&
+           bridge.Contains("packed_pbr_export_mismatch", StringComparison.Ordinal) &&
+           bridge.Contains("sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive", StringComparison.Ordinal) &&
            bridge.Contains("unpreview_snapshot_emissive_bytes", StringComparison.Ordinal) &&
-           bridge.Contains("restore_channel(sdk::EPaintChannel::Emissive", StringComparison.Ordinal),
-        "preview and unpreview must preserve the AMR and Emissive channels produced by normal paint strokes");
+           bridge.Contains("mesh_unpreview_packed_pbr_mismatch", StringComparison.Ordinal),
+        "preview and unpreview must preserve packed Metallic/Roughness/Emissive data without successive imports overwriting it");
 }
 
 static void NativeAutoMaterialDetectsEmissiveAndReportsLocalPacing()
@@ -401,6 +412,17 @@ static void NativeAutoMaterialDetectsEmissiveAndReportsLocalPacing()
            bridge.Contains("sdk::EPaintChannel::Emissive", StringComparison.Ordinal) &&
            bridge.Contains("material_properties_emissive_source", StringComparison.Ordinal),
         "Auto Detect must derive Emissive from the game channel and report its source or fallback");
+    Assert(bridge.Contains("sizeof(MeshFirstPaintMaterialPattern) == 0x30", StringComparison.Ordinal) &&
+           bridge.Contains("offsetof(MeshFirstPaintMaterialPattern, emissive_color) == 0x18", StringComparison.Ordinal) &&
+           bridge.Contains("offsetof(MeshFirstPaintMaterialPattern, sample_count) == 0x2C", StringComparison.Ordinal) &&
+           bridge.Contains("material_properties_candidates", StringComparison.Ordinal) &&
+           bridge.Contains("packed_pbr_emissive_blue_mode", StringComparison.Ordinal) &&
+           bridge.Contains("PreferredSurfaceCoverageFloor = 0.01", StringComparison.Ordinal) &&
+           bridge.Contains("auto_material_fill_policy", StringComparison.Ordinal) &&
+           bridge.Contains("detected_surface_material", StringComparison.Ordinal) &&
+           bridge.Contains("material_properties_fill_manual_fallbacks", StringComparison.Ordinal) &&
+           bridge.Contains("first_stroke_emissive", StringComparison.Ordinal),
+        "Auto Detect must cover Fill as well as Paint, use the UE5.6 Emissive-aware pattern layout, and expose numeric candidates for runtime verification");
     Assert(bridge.Contains("local_cpu_budget_us", StringComparison.Ordinal) &&
            bridge.Contains("local_render_target_write_budget", StringComparison.Ordinal) &&
            bridge.Contains("local_logical_sample_batch_limit", StringComparison.Ordinal),
@@ -528,6 +550,49 @@ static void LegacyCompatibilityPacingMigratesToSliders()
 
     Assert(settings.Paint.PackedBatchLimit == 6, "compatibility mode should migrate to six strokes per RPC");
     Assert(settings.Paint.PackedBatchPacingMs == 75, "compatibility mode should migrate to 75 ms pacing");
+}
+
+static void LegacyFillPbrDefaultsMigrateToManualMaterial()
+{
+    using var temp = new TempHome();
+    var paths = new AppPaths("fill-pbr-defaults-migration-test");
+    Directory.CreateDirectory(paths.ConfigDirectory);
+    File.WriteAllText(paths.ConfigPath, """
+    {
+      "layout_version": 38,
+      "metallic": 0,
+      "roughness": 1,
+      "emissive": 0,
+      "fill_metallic": 1,
+      "fill_roughness": 0,
+      "fill_emissive": 0
+    }
+    """);
+
+    var migrated = new SettingsStore(paths).Load();
+    Assert(Math.Abs(migrated.Paint.FillMetallic) < 0.000001,
+        "the old mirror-like Fill metallic default should migrate to the manual material value");
+    Assert(Math.Abs(migrated.Paint.FillRoughness - 1.0) < 0.000001,
+        "the old mirror-like Fill roughness default should migrate to the manual material value");
+    Assert(Math.Abs(migrated.Paint.FillEmissive) < 0.000001,
+        "the Fill emissive default should migrate with the manual material value");
+
+    File.WriteAllText(paths.ConfigPath, """
+    {
+      "layout_version": 38,
+      "metallic": 0,
+      "roughness": 1,
+      "emissive": 0,
+      "fill_metallic": 0.7,
+      "fill_roughness": 0.2,
+      "fill_emissive": 0.1
+    }
+    """);
+    var custom = new SettingsStore(paths).Load();
+    Assert(Math.Abs(custom.Paint.FillMetallic - 0.7) < 0.000001 &&
+           Math.Abs(custom.Paint.FillRoughness - 0.2) < 0.000001 &&
+           Math.Abs(custom.Paint.FillEmissive - 0.1) < 0.000001,
+        "a non-default Fill PBR choice must not be changed by the migration");
 }
 
 static void PayloadSendsBatchSliderValues()
@@ -2148,8 +2213,34 @@ static void ResearchRunnerRecordsTwoPassBrushesAndPackedLocalQueueMode()
     Assert(source.Contains("TryNormalizeNonZeroHexAddress", StringComparison.Ordinal) &&
            source.Contains("ulong.TryParse", StringComparison.Ordinal),
         "joining receiver discovery must require a strict non-zero hexadecimal component address");
+    Assert(source.Contains("--target-channel", StringComparison.Ordinal) &&
+           source.Contains("research_target_channel", StringComparison.Ordinal) &&
+           native.Contains("research_single_channel", StringComparison.Ordinal),
+        "research runs must be able to isolate one live paint-channel enum without changing production fan-out");
+    Assert(source.Contains("--metallic", StringComparison.Ordinal) &&
+           source.Contains("--roughness", StringComparison.Ordinal) &&
+           source.Contains("--emissive", StringComparison.Ordinal) &&
+           source.Contains("ParseUnitIntervalOverride", StringComparison.Ordinal),
+        "research runs must support bounded PBR sentinel values for channel-contract checks");
+    Assert(source.Contains("--preview-only", StringComparison.Ordinal) &&
+           source.Contains("--unpreview-only", StringComparison.Ordinal) &&
+           source.Contains("not_applicable_preview_operation", StringComparison.Ordinal) &&
+           source.Contains("preview-cleanup-reply.json", StringComparison.Ordinal) &&
+           source.Contains("new PaintRequestOptions(UnPreviewOnly: true, ResearchArtifacts: true)", StringComparison.Ordinal),
+        "research preview runs must restore their material snapshot before the short-lived bridge shuts down");
+    Assert(source.Contains("--auto-material", StringComparison.Ordinal) &&
+           source.Contains("session.Settings.Paint.AutoMaterial = true", StringComparison.Ordinal),
+        "research runs must be able to capture the live auto-material decision separately from manual PBR sentinels");
     Assert(native.Contains("selected_texture_target_only", StringComparison.Ordinal),
         "texture diagnostics must avoid unrelated component readbacks that perturb joining-client timing");
+    Assert(native.Contains("emissive_export", StringComparison.Ordinal) &&
+           native.Contains("emissive_after_changed_rgba", StringComparison.Ordinal) &&
+           native.Contains("roughness_after_changed_rgba", StringComparison.Ordinal),
+        "research texture diagnostics must record all PBR channels and their changed output values");
+    Assert(native.Contains("channel_data_schema", StringComparison.Ordinal) &&
+           native.Contains("channel_enum_schema", StringComparison.Ordinal) &&
+           native.Contains("out_patterns_schema", StringComparison.Ordinal),
+        "research paint probes must report the live channel, enum, and auto-material pattern contracts");
     Assert(source.Contains("CancelPaintAfterDelayAsync(session.Runtime, cancelAfterMs, paintTask)", StringComparison.Ordinal) &&
            source.Contains("cancel_admission_latched", StringComparison.Ordinal) &&
            native.Contains("cancel_latched_paint_request", StringComparison.Ordinal),
