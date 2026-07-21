@@ -28,6 +28,27 @@ Logs are written under:
 %LOCALAPPDATA%\MecchaCamouflage\versions\<version>\logs\
 ```
 
+## Windows Security
+
+If the log reports an error like the following, Windows Security has blocked a
+runtime file:
+
+```text
+Bridge warmup failed: One or more errors occurred. (Operation did not complete successfully because the file contains a virus or potentially unwanted software.)
+```
+
+1. Open **Windows Security**.
+2. Go to **Virus & threat protection** → **Manage settings**.
+3. Scroll down to **Exclusions** and click **Add or remove exclusions**.
+4. Click **Add an exclusion** → **Folder**.
+5. Select the following folder:
+
+```text
+%LOCALAPPDATA%\MecchaCamouflage\
+```
+
+After adding the exclusion, restart MecchaCamouflage.
+
 ## Development
 
 ```bash
