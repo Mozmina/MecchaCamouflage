@@ -42,7 +42,7 @@ var tests = new List<(string Name, Action Run)>
     ("diagnostics log write is best effort when file is locked", DiagnosticsLogWriteIsBestEffortWhenFileLocked),
     ("runtime log write is best effort when file is locked", RuntimeLogWriteIsBestEffortWhenFileLocked),
     ("auto material defaults off", AutoMaterialDefaultsOff),
-    ("front region defaults to fill", FrontRegionDefaultsToFill),
+    ("regions default to side and back paint", RegionsDefaultToSideAndBackPaint),
     ("bridge messages are user friendly", BridgeMessagesAreUserFriendly),
     ("settings detect supported system language", SettingsDetectSupportedSystemLanguage),
     ("ui snapshot exposes a single brush", UiSnapshotExposesSingleBrush),
@@ -117,9 +117,9 @@ static void PaintDefaultsExposeSingleBrush()
     Assert(Math.Abs(paint.BrushSizeTexels - 4.0) < 0.000001, "the single brush should default to 4 texels");
     Assert(Math.Abs(paint.ColorCompressionTolerance - 4.0) < 0.000001,
         "color compression should default to 4");
-    Assert(paint.FrontRegionMode == RegionMode.Fill, "front should default to fill");
-    Assert(paint.SideRegionMode == RegionMode.Skip, "side should default to skip");
-    Assert(paint.BackRegionMode == RegionMode.Skip, "back should default to skip");
+    Assert(paint.FrontRegionMode == RegionMode.Skip, "front should default to skip");
+    Assert(paint.SideRegionMode == RegionMode.Paint, "side should default to paint");
+    Assert(paint.BackRegionMode == RegionMode.Paint, "back should default to paint");
 }
 
 static void SingleBrushPersistsAndMigratesLegacyDetailSettings()
@@ -600,9 +600,12 @@ static void AutoMaterialDefaultsOff()
     Assert(!new AppSettings().Paint.AutoMaterial, "auto material should default off");
 }
 
-static void FrontRegionDefaultsToFill()
+static void RegionsDefaultToSideAndBackPaint()
 {
-    Assert(new AppSettings().Paint.FrontRegionMode == RegionMode.Fill, "front should default to fill");
+    var paint = new AppSettings().Paint;
+    Assert(paint.FrontRegionMode == RegionMode.Skip, "front should default to skip");
+    Assert(paint.SideRegionMode == RegionMode.Paint, "side should default to paint");
+    Assert(paint.BackRegionMode == RegionMode.Paint, "back should default to paint");
 }
 
 static void BridgeMessagesAreUserFriendly()
@@ -1789,22 +1792,6 @@ static void ResearchTextureProbeIsExplicitlyDispatched()
         "texture command must be able to pin the watched direct receiver rather than the local pawn");
     Assert(native.Contains("research_texture_target_unavailable", StringComparison.Ordinal),
         "an unobserved or stale multicast receiver must fail closed");
-}
-
-static void NativeResearchReplayPlanPreservesActualPassStrokes()
-{
-    var native = File.ReadAllText(Path.Combine(
-        FindRepositoryRoot(),
-        "src", "native", "bridge", "bridge.cpp"));
-
-    Assert(native.Contains("research_uv_replay_atlas", StringComparison.Ordinal),
-        "native paint requests should explicitly gate UV replay sidecars to research mode");
-    Assert(native.Contains("mesh_first_write_uv_replay_plan_artifact", StringComparison.Ordinal),
-        "native bridge should write the actual replay-plan sidecar after planning");
-    Assert(native.Contains("research_uv_replay_plan_written", StringComparison.Ordinal),
-        "native reply must say whether the replay-plan sidecar was written");
-    Assert(native.Contains("effective_fill_end", StringComparison.Ordinal) && native.Contains("effective_paint_begin", StringComparison.Ordinal),
-        "native replay sidecar must use the post-truncation pass boundaries");
 }
 
 static void ResearchRunnerCanIsolateOnePlannedReplayStroke()
