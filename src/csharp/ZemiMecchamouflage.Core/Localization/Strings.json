@@ -181,7 +181,11 @@
     "toast.hotkey.duplicate": "{0} はすでに割り当て済みです。",
     "toast.editing.hotkey.blocked": "ホットキーを使う前に編集を保存またはキャンセルしてください。",
     "error.settings.not.saved": "設定を保存できませんでした。",
-    "color.compression.tolerance": "色圧縮許容誤差"
+    "color.compression.tolerance": "色圧縮許容誤差",
+    "group.second.pass": "2回目の塗装",
+    "second.pass.brush.size": "2回目のブラシサイズ",
+    "second.pass.color.compression.tolerance": "2回目の色圧縮許容誤差",
+    "second.pass.hotkey": "2回目のホットキー"
   },
   "ko": {
     "app.title": "Zemi Mecchamouflage",
@@ -271,7 +275,11 @@
     "toast.hotkey.duplicate": "{0}은(는) 이미 지정되었습니다.",
     "toast.editing.hotkey.blocked": "핫키를 사용하기 전에 편집을 저장하거나 취소하세요.",
     "error.settings.not.saved": "설정을 저장하지 못했습니다.",
-    "color.compression.tolerance": "색상 압축 허용 오차"
+    "color.compression.tolerance": "색상 압축 허용 오차",
+    "group.second.pass": "2차 도색",
+    "second.pass.brush.size": "2차 브러시 크기",
+    "second.pass.color.compression.tolerance": "2차 색상 압축 허용 오차",
+    "second.pass.hotkey": "2차 단축키"
   },
   "es": {
     "app.title": "Zemi Mecchamouflage",
@@ -361,7 +369,11 @@
     "toast.hotkey.duplicate": "{0} ya está asignada.",
     "toast.editing.hotkey.blocked": "Guarda o cancela la edición antes de usar atajos.",
     "error.settings.not.saved": "No se pudieron guardar los ajustes.",
-    "color.compression.tolerance": "Tolerancia de compresión de color"
+    "color.compression.tolerance": "Tolerancia de compresión de color",
+    "group.second.pass": "Segunda pasada",
+    "second.pass.brush.size": "Tamaño de pincel (segunda pasada)",
+    "second.pass.color.compression.tolerance": "Tolerancia de compresión de color (segunda pasada)",
+    "second.pass.hotkey": "Tecla de acceso rápido (segunda pasada)"
   },
   "fr": {
     "app.title": "Zemi Mecchamouflage",
@@ -451,7 +463,11 @@
     "toast.hotkey.duplicate": "{0} est déjà attribuée.",
     "toast.editing.hotkey.blocked": "Enregistrez ou annulez les modifications avant d'utiliser les raccourcis.",
     "error.settings.not.saved": "Les paramètres n’ont pas été enregistrés.",
-    "color.compression.tolerance": "Tolérance de compression des couleurs"
+    "color.compression.tolerance": "Tolérance de compression des couleurs",
+    "group.second.pass": "Deuxième passage",
+    "second.pass.brush.size": "Taille de pinceau (deuxième passage)",
+    "second.pass.color.compression.tolerance": "Tolérance de compression des couleurs (deuxième passage)",
+    "second.pass.hotkey": "Raccourci du deuxième passage"
   },
   "de": {
     "app.title": "Zemi Mecchamouflage",
@@ -541,7 +557,11 @@
     "toast.hotkey.duplicate": "{0} ist bereits belegt.",
     "toast.editing.hotkey.blocked": "Speichern oder abbrechen, bevor Hotkeys verwendet werden.",
     "error.settings.not.saved": "Einstellungen wurden nicht gespeichert.",
-    "color.compression.tolerance": "Farbkompressionstoleranz"
+    "color.compression.tolerance": "Farbkompressionstoleranz",
+    "group.second.pass": "Zweiter Durchgang",
+    "second.pass.brush.size": "Pinselgröße (zweiter Durchgang)",
+    "second.pass.color.compression.tolerance": "Farbkompressionstoleranz (zweiter Durchgang)",
+    "second.pass.hotkey": "Hotkey für zweiten Durchgang"
   },
   "pt-BR": {
     "app.title": "Zemi Mecchamouflage",
@@ -631,7 +651,11 @@
     "toast.hotkey.duplicate": "{0} já está atribuída.",
     "toast.editing.hotkey.blocked": "Salve ou cancele a edição antes de usar atalhos.",
     "error.settings.not.saved": "As configurações não foram salvas.",
-    "color.compression.tolerance": "Tolerância de compressão de cores"
+    "color.compression.tolerance": "Tolerância de compressão de cores",
+    "group.second.pass": "Segunda passada",
+    "second.pass.brush.size": "Tamanho do pincel (segunda passada)",
+    "second.pass.color.compression.tolerance": "Tolerância de compressão de cores (segunda passada)",
+    "second.pass.hotkey": "Tecla de atalho (segunda passada)"
   },
   "zh-Hans": {
     "app.title": "Zemi Mecchamouflage",
@@ -721,7 +745,11 @@
     "toast.hotkey.duplicate": "{0} 已被分配。",
     "toast.editing.hotkey.blocked": "使用热键前请先保存或取消编辑。",
     "error.settings.not.saved": "设置未保存。",
-    "color.compression.tolerance": "颜色压缩容差"
+    "color.compression.tolerance": "颜色压缩容差",
+    "group.second.pass": "第二遍",
+    "second.pass.brush.size": "第二遍笔刷大小",
+    "second.pass.color.compression.tolerance": "第二遍颜色压缩容差",
+    "second.pass.hotkey": "第二遍快捷键"
   },
   "zh-Hant": {
     "app.title": "Zemi Mecchamouflage",
@@ -811,7 +839,11 @@
     "toast.hotkey.duplicate": "{0} 已被指派。",
     "toast.editing.hotkey.blocked": "使用快捷鍵前請先儲存或取消編輯。",
     "error.settings.not.saved": "設定未儲存。",
-    "color.compression.tolerance": "顏色壓縮容差"
+    "color.compression.tolerance": "顏色壓縮容差",
+    "group.second.pass": "第二遍",
+    "second.pass.brush.size": "第二遍筆刷大小",
+    "second.pass.color.compression.tolerance": "第二遍顏色壓縮容差",
+    "second.pass.hotkey": "第二遍快捷鍵"
   },
   "ru": {
     "app.title": "Zemi Mecchamouflage",
@@ -901,7 +933,11 @@
     "toast.hotkey.duplicate": "{0} уже назначена.",
     "toast.editing.hotkey.blocked": "Сохраните или отмените правку перед горячими клавишами.",
     "error.settings.not.saved": "Настройки не сохранены.",
-    "color.compression.tolerance": "Допуск сжатия цвета"
+    "color.compression.tolerance": "Допуск сжатия цвета",
+    "group.second.pass": "Второй проход",
+    "second.pass.brush.size": "Размер кисти (второй проход)",
+    "second.pass.color.compression.tolerance": "Допуск сжатия цвета (второй проход)",
+    "second.pass.hotkey": "Горячая клавиша второго прохода"
   },
   "pl": {
     "app.title": "Zemi Mecchamouflage",
@@ -991,7 +1027,11 @@
     "toast.hotkey.duplicate": "{0} jest już przypisany.",
     "toast.editing.hotkey.blocked": "Zapisz lub anuluj edycję przed użyciem skrótów.",
     "error.settings.not.saved": "Nie zapisano ustawień.",
-    "color.compression.tolerance": "Tolerancja kompresji kolorów"
+    "color.compression.tolerance": "Tolerancja kompresji kolorów",
+    "group.second.pass": "Drugi przebieg",
+    "second.pass.brush.size": "Rozmiar pędzla (drugi przebieg)",
+    "second.pass.color.compression.tolerance": "Tolerancja kompresji koloru (drugi przebieg)",
+    "second.pass.hotkey": "Skrót drugiego przebiegu"
   },
   "tr": {
     "app.title": "Zemi Mecchamouflage",
@@ -1081,7 +1121,11 @@
     "toast.hotkey.duplicate": "{0} zaten atanmış.",
     "toast.editing.hotkey.blocked": "Kısayolları kullanmadan önce düzenlemeyi kaydedin veya iptal edin.",
     "error.settings.not.saved": "Ayarlar kaydedilmedi.",
-    "color.compression.tolerance": "Renk sıkıştırma toleransı"
+    "color.compression.tolerance": "Renk sıkıştırma toleransı",
+    "group.second.pass": "İkinci geçiş",
+    "second.pass.brush.size": "İkinci geçiş fırça boyutu",
+    "second.pass.color.compression.tolerance": "İkinci geçiş renk sıkıştırma toleransı",
+    "second.pass.hotkey": "İkinci geçiş kısayolu"
   },
   "id": {
     "app.title": "Zemi Mecchamouflage",
@@ -1171,7 +1215,11 @@
     "toast.hotkey.duplicate": "{0} sudah dipakai.",
     "toast.editing.hotkey.blocked": "Simpan atau batalkan edit sebelum memakai hotkey.",
     "error.settings.not.saved": "Pengaturan tidak tersimpan.",
-    "color.compression.tolerance": "Toleransi kompresi warna"
+    "color.compression.tolerance": "Toleransi kompresi warna",
+    "group.second.pass": "Lintasan kedua",
+    "second.pass.brush.size": "Ukuran kuas lintasan kedua",
+    "second.pass.color.compression.tolerance": "Toleransi kompresi warna lintasan kedua",
+    "second.pass.hotkey": "Pintasan lintasan kedua"
   },
   "it": {
     "app.title": "Zemi Mecchamouflage",
@@ -1261,7 +1309,11 @@
     "toast.hotkey.duplicate": "{0} è già assegnato.",
     "toast.editing.hotkey.blocked": "Salva o annulla la modifica prima degli hotkey.",
     "error.settings.not.saved": "Impostazioni non salvate.",
-    "color.compression.tolerance": "Tolleranza di compressione del colore"
+    "color.compression.tolerance": "Tolleranza di compressione del colore",
+    "group.second.pass": "Secondo passaggio",
+    "second.pass.brush.size": "Dimensione pennello (secondo passaggio)",
+    "second.pass.color.compression.tolerance": "Tolleranza di compressione colore (secondo passaggio)",
+    "second.pass.hotkey": "Tasto di scelta rapida (secondo passaggio)"
   },
   "nl": {
     "app.title": "Zemi Mecchamouflage",
@@ -1351,7 +1403,11 @@
     "toast.hotkey.duplicate": "{0} is al toegewezen.",
     "toast.editing.hotkey.blocked": "Sla op of annuleer de bewerking voordat je sneltoetsen gebruikt.",
     "error.settings.not.saved": "Instellingen zijn niet opgeslagen.",
-    "color.compression.tolerance": "Kleurcompressietolerantie"
+    "color.compression.tolerance": "Kleurcompressietolerantie",
+    "group.second.pass": "Tweede ronde",
+    "second.pass.brush.size": "Penseelgrootte (tweede ronde)",
+    "second.pass.color.compression.tolerance": "Kleurcompressietolerantie (tweede ronde)",
+    "second.pass.hotkey": "Sneltoets tweede ronde"
   },
   "vi": {
     "app.title": "Zemi Mecchamouflage",
@@ -1441,6 +1497,10 @@
     "toast.hotkey.duplicate": "{0} đã được gán.",
     "toast.editing.hotkey.blocked": "Lưu hoặc hủy chỉnh sửa trước khi dùng phím tắt.",
     "error.settings.not.saved": "Chưa lưu được cài đặt.",
-    "color.compression.tolerance": "Dung sai nén màu"
+    "color.compression.tolerance": "Dung sai nén màu",
+    "group.second.pass": "Lượt thứ hai",
+    "second.pass.brush.size": "Kích thước cọ (lượt thứ hai)",
+    "second.pass.color.compression.tolerance": "Dung sai nén màu (lượt thứ hai)",
+    "second.pass.hotkey": "Phím tắt lượt thứ hai"
   }
 }
