@@ -11287,17 +11287,58 @@ namespace
                                  metadata + ",\"replay_blocked\":true");
         }
         metadata += ",\"paint_target_channel\":\"albedo_metallic_roughness_emissive\"";
-        if (preview_only)
-        {
-            metadata += ",\"local_paint_rpc\":\"ImportChannelFromBytes\"";
-            metadata += ",\"local_visual_sync_mode\":\"local_material_channels_import_preview\"";
-            metadata += ",\"local_batch_strategy\":\"four_channel_import_preview\"";
-            metadata += ",\"local_paint_target_channel\":\"albedo_metallic_roughness_emissive\"";
-            metadata += ",\"local_texture_import_byte_order\":\"rgba\"";
-            metadata += ",\"local_visual_sync_required\":false";
-            metadata += ",\"local_texture_import_required\":true";
-            metadata += ",\"authoritative_replay\":\"local_texture_preview_only\"";
-        }
+if (preview_only)
+{
+const auto preview_started = std::chrono::steady_clock::now();
+write_bridge_progress("mesh_local_texture_import",
+"Importing local preview material texture",
+0,
+1,
+0.0,
+"\"phase\":\"local_texture_import\",\"preview_only\":true,\"terminal\":false,\"result\":\"running\"");
+const auto albedo_before_bytes = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo);
+const auto metallic_before_bytes = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Metallic);
+const auto roughness_before_bytes = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Roughness);
+const auto emissive_before_bytes = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Emissive);
+const auto* base_albedo_bytes = albedo_before_bytes.ok ? &albedo_before_bytes.bytes : nullptr;
+const auto* base_metallic_bytes = metallic_before_bytes.ok ? &metallic_before_bytes.bytes : nullptr;
+const auto* base_roughness_bytes = roughness_before_bytes.ok ? &roughness_before_bytes.bytes : nullptr;
+const auto* base_emissive_bytes = emissive_before_bytes.ok ? &emissive_before_bytes.bytes : nullptr;
+const auto result = mesh_first_apply_local_material_import_preview(
+ref, ctx.component, strokes, active_texture_size,
+base_albedo_bytes, base_metallic_bytes, base_roughness_bytes, base_emissive_bytes);
+if (result.ok && albedo_before_bytes.ok && metallic_before_bytes.ok &&
+roughness_before_bytes.ok && emissive_before_bytes.ok)
+{
+mesh_first_store_preview_snapshot(
+ctx.component, active_texture_size,
+albedo_before_bytes.bytes, metallic_before_bytes.bytes,
+roughness_before_bytes.bytes, emissive_before_bytes.bytes);
+}
+const double preview_elapsed_ms = std::chrono::duration<double, std::milli>(
+std::chrono::steady_clock::now() - preview_started).count();
+metadata += ",\"local_paint_rpc\":\"ImportChannelFromBytes\"";
+metadata += ",\"local_visual_sync_mode\":\"local_material_channels_import_preview\"";
+metadata += ",\"local_batch_strategy\":\"four_channel_import_preview\"";
+metadata += ",\"local_paint_target_channel\":\"albedo_metallic_roughness_emissive\"";
+metadata += ",\"local_texture_import_byte_order\":\"rgba\"";
+metadata += ",\"local_visual_sync_required\":false";
+metadata += ",\"local_texture_import_required\":true";
+metadata += ",\"authoritative_replay\":\"local_texture_preview_only\"";
+write_bridge_progress(result.ok ? "mesh_preview_done" : "mesh_preview_failed",
+result.ok ? "local preview material texture imported" : "local preview material texture import failed",
+result.ok ? 1 : 0,
+1,
+preview_elapsed_ms,
+"\"phase\":\"local_texture_import\",\"preview_only\":true,\"terminal\":true,\"result\":\"" +
+std::string(result.ok ? "done" : "failed") + "\"");
+return response_json(result.ok,
+result.ok ? "mesh_preview_done" : "mesh_preview_failed",
+result.ok ? 1 : 0,
+result.ok ? 0 : 1,
+result.ok ? "local preview material texture imported" : "local preview material texture import failed",
+metadata);
+}
         if (!ctx.local_paint_at_uv_function)
         {
             return response_json(false,
