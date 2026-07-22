@@ -1,31 +1,31 @@
 <p align="center">
-  <img src="docs/assets/meccha-camouflage-readme-banner-v151-1600w.jpg" alt="Meccha Camouflage demo" width="900" />
+  <img src="docs/assets/zemi-mecchamouflage-readme-banner-v151-1600w.jpg" alt="Zemi Mecchamouflage demo" width="900" />
 </p>
 
 <h1>
-  <img src="resources/app-icons/icon.png" alt="Meccha Camouflage icon" width="36" />
-  Meccha Camouflage
+  <img src="resources/app-icons/icon.png" alt="Zemi Mecchamouflage icon" width="36" />
+  Zemi Mecchamouflage
 </h1>
 
 A standalone Windows desktop tool for MECCHA CHAMELEON camouflage experiments.
 
 ## Download
 
-Download the latest `meccha-camouflage.exe` from GitHub Releases:
+Download the latest `zemi-mecchamouflage.exe` from GitHub Releases:
 
-- https://github.com/acentrist/MecchaCamouflage/releases/latest
+- https://github.com/Mozmina/MecchaCamouflage/releases/latest
 
 ## Usage
 
 1. Start MECCHA CHAMELEON.
-2. Start `meccha-camouflage.exe`.
+2. Start `zemi-mecchamouflage.exe`.
 3. Confirm the target process and bridge state in the app.
 4. Press the saved paint hotkey.
 
 Logs are written under:
 
 ```text
-%LOCALAPPDATA%\MecchaCamouflage\versions\<version>\logs\
+%LOCALAPPDATA%\ZemiMecchamouflage\versions\<version>\logs\
 ```
 
 ## Windows Security
@@ -44,15 +44,15 @@ Bridge warmup failed: One or more errors occurred. (Operation did not complete s
 5. Select the following folder:
 
 ```text
-%LOCALAPPDATA%\MecchaCamouflage\
+%LOCALAPPDATA%\ZemiMecchamouflage\
 ```
 
-After adding the exclusion, restart MecchaCamouflage.
+After adding the exclusion, restart ZemiMecchamouflage.
 
 ## Development
 
 ```bash
-git clone https://github.com/acentrist/MecchaCamouflage.git
+git clone https://github.com/Mozmina/MecchaCamouflage.git
 cd MecchaCamouflage
 make run
 ```

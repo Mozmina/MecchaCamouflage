@@ -1,7 +1,7 @@
 param(
     [string]$RuntimeRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath,
     [string]$BuildOutputDir = ".build\bin",
-    [string]$ExeName = "meccha-camouflage.exe",
+    [string]$ExeName = "zemi-mecchamouflage.exe",
     [string[]]$RuntimeArgs,
     [string]$RuntimeArgString = "",
     [string]$NativeApplyMode = "mesh_first_paint",

@@ -82,7 +82,7 @@ game archives, mappings, or the expected mesh shape are unavailable.
 
 When a game update breaks painting, use this order:
 
-1. Run the app once and keep `%LOCALAPPDATA%\MecchaCamouflage\runtime\` logs.
+1. Run the app once and keep `%LOCALAPPDATA%\ZemiMecchamouflage\runtime\` logs.
 2. Check runtime reflection metadata first: function availability, reflected
    offsets, `RuntimePaintable` state, mesh profile identity, direct
    `PaintAtUVWithBrush` availability, and `FPaintChannelData`/`FPaintStroke`

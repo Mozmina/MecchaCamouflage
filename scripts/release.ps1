@@ -49,9 +49,9 @@ elseif (-not [System.IO.Path]::IsPathRooted($OutDir)) {
     $OutDir = Join-Path $RuntimeRoot $OutDir
 }
 $OutDir = [System.IO.Path]::GetFullPath($OutDir)
-$ArtifactName = "meccha-camouflage-$Version"
+$ArtifactName = "zemi-mecchamouflage-$Version"
 if (-not $ExePath) {
-    $ExePath = Join-Path $RuntimeRoot ".build\bin\meccha-camouflage.exe"
+    $ExePath = Join-Path $RuntimeRoot ".build\bin\zemi-mecchamouflage.exe"
 }
 elseif (-not [System.IO.Path]::IsPathRooted($ExePath)) {
     $ExePath = Join-Path $RuntimeRoot $ExePath

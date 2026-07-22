@@ -13,7 +13,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/research/build-repli
 The runner requires `MECCHA_RESEARCH_ARTIFACTS=1` and an exact game PID:
 
 ```text
-meccha-camouflage.exe --research-replication --pid <pid> \
+zemi-mecchamouflage.exe --research-replication --pid <pid> \
   --role host|joining-client --out <local-artifact-directory> [--paint] \
   [--hold-seconds N] [--pressure-sample-ms N] [--texture-snapshot] [--texture-sample-ms N] \
   [--texture-target resolved|inventory-all|eventwatch-direct-receiver --texture-discovery-seconds N] \

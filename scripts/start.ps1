@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$SourceExe,
-    [string]$LaunchRoot = (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) "MecchaCamouflage\launch"),
+    [string]$LaunchRoot = (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) "ZemiMecchamouflage\launch"),
     [ValidateRange(0, 10000)][int]$DiagnosticStrokeLimit = 0
 )
 
@@ -31,7 +31,7 @@ $exeBaseName = [System.IO.Path]::GetFileNameWithoutExtension($exeName)
 $activeRuntimes = @(Get-Process -Name $exeBaseName -ErrorAction SilentlyContinue)
 if ($activeRuntimes.Count -gt 0) {
     $activeProcessIds = $activeRuntimes | ForEach-Object { $_.Id } | Sort-Object
-    throw "MecchaCamouflage is already running (pid $($activeProcessIds -join ', ')). Close it normally before running make start; do not force-stop it while paint is active."
+    throw "ZemiMecchamouflage is already running (pid $($activeProcessIds -join ', ')). Close it normally before running make start; do not force-stop it while paint is active."
 }
 $stageDirectory = Join-Path $LaunchRoot ("{0}-{1}" -f $exeBaseName, $sourceHash.Substring(0, 16))
 $stagedExe = Join-Path $stageDirectory $exeName

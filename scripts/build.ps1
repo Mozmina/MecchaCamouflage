@@ -1,7 +1,7 @@
 param(
     [string]$RuntimeRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath,
     [string]$OutDir = "",
-    [string]$ExeName = "meccha-camouflage",
+    [string]$ExeName = "zemi-mecchamouflage",
     [string]$Version = "",
     [ValidateSet("ReleaseSingleFile", "DevLooseSelfContained")]
     [string]$BuildMode = "ReleaseSingleFile",
@@ -123,7 +123,7 @@ function Invoke-VsToolCapture {
 function Get-ExeBaseName {
     param([string]$Name)
     $candidate = (New-Object System.IO.FileInfo($Name)).BaseName
-    if ([string]::IsNullOrWhiteSpace($candidate)) { return "meccha-camouflage" }
+    if ([string]::IsNullOrWhiteSpace($candidate)) { return "zemi-mecchamouflage" }
     return $candidate
 }
 
@@ -251,8 +251,8 @@ $WebView2BootstrapperCacheRoot = Join-Path $RuntimeRoot ".build\cache\webview2\e
 $BridgeSource = Join-Path $RuntimeRoot "src\native\bridge\bridge.cpp"
 $InjectorSource = Join-Path $RuntimeRoot "src\native\injector\injector.cpp"
 $TransformValidationTestSource = Join-Path $RuntimeRoot "src\native\tests\transform_validation_test.cpp"
-$WebHostProject = Join-Path $RuntimeRoot "src\csharp\MecchaCamouflage.WebHost\MecchaCamouflage.WebHost.csproj"
-$TestsProject = Join-Path $RuntimeRoot "src\csharp\MecchaCamouflage.Tests\MecchaCamouflage.Tests.csproj"
+$WebHostProject = Join-Path $RuntimeRoot "src\csharp\ZemiMecchamouflage.WebHost\ZemiMecchamouflage.WebHost.csproj"
+$TestsProject = Join-Path $RuntimeRoot "src\csharp\ZemiMecchamouflage.Tests\ZemiMecchamouflage.Tests.csproj"
 $MeshProfilesSourceDir = Join-Path $RuntimeRoot "resources\mesh-profiles"
 
 foreach ($path in @($BridgeSource, $InjectorSource, $TransformValidationTestSource, $WebHostProject, $TestsProject)) {
@@ -368,7 +368,7 @@ try {
     }
 
     Invoke-BuildStep -Name "verify build output" -ScriptBlock {
-        $DefaultControllerOutput = Join-Path $OutDir "meccha-camouflage.exe"
+        $DefaultControllerOutput = Join-Path $OutDir "zemi-mecchamouflage.exe"
         $ControllerOutput = Join-Path $OutDir "$ExeName.exe"
         if ($DefaultControllerOutput -ne $ControllerOutput -and (Test-Path $DefaultControllerOutput -PathType Leaf)) {
             Move-Item -Force $DefaultControllerOutput $ControllerOutput

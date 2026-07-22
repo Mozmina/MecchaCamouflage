@@ -690,7 +690,7 @@ namespace
             return {};
         }
         std::wstring base = local_appdata;
-        const std::wstring root = base + L"\\MecchaCamouflage";
+        const std::wstring root = base + L"\\ZemiMecchamouflage";
         const std::wstring runtime = root + L"\\runtime";
         if (!ensure_directory(root) || !ensure_directory(runtime))
         {

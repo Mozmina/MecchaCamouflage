@@ -48,7 +48,7 @@ single EXE from `.build/package/`.
 ```bash
 git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin main --follow-tags
-gh release create vX.Y.Z .build/package/meccha-camouflage-vX.Y.Z.exe --title vX.Y.Z --notes-file <maintainer-notes.md>
+gh release create vX.Y.Z .build/package/zemi-mecchamouflage-vX.Y.Z.exe --title vX.Y.Z --notes-file <maintainer-notes.md>
 ```
 
 Write release notes in GitHub before publishing. Do not regenerate, rewrite,

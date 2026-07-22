@@ -25,11 +25,11 @@ The relevant implementation is:
 - `src/native/bridge/bridge.cpp`: injected bridge and `BridgeStartV1`.
 - `src/native/injector/injector.cpp`: one direct injection attempt.
 - `src/native/include/direct_bridge_abi.hpp`: fixed startup ABI.
-- `src/csharp/MecchaCamouflage.Controller/RuntimeBridgeService.cs`: staging,
+- `src/csharp/ZemiMecchamouflage.Controller/RuntimeBridgeService.cs`: staging,
   identity, synchronization, and connection ownership.
-- `src/csharp/MecchaCamouflage.Controller/BridgeBootstrap.cs`: startup-block
+- `src/csharp/ZemiMecchamouflage.Controller/BridgeBootstrap.cs`: startup-block
   and endpoint identity models.
-- `src/csharp/MecchaCamouflage.Controller/BridgeClient.cs`: HELLO and command
+- `src/csharp/ZemiMecchamouflage.Controller/BridgeClient.cs`: HELLO and command
   sequencing.
 
 ## Per-instance staging
@@ -37,7 +37,7 @@ The relevant implementation is:
 For every attempt the controller creates a new directory under:
 
 ```text
-%LOCALAPPDATA%\MecchaCamouflage\bridge-instances\<instance-guid>\
+%LOCALAPPDATA%\ZemiMecchamouflage\bridge-instances\<instance-guid>\
 ```
 
 It copies the packaged bridge, injector, and mesh profiles into that directory.

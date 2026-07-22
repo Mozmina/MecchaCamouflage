@@ -55,7 +55,7 @@ $DotNetArtifactsDir = Join-Path $OutDir "dotnet-artifacts"
 $BridgeSource = Join-Path $RuntimeRoot "src\native\bridge\bridge.cpp"
 $InjectorSource = Join-Path $RuntimeRoot "src\native\injector\injector.cpp"
 $TransformValidationTestSource = Join-Path $RuntimeRoot "src\native\tests\transform_validation_test.cpp"
-$WebHostProject = Join-Path $RuntimeRoot "src\csharp\MecchaCamouflage.WebHost\MecchaCamouflage.WebHost.csproj"
+$WebHostProject = Join-Path $RuntimeRoot "src\csharp\ZemiMecchamouflage.WebHost\ZemiMecchamouflage.WebHost.csproj"
 $MeshProfilesDir = Join-Path $RuntimeRoot "resources\mesh-profiles"
 
 foreach ($path in @($BridgeSource, $InjectorSource, $TransformValidationTestSource, $WebHostProject, $MeshProfilesDir)) {
@@ -99,7 +99,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish failed with exit code $LASTEXITCODE"
 }
 
-$RunnerPath = Join-Path $RunnerDir "meccha-camouflage.exe"
+$RunnerPath = Join-Path $RunnerDir "zemi-mecchamouflage.exe"
 if (-not (Test-Path $RunnerPath -PathType Leaf)) {
     throw "Research runner was not produced: $RunnerPath"
 }

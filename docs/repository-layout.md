@@ -10,10 +10,10 @@ Source code lives under `src/`.
 ```text
 src/
   csharp/
-    MecchaCamouflage.Core/
-    MecchaCamouflage.Controller/
-    MecchaCamouflage.WebHost/
-    MecchaCamouflage.Tests/
+    ZemiMecchamouflage.Core/
+    ZemiMecchamouflage.Controller/
+    ZemiMecchamouflage.WebHost/
+    ZemiMecchamouflage.Tests/
   native/
     bridge/
       bridge.cpp
@@ -25,7 +25,7 @@ src/
 ```
 
 `src/csharp/` contains the supported .NET projects. The supported controller UI
-is `MecchaCamouflage.WebHost`.
+is `ZemiMecchamouflage.WebHost`.
 
 `src/native/` contains native code used by the injected bridge and injector.
 The bridge source is intentionally split conservatively because it depends on
@@ -121,14 +121,14 @@ the repository.
 Important paths:
 
 ```text
-%LOCALAPPDATA%\MecchaCamouflage\versions\<version>\
-%LOCALAPPDATA%\MecchaCamouflage\bridge-instances\
-%LOCALAPPDATA%\MecchaCamouflage\bridge-state\
+%LOCALAPPDATA%\ZemiMecchamouflage\versions\<version>\
+%LOCALAPPDATA%\ZemiMecchamouflage\bridge-instances\
+%LOCALAPPDATA%\ZemiMecchamouflage\bridge-state\
 ```
 
 Versioned app logs, diagnostics, and extracted package assets live under
 `versions/<version>/`. WebView2 user data lives in the stable shared folder
-`%LOCALAPPDATA%\MecchaCamouflage\webview2-user-data\` so it is not tied to a
+`%LOCALAPPDATA%\ZemiMecchamouflage\webview2-user-data\` so it is not tied to a
 single-file extraction directory or app version.
 
 Bridge live state, such as progress snapshots tied to an injected bridge in the
