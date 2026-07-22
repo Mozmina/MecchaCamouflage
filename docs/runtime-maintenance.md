@@ -126,6 +126,15 @@ Fill is always an explicit manual material, even when Auto Detect is on. Record
 the returned candidate list, selection, and first-stroke M/R/E before judging
 an Auto Detect result.
 
+Color compression is a planner-only optimization for the single Paint pass.
+At a nonzero tolerance it may widen and coalesce strokes only within one
+region, UV island, safe sample set, and final material payload; Fill is never
+compressed. Its supported range is `0` through `10` (default `4`); `0`
+disables widening, while higher values trade color boundaries for fewer direct
+strokes. New settings default to a 4-texel brush with Front `Fill` and Side /
+Back `Skip`. Disable compression when Auto Detect falls back to per-sample source PBR,
+because matching albedo alone is not proof that M/R/E is interchangeable.
+
 The reflected `PaintAtUVWithBrush` schema is a fatal requirement. If it is
 unavailable, stop before painting; do not silently switch to texture import or
 any legacy packed route.

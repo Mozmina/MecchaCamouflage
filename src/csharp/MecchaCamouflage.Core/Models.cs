@@ -37,16 +37,12 @@ public sealed record RgbColor(byte R, byte G, byte B)
 
 public sealed class PaintSettings
 {
-    public bool Brush1Enabled { get; set; } = false;
-    public double Brush1SizeTexels { get; set; } = 25.0;
-    public bool Brush2Enabled { get; set; } = true;
-    public double Brush2SizeTexels { get; set; } = 5.0;
-    public double CoverageStepTexels { get; set; } = 5.0;
+    public double BrushSizeTexels { get; set; } = 4.0;
     public double SideSourceMaxUv { get; set; } = 0.08;
     public double FrontBackSourceMaxUv { get; set; } = 0.45;
     public RegionMode FrontRegionMode { get; set; } = RegionMode.Fill;
-    public RegionMode SideRegionMode { get; set; } = RegionMode.Paint;
-    public RegionMode BackRegionMode { get; set; } = RegionMode.Paint;
+    public RegionMode SideRegionMode { get; set; } = RegionMode.Skip;
+    public RegionMode BackRegionMode { get; set; } = RegionMode.Skip;
     public bool AutoMaterial { get; set; } = false;
     public double Metallic { get; set; } = 0.0;
     public double Roughness { get; set; } = 1.0;
@@ -55,7 +51,7 @@ public sealed class PaintSettings
     public double FillMetallic { get; set; } = 1.0;
     public double FillRoughness { get; set; } = 0.0;
     public double FillEmissive { get; set; } = 0.0;
-    public double ColorCompressionTolerance { get; set; } = 0.0;
+    public double ColorCompressionTolerance { get; set; } = 4.0;
 
     public bool UsesFill =>
         FrontRegionMode == RegionMode.Fill ||
@@ -65,7 +61,7 @@ public sealed class PaintSettings
 
 public sealed class AppSettings
 {
-    public const int CurrentLayoutVersion = 40;
+    public const int CurrentLayoutVersion = 41;
     public int LayoutVersion { get; set; } = CurrentLayoutVersion;
     public double PanelX { get; set; } = -1.0;
     public double PanelY { get; set; } = -1.0;

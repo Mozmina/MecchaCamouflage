@@ -121,8 +121,7 @@ public static class ResearchUvReplayArtifacts
         return value switch
         {
             "fill" => UvReplayPass.Fill,
-            "coarse_paint" => UvReplayPass.CoarsePaint,
-            "fine_paint" => UvReplayPass.FinePaint,
+            "paint" => UvReplayPass.Paint,
             _ => throw new InvalidDataException("native replay-plan stroke has an unknown pass: " + value)
         };
     }

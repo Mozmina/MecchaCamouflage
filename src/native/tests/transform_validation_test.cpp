@@ -91,7 +91,7 @@ int main()
         return 11;
     }
 
-    const std::vector<runtime_contract::TwoBrushReplayCandidate> routed_candidates{
+    const std::vector<runtime_contract::ReplayCandidate> routed_candidates{
         {0, runtime_contract::ReplayRegion::Back, runtime_contract::ReplayRegionMode::Fill,
          0, 0.10, 0.10, true, 100.0, 10.0, -5.0, 0},
         {1, runtime_contract::ReplayRegion::Side, runtime_contract::ReplayRegionMode::Paint,
@@ -99,18 +99,11 @@ int main()
         {2, runtime_contract::ReplayRegion::Front, runtime_contract::ReplayRegionMode::Skip,
          2, 0.30, 0.30, true, 80.0, 8.0, 5.0, 2},
     };
-    const auto routed_plan = runtime_contract::build_two_brush_replay_plan(
-        routed_candidates,
-        1024,
-        true,
-        20.0,
-        true,
-        10.0,
-        80.0);
-    if (routed_plan.entries.size() != 5 ||
-        routed_plan.fill_end != 3 || routed_plan.coarse_end != 4 ||
-        routed_plan.fill_count != 3 || routed_plan.coarse_paint_count != 1 ||
-        routed_plan.fine_paint_count != 1 ||
+    const auto routed_plan = runtime_contract::build_single_brush_replay_plan(
+        routed_candidates, 1024, 5.0, 80.0);
+    if (routed_plan.entries.size() != 4 ||
+        routed_plan.fill_end != 3 ||
+        routed_plan.fill_count != 3 || routed_plan.paint_count != 1 ||
         routed_plan.fill_candidates != 3 || routed_plan.fill_deduplicated != 0 ||
         routed_plan.entries[0].pass != runtime_contract::ReplayPass::Fill ||
         routed_plan.entries[0].sample_index != 0 ||
@@ -118,15 +111,13 @@ int main()
         routed_plan.entries[1].sample_index != 1 ||
         routed_plan.entries[2].pass != runtime_contract::ReplayPass::Fill ||
         routed_plan.entries[2].sample_index != 2 ||
-        routed_plan.entries[3].pass != runtime_contract::ReplayPass::CoarsePaint ||
-        routed_plan.entries[3].sample_index != 1 ||
-        routed_plan.entries[4].pass != runtime_contract::ReplayPass::FinePaint ||
-        routed_plan.entries[4].sample_index != 1)
+        routed_plan.entries[3].pass != runtime_contract::ReplayPass::Paint ||
+        routed_plan.entries[3].sample_index != 1)
     {
         return 12;
     }
 
-    const std::vector<runtime_contract::TwoBrushReplayCandidate> dedupe_candidates{
+    const std::vector<runtime_contract::ReplayCandidate> dedupe_candidates{
         {0, runtime_contract::ReplayRegion::Back, runtime_contract::ReplayRegionMode::Fill,
          0, 0.100, 0.100, true, 100.0, 10.0, -5.0, 0},
         {1, runtime_contract::ReplayRegion::Back, runtime_contract::ReplayRegionMode::Fill,
@@ -138,20 +129,13 @@ int main()
         {4, runtime_contract::ReplayRegion::Side, runtime_contract::ReplayRegionMode::Paint,
          1, 0.250, 0.250, true, 80.0, 6.0, -1.0, 4},
     };
-    const auto dedupe_plan = runtime_contract::build_two_brush_replay_plan(
-        dedupe_candidates,
-        1024,
-        true,
-        20.0,
-        true,
-        10.0,
-        80.0);
-    if (dedupe_plan.entries.size() != 8 ||
-        dedupe_plan.fill_end != 3 || dedupe_plan.coarse_end != 5 ||
-        dedupe_plan.fill_count != 3 || dedupe_plan.coarse_paint_count != 2 ||
-        dedupe_plan.fine_paint_count != 3 ||
+    const auto dedupe_plan = runtime_contract::build_single_brush_replay_plan(
+        dedupe_candidates, 1024, 5.0, 80.0);
+    if (dedupe_plan.entries.size() != 6 ||
+        dedupe_plan.fill_end != 3 ||
+        dedupe_plan.fill_count != 3 || dedupe_plan.paint_count != 3 ||
         dedupe_plan.fill_candidates != 5 || dedupe_plan.fill_deduplicated != 2 ||
-        dedupe_plan.coarse_paint_candidates != 3 || dedupe_plan.coarse_paint_deduplicated != 1 ||
+        dedupe_plan.paint_candidates != 3 || dedupe_plan.paint_deduplicated != 0 ||
         dedupe_plan.entries[0].sample_index != 0 ||
         dedupe_plan.entries[1].sample_index != 2 ||
         dedupe_plan.entries[2].sample_index != 4)
@@ -159,7 +143,7 @@ int main()
         return 13;
     }
 
-    const std::vector<runtime_contract::TwoBrushReplayCandidate> current_view_order_candidates{
+    const std::vector<runtime_contract::ReplayCandidate> current_view_order_candidates{
         {0, runtime_contract::ReplayRegion::Back, runtime_contract::ReplayRegionMode::Paint,
          0, 0.10, 0.10, true, 90.0, 1000.0, 10.0, 0},
         {1, runtime_contract::ReplayRegion::Back, runtime_contract::ReplayRegionMode::Paint,
@@ -169,19 +153,12 @@ int main()
         {3, runtime_contract::ReplayRegion::Back, runtime_contract::ReplayRegionMode::Paint,
          0, 0.40, 0.40, false, 999.0, 80.0, 0.0, 3},
     };
-    const auto current_view_order_plan = runtime_contract::build_two_brush_replay_plan(
-        current_view_order_candidates,
-        1024,
-        true,
-        20.0,
-        true,
-        10.0,
-        80.0);
+    const auto current_view_order_plan = runtime_contract::build_single_brush_replay_plan(
+        current_view_order_candidates, 1024, 5.0, 80.0);
     const std::array<std::size_t, 4> expected_current_view_order{{2, 1, 0, 3}};
     for (std::size_t index = 0; index < expected_current_view_order.size(); ++index)
     {
-        if (current_view_order_plan.entries[index].sample_index != expected_current_view_order[index] ||
-            current_view_order_plan.entries[current_view_order_plan.coarse_end + index].sample_index != expected_current_view_order[index])
+        if (current_view_order_plan.entries[index].sample_index != expected_current_view_order[index])
         {
             return 14;
         }
@@ -192,7 +169,7 @@ int main()
         return 14;
     }
 
-    const std::vector<runtime_contract::TwoBrushReplayCandidate> cross_region_view_order_candidates{
+    const std::vector<runtime_contract::ReplayCandidate> cross_region_view_order_candidates{
         {0, runtime_contract::ReplayRegion::Front, runtime_contract::ReplayRegionMode::Paint,
          0, 0.10, 0.10, true, 300.0, 0.0, 0.0, 0},
         {1, runtime_contract::ReplayRegion::Side, runtime_contract::ReplayRegionMode::Paint,
@@ -200,59 +177,64 @@ int main()
         {2, runtime_contract::ReplayRegion::Back, runtime_contract::ReplayRegionMode::Paint,
          0, 0.10, 0.10, true, 100.0, 0.0, 0.0, 2},
     };
-    const auto cross_region_view_order_plan = runtime_contract::build_two_brush_replay_plan(
-        cross_region_view_order_candidates,
-        1024,
-        true,
-        20.0,
-        true,
-        10.0,
-        80.0);
+    const auto cross_region_view_order_plan = runtime_contract::build_single_brush_replay_plan(
+        cross_region_view_order_candidates, 1024, 5.0, 80.0);
     const std::array<std::size_t, 3> expected_cross_region_view_order{{0, 1, 2}};
     for (std::size_t index = 0; index < expected_cross_region_view_order.size(); ++index)
     {
-        if (cross_region_view_order_plan.entries[index].sample_index != expected_cross_region_view_order[index] ||
-            cross_region_view_order_plan.entries[cross_region_view_order_plan.coarse_end + index].sample_index != expected_cross_region_view_order[index])
+        if (cross_region_view_order_plan.entries[index].sample_index != expected_cross_region_view_order[index])
         {
             return 15;
         }
     }
 
-    const auto brush_1_only_plan = runtime_contract::build_two_brush_replay_plan(
-        routed_candidates, 1024, true, 25.0, false, 5.0, 100.0);
-    const auto brush_2_only_plan = runtime_contract::build_two_brush_replay_plan(
-        routed_candidates, 1024, false, 25.0, true, 5.0, 100.0);
-    if (brush_1_only_plan.entries.size() != 4 ||
-        brush_1_only_plan.fill_end != 3 || brush_1_only_plan.coarse_end != 4 ||
-        brush_1_only_plan.coarse_paint_count != 1 || brush_1_only_plan.fine_paint_count != 0 ||
-        brush_1_only_plan.entries[3].pass != runtime_contract::ReplayPass::CoarsePaint ||
-        brush_1_only_plan.entries[3].sample_index != 1 ||
-        brush_2_only_plan.entries.size() != 4 ||
-        brush_2_only_plan.fill_end != 3 || brush_2_only_plan.coarse_end != 3 ||
-        brush_2_only_plan.coarse_paint_count != 0 || brush_2_only_plan.fine_paint_count != 1 ||
-        brush_2_only_plan.entries[3].pass != runtime_contract::ReplayPass::FinePaint ||
-        brush_2_only_plan.entries[3].sample_index != 1)
-    {
-        return 16;
-    }
-
-    const auto fill_window = runtime_contract::replay_pass_window(0, 100, 20, 80);
-    const auto coarse_window = runtime_contract::replay_pass_window(20, 100, 20, 80);
-    const auto fine_window = runtime_contract::replay_pass_window(80, 100, 20, 80);
-    const auto complete_window = runtime_contract::replay_pass_window(100, 100, 20, 80);
-    const auto clamped_window = runtime_contract::replay_pass_window(999, 10, 50, 2);
+    const auto fill_window = runtime_contract::replay_pass_window(0, 100, 20);
+    const auto paint_window = runtime_contract::replay_pass_window(20, 100, 20);
+    const auto complete_window = runtime_contract::replay_pass_window(100, 100, 20);
+    const auto clamped_window = runtime_contract::replay_pass_window(999, 10, 50);
     if (fill_window.pass != runtime_contract::ReplayPass::Fill ||
         fill_window.begin != 0 || fill_window.end != 20 ||
-        coarse_window.pass != runtime_contract::ReplayPass::CoarsePaint ||
-        coarse_window.begin != 20 || coarse_window.end != 80 ||
-        fine_window.pass != runtime_contract::ReplayPass::FinePaint ||
-        fine_window.begin != 80 || fine_window.end != 100 ||
+        paint_window.pass != runtime_contract::ReplayPass::Paint ||
+        paint_window.begin != 20 || paint_window.end != 100 ||
         complete_window.pass != runtime_contract::ReplayPass::Complete ||
         complete_window.begin != 100 || complete_window.end != 100 ||
         clamped_window.pass != runtime_contract::ReplayPass::Complete ||
         clamped_window.begin != 10 || clamped_window.end != 10)
     {
         return 22;
+    }
+
+    const std::vector<runtime_contract::AdaptivePaintSample> adaptive_samples{
+        {0.10, 0.10, runtime_contract::ReplayRegion::Front, 0, 0.50, 0.50, 0.50, true, true, 1},
+        {0.102, 0.10, runtime_contract::ReplayRegion::Front, 0, 0.50, 0.50, 0.50, true, true, 1},
+        {0.30, 0.10, runtime_contract::ReplayRegion::Front, 0, 0.20, 0.20, 0.20, true, true, 1},
+        {0.60, 0.10, runtime_contract::ReplayRegion::Front, 1, 0.50, 0.50, 0.50, true, true, 1},
+    };
+    const std::vector<runtime_contract::ReplayEntry> adaptive_entries{
+        {0, runtime_contract::ReplayPass::Paint, runtime_contract::ReplayRegion::Front, {0, 0.0, 0}},
+        {1, runtime_contract::ReplayPass::Paint, runtime_contract::ReplayRegion::Front, {0, 1.0, 1}},
+        {2, runtime_contract::ReplayPass::Paint, runtime_contract::ReplayRegion::Front, {0, 2.0, 2}},
+        {3, runtime_contract::ReplayPass::Paint, runtime_contract::ReplayRegion::Front, {0, 3.0, 3}},
+    };
+    const auto no_compression = runtime_contract::build_adaptive_paint_plan(
+        adaptive_entries, adaptive_samples, 0.01, 0.0);
+    if (no_compression.entries.size() != adaptive_entries.size() ||
+        no_compression.compressed_paint_entries != 0 ||
+        no_compression.entries[0].radius_multiplier != 1.0 ||
+        no_compression.entries[1].replay.sample_index != 1)
+    {
+        return 24;
+    }
+    const auto compressed = runtime_contract::build_adaptive_paint_plan(
+        adaptive_entries, adaptive_samples, 0.01, 1.0);
+    if (compressed.entries.size() != 3 ||
+        compressed.compressed_paint_entries != 1 ||
+        compressed.entries[0].replay.sample_index != 0 ||
+        compressed.entries[0].radius_multiplier != 4.0 ||
+        compressed.entries[1].replay.sample_index != 2 ||
+        compressed.entries[2].replay.sample_index != 3)
+    {
+        return 25;
     }
 
     if (runtime_contract::production_material_stroke_count(3) != 3 ||

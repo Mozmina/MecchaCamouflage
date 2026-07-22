@@ -9081,7 +9081,6 @@ namespace
         int replay_side{0};
         int replay_back{0};
         std::size_t replay_fill_end{0};
-        std::size_t replay_coarse_end{0};
         int replay_pass_boundary_limited_batches{0};
         int texture_size{1024};
         std::size_t local_offset{0};
@@ -9415,10 +9414,8 @@ namespace
         {
         case runtime_contract::ReplayPass::Fill:
             return "fill";
-        case runtime_contract::ReplayPass::CoarsePaint:
-            return "coarse_paint";
-        case runtime_contract::ReplayPass::FinePaint:
-            return "fine_paint";
+        case runtime_contract::ReplayPass::Paint:
+            return "paint";
         case runtime_contract::ReplayPass::Complete:
             return "complete";
         }
@@ -9510,19 +9507,14 @@ namespace
     {
         const std::size_t total = job ? job->strokes.size() : 0;
         const std::size_t fill_end = job ? job->replay_fill_end : 0;
-        const std::size_t coarse_end = job ? job->replay_coarse_end : 0;
         const std::size_t offset = job ? std::min(job->local_offset, total) : 0;
         const auto current = runtime_contract::replay_pass_window(offset,
                                                                     total,
-                                                                    fill_end,
-                                                                    coarse_end);
-        return std::string(",\"replay_pass_order\":\"fill,coarse_paint,fine_paint\"") +
+                                                                    fill_end);
+        return std::string(",\"replay_pass_order\":\"fill,paint\"") +
                ",\"replay_progress_source\":\"native_queue_backpressure\"" +
                ",\"replay_fill_end\":" + std::to_string(std::min(fill_end, total)) +
-               ",\"replay_coarse_end\":" +
-                   std::to_string(std::min(std::max(coarse_end, fill_end), total)) +
-               ",\"replay_fine_begin\":" +
-                   std::to_string(std::min(std::max(coarse_end, fill_end), total)) +
+               ",\"replay_paint_begin\":" + std::to_string(std::min(fill_end, total)) +
                ",\"replay_local_offset\":" + std::to_string(offset) +
                ",\"replay_current_pass\":\"" +
                    std::string(mesh_first_replay_pass_name(current.pass)) + "\"" +
@@ -9555,8 +9547,7 @@ namespace
         const auto pass = runtime_contract::replay_pass_window(
             static_cast<std::size_t>(completed),
             static_cast<std::size_t>(std::max(0, total)),
-            job ? job->replay_fill_end : 0,
-            job ? job->replay_coarse_end : 0);
+            job ? job->replay_fill_end : 0);
         const int pass_total = static_cast<int>(pass.end - pass.begin);
         const int pass_completed = static_cast<int>(
             std::min(pass.end, static_cast<std::size_t>(completed)) - pass.begin);
@@ -9689,19 +9680,10 @@ namespace
                                             : -1;
         const bool research_uv_replay_atlas =
             research_artifacts && json_bool_field(request, "research_uv_replay_atlas", false);
-        const bool tuning_brush_1_enabled =
-            json_bool_field(request, "brush_1_enabled", false);
-        const double tuning_brush_1_size_texels =
-            clamp_range(json_number_field(request, "brush_1_size_texels", 25.0), 10.0, 50.0);
-        const bool tuning_brush_2_enabled =
-            json_bool_field(request, "brush_2_enabled", true);
-        const double tuning_brush_2_size_texels =
-            clamp_range(json_number_field(request, "brush_2_size_texels", 5.0), 1.0, 10.0);
-        const double tuning_coverage_step_texels =
-            tuning_brush_1_enabled && tuning_brush_2_enabled
-                ? std::min(tuning_brush_1_size_texels, tuning_brush_2_size_texels)
-                : (tuning_brush_1_enabled ? tuning_brush_1_size_texels
-                                          : tuning_brush_2_size_texels);
+        const double tuning_brush_size_texels =
+            clamp_range(json_number_field(request, "brush_size_texels", 4.0), 1.0, 10.0);
+        const double tuning_color_compression_tolerance =
+            clamp_range(json_number_field(request, "color_compression_tolerance", 4.0), 0.0, 10.0);
         const double tuning_side_source_max_uv = clamp_range(json_number_field(request, "side_source_max_uv", 0.08), 0.001, 0.50);
         const double tuning_front_back_source_max_uv = clamp_range(json_number_field(request, "front_back_source_max_uv", 0.45), 0.001, 2.00);
         const bool tuning_auto_material = json_bool_field(request, "auto_material", false);
@@ -9771,16 +9753,11 @@ namespace
         metadata += ",\"skip_region_count\":" + std::to_string((front_region_mode == MeshFirstRegionMode::Skip ? 1 : 0) +
                                                                (side_region_mode == MeshFirstRegionMode::Skip ? 1 : 0) +
                                                                (back_region_mode == MeshFirstRegionMode::Skip ? 1 : 0));
-        metadata += ",\"brush_pipeline\":\"" +
-                    std::string(tuning_brush_1_enabled && tuning_brush_2_enabled
-                                    ? "fill_brush_1_brush_2"
-                                    : (tuning_brush_1_enabled ? "fill_brush_1" : "fill_brush_2")) +
-                    "\"";
-        metadata += ",\"brush_1_enabled\":" + std::string(json_bool(tuning_brush_1_enabled));
-        metadata += ",\"brush_1_size_texels\":" + std::to_string(tuning_brush_1_size_texels);
-        metadata += ",\"brush_2_enabled\":" + std::string(json_bool(tuning_brush_2_enabled));
-        metadata += ",\"brush_2_size_texels\":" + std::to_string(tuning_brush_2_size_texels);
-        metadata += ",\"coverage_step_texels\":" + std::to_string(tuning_coverage_step_texels);
+        metadata += ",\"brush_pipeline\":\"fill_single_brush\"";
+        metadata += ",\"brush_size_texels\":" + std::to_string(tuning_brush_size_texels);
+        metadata += ",\"coverage_step_texels\":" + std::to_string(tuning_brush_size_texels);
+        metadata += ",\"color_compression_tolerance\":" +
+                    std::to_string(tuning_color_compression_tolerance);
         metadata += ",\"side_source_max_uv\":" + std::to_string(tuning_side_source_max_uv);
         metadata += ",\"front_back_source_max_uv\":" + std::to_string(tuning_front_back_source_max_uv);
         metadata += ",\"auto_material\":" + std::string(json_bool(tuning_auto_material));
@@ -9797,16 +9774,6 @@ namespace
         metadata += ",\"fill_emissive\":" + std::to_string(fill_emissive);
         metadata += ",\"bridge_events\":[\"mesh_profile_load\",\"pose_resolve\",\"planner_build\",\"bridge.paint_batch.request\",\"bridge.paint_batch.response\"]";
 
-        if (!tuning_brush_1_enabled && !tuning_brush_2_enabled)
-        {
-            return response_json(
-                false,
-                "mesh_brush_selection_invalid",
-                0,
-                1,
-                "at least one brush must be enabled",
-                metadata + ",\"replay_blocked\":true");
-        }
 
         if (queued_job)
         {
@@ -10426,7 +10393,7 @@ namespace
                                                                  center_ray.location,
                                                                  camera_direction,
                                                                  region_axis,
-                                                                 tuning_coverage_step_texels,
+                                                                 tuning_brush_size_texels,
                                                                  plan_samples,
                                                                  plan_stats,
                                                                  planner_failure))
@@ -10610,7 +10577,7 @@ namespace
 
         metadata += ",";
         metadata += mesh_first_plan_stats_metadata(plan_stats);
-        metadata += ",\"planner_coverage_step_texels\":" + std::to_string(tuning_coverage_step_texels);
+        metadata += ",\"planner_coverage_step_texels\":" + std::to_string(tuning_brush_size_texels);
         metadata += ",\"source_distance_policy\":\"" +
                     std::string(research_force_paint_color
                                     ? "research_constant_paint_color"
@@ -10662,18 +10629,11 @@ namespace
         base_brush.Falloff = sdk::EBrushFalloff::Spherical;
         base_brush.BlendMode = sdk::EPaintBlendMode::Normal;
         const double texture_size_double = static_cast<double>(std::max(1, active_texture_size));
-        const double brush_1_radius_uv =
-            tuning_brush_1_size_texels / texture_size_double;
-        const double brush_2_radius_uv =
-            tuning_brush_2_size_texels / texture_size_double;
-        sdk::FRuntimeBrushSettings brush_1 = base_brush;
-        sdk::FRuntimeBrushSettings brush_2 = base_brush;
-        brush_1.Radius = static_cast<float>(brush_1_radius_uv);
-        brush_2.Radius = static_cast<float>(brush_2_radius_uv);
-        metadata += ",\"brush_1_radius_texels\":" + std::to_string(tuning_brush_1_size_texels);
-        metadata += ",\"brush_1_radius_uv\":" + std::to_string(brush_1_radius_uv);
-        metadata += ",\"brush_2_radius_texels\":" + std::to_string(tuning_brush_2_size_texels);
-        metadata += ",\"brush_2_radius_uv\":" + std::to_string(brush_2_radius_uv);
+        const double brush_radius_uv = tuning_brush_size_texels / texture_size_double;
+        sdk::FRuntimeBrushSettings paint_brush = base_brush;
+        paint_brush.Radius = static_cast<float>(brush_radius_uv);
+        metadata += ",\"brush_radius_texels\":" + std::to_string(tuning_brush_size_texels);
+        metadata += ",\"brush_radius_uv\":" + std::to_string(brush_radius_uv);
         const bool any_fill_region = front_region_mode == MeshFirstRegionMode::Fill ||
                                      side_region_mode == MeshFirstRegionMode::Fill ||
                                      back_region_mode == MeshFirstRegionMode::Fill;
@@ -10683,7 +10643,7 @@ namespace
         const double fill_stroke_radius_uv =
             fill_stroke_radius_texels / texture_size_double;
         const double fill_cell_uv = fill_stroke_radius_uv * 0.75;
-        sdk::FRuntimeBrushSettings fill_brush = brush_1;
+        sdk::FRuntimeBrushSettings fill_brush = paint_brush;
         fill_brush.Radius = static_cast<float>(fill_stroke_radius_uv);
         metadata += ",\"fill_stroke_radius_source\":\"fixed_100_texels\"";
         metadata += ",\"fill_stroke_radius_texels\":" + std::to_string(fill_stroke_radius_texels);
@@ -10718,7 +10678,7 @@ namespace
                 return runtime_contract::ReplayRegionMode::Skip;
             return runtime_contract::ReplayRegionMode::Paint;
         };
-        std::vector<runtime_contract::TwoBrushReplayCandidate> replay_candidates{};
+        std::vector<runtime_contract::ReplayCandidate> replay_candidates{};
         replay_candidates.reserve(plan_samples.size());
         double replay_current_view_vertical_min = 0.0;
         double replay_current_view_vertical_max = 0.0;
@@ -10778,13 +10738,10 @@ namespace
             }
         }
         const auto replay_spatial_sort_started = std::chrono::steady_clock::now();
-        auto replay_plan = runtime_contract::build_two_brush_replay_plan(
+        auto replay_plan = runtime_contract::build_single_brush_replay_plan(
             replay_candidates,
             active_texture_size,
-            tuning_brush_1_enabled,
-            tuning_brush_1_size_texels,
-            tuning_brush_2_enabled,
-            tuning_brush_2_size_texels,
+            tuning_brush_size_texels,
             fill_stroke_radius_texels);
         if (research_replay_stroke_index >= 0)
         {
@@ -10801,10 +10758,8 @@ namespace
             const auto selected_entry = replay_plan.entries[selected];
             replay_plan.entries = {selected_entry};
             replay_plan.fill_end = selected_entry.pass == runtime_contract::ReplayPass::Fill ? 1 : 0;
-            replay_plan.coarse_end = selected_entry.pass == runtime_contract::ReplayPass::FinePaint ? 0 : 1;
             replay_plan.fill_count = selected_entry.pass == runtime_contract::ReplayPass::Fill ? 1 : 0;
-            replay_plan.coarse_paint_count = selected_entry.pass == runtime_contract::ReplayPass::CoarsePaint ? 1 : 0;
-            replay_plan.fine_paint_count = selected_entry.pass == runtime_contract::ReplayPass::FinePaint ? 1 : 0;
+            replay_plan.paint_count = selected_entry.pass == runtime_contract::ReplayPass::Paint ? 1 : 0;
             metadata += ",\"research_replay_stroke_index_selected\":" + std::to_string(selected);
             metadata += ",\"research_replay_stroke_selected_pass\":\"" +
                         std::string(mesh_first_replay_pass_name(selected_entry.pass)) + "\"";
@@ -10842,8 +10797,6 @@ namespace
         int replay_back = 0;
         int replay_paint = 0;
         int replay_fill = 0;
-        int replay_coarse_paint = 0;
-        int replay_fine_paint = 0;
         int replay_front_paint = 0;
         int replay_side_paint = 0;
         int replay_back_paint = 0;
@@ -10960,17 +10913,13 @@ namespace
         bool have_previous_partition_entry = false;
         for (const auto& entry : replay_plan.entries)
         {
-            if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
-            {
-                return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
-            }
             if (entry.sample_index >= plan_samples.size())
             {
                 return response_json(false,
                                      "planner_replay_index_invalid",
                                      0,
                                      1,
-                                     "two-brush planner returned an invalid sample index",
+                                     "single-brush planner returned an invalid sample index",
                                      metadata + ",\"replay_blocked\":true");
             }
             if (!have_previous_partition_entry || entry.pass != previous_pass)
@@ -10985,7 +10934,61 @@ namespace
             }
             previous_pass = entry.pass;
             previous_spatial_key = entry.spatial_key;
-
+        }
+        const bool compression_requested = tuning_color_compression_tolerance > 0.0;
+        // Auto Detect may fall back to source PBR values per sample. Do not
+        // merge those samples merely because their albedo happens to match.
+        const bool compression_enabled = compression_requested &&
+                                         (!tuning_auto_material || material_properties.ok);
+        std::vector<runtime_contract::AdaptivePaintSample> adaptive_samples{};
+        adaptive_samples.reserve(plan_samples.size());
+        for (const auto& sample : plan_samples)
+        {
+            const auto mode = mesh_first_region_mode_for_sample(sample.region,
+                                                                 front_region_mode,
+                                                                 side_region_mode,
+                                                                 back_region_mode);
+            adaptive_samples.push_back({sample.u,
+                                        sample.v,
+                                        sample.region == MeshFirstRegion::Side
+                                            ? runtime_contract::ReplayRegion::Side
+                                            : (sample.region == MeshFirstRegion::Back
+                                                   ? runtime_contract::ReplayRegion::Back
+                                                   : runtime_contract::ReplayRegion::Front),
+                                        sample.uv_island,
+                                        sample.r,
+                                        sample.g,
+                                        sample.b,
+                                        mode == MeshFirstRegionMode::Paint,
+                                        !sample.unsafe,
+                                        1});
+        }
+        const auto adaptive_replay_plan = runtime_contract::build_adaptive_paint_plan(
+            replay_plan.entries,
+            adaptive_samples,
+            brush_radius_uv,
+            compression_enabled ? tuning_color_compression_tolerance : 0.0,
+            0.8 / static_cast<double>(std::max(1, active_texture_size)));
+        metadata += ",\"color_compression_requested\":" +
+                    std::string(json_bool(compression_requested));
+        metadata += ",\"color_compression_enabled\":" +
+                    std::string(json_bool(compression_enabled));
+        metadata += ",\"color_compression_disabled_reason\":\"" +
+                    std::string(!compression_requested
+                                    ? "tolerance_zero"
+                                    : (compression_enabled ? "" : "auto_material_source_fallback")) +
+                    "\"";
+        metadata += ",\"color_compression_expanded_strokes\":" +
+                    std::to_string(adaptive_replay_plan.expanded_paint_entries);
+        metadata += ",\"color_compression_skipped_strokes\":" +
+                    std::to_string(adaptive_replay_plan.compressed_paint_entries);
+        for (const auto& adaptive_entry : adaptive_replay_plan.entries)
+        {
+            const auto& entry = adaptive_entry.replay;
+            if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+            {
+                return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+            }
             const auto& sample = plan_samples[entry.sample_index];
             const bool fill_mode = entry.pass == runtime_contract::ReplayPass::Fill;
             sdk::FPaintChannelData channel{};
@@ -11046,11 +11049,12 @@ namespace
                                            stroke_emissive,
                                            apply_mode);
             }
-            const auto& stroke_brush = fill_mode
-                                           ? fill_brush
-                                           : (entry.pass == runtime_contract::ReplayPass::CoarsePaint
-                                                  ? brush_1
-                                                  : brush_2);
+            auto stroke_brush = fill_mode ? fill_brush : paint_brush;
+            if (!fill_mode)
+            {
+                stroke_brush.Radius = static_cast<float>(
+                    static_cast<double>(stroke_brush.Radius) * adaptive_entry.radius_multiplier);
+            }
             auto stroke = use_mesh_anchors
                               ? sdk_make_mesh_anchor_stroke(sample.u,
                                                             sample.v,
@@ -11080,10 +11084,6 @@ namespace
                 ++replay_fill;
             else
                 ++replay_paint;
-            if (entry.pass == runtime_contract::ReplayPass::CoarsePaint)
-                ++replay_coarse_paint;
-            else if (entry.pass == runtime_contract::ReplayPass::FinePaint)
-                ++replay_fine_paint;
             if (sample.region == MeshFirstRegion::Front)
             {
                 ++replay_front;
@@ -11100,12 +11100,11 @@ namespace
                 fill_mode ? ++replay_back_fill : ++replay_back_paint;
             }
         }
-        metadata += ",\"replay_pass_order\":\"fill,coarse_paint,fine_paint\"";
+        metadata += ",\"replay_pass_order\":\"fill,paint\"";
         metadata += ",\"replay_region_order\":\"current_camera_scanline_across_regions\"";
         metadata += ",\"replay_fill_end\":" + std::to_string(replay_plan.fill_end);
-        metadata += ",\"replay_coarse_end\":" + std::to_string(replay_plan.coarse_end);
-        metadata += ",\"replay_fine_begin\":" + std::to_string(replay_plan.coarse_end);
-        metadata += ",\"replay_spatial_order\":\"current_pose_camera_projection_top_to_bottom_left_to_right\"";
+        metadata += ",\"replay_paint_begin\":" + std::to_string(replay_plan.fill_end);
+        metadata += ",\"replay_spatial_order\":\"current_pose_camera_scanline_before_adaptive_radius_order\"";
         metadata += ",\"replay_spatial_current_view_vertical_min\":" +
                     std::to_string(replay_current_view_vertical_min);
         metadata += ",\"replay_spatial_current_view_vertical_max\":" +
@@ -11132,12 +11131,10 @@ namespace
                     std::to_string(material_properties_emissive_manual_fallbacks);
         metadata += ",\"replay_strokes_paint\":" + std::to_string(replay_paint);
         metadata += ",\"replay_strokes_fill\":" + std::to_string(replay_fill);
-        metadata += ",\"replay_strokes_coarse_paint\":" + std::to_string(replay_coarse_paint);
-        metadata += ",\"replay_strokes_fine_paint\":" + std::to_string(replay_fine_paint);
         metadata += ",\"replay_strokes_fill_candidates\":" + std::to_string(replay_plan.fill_candidates);
-        metadata += ",\"replay_strokes_fill_coarse_skipped\":" + std::to_string(replay_plan.fill_deduplicated);
-        metadata += ",\"replay_strokes_coarse_paint_candidates\":" + std::to_string(replay_plan.coarse_paint_candidates);
-        metadata += ",\"replay_strokes_coarse_paint_deduplicated\":" + std::to_string(replay_plan.coarse_paint_deduplicated);
+        metadata += ",\"replay_strokes_fill_deduplicated\":" + std::to_string(replay_plan.fill_deduplicated);
+        metadata += ",\"replay_strokes_paint_candidates\":" + std::to_string(replay_plan.paint_candidates);
+        metadata += ",\"replay_strokes_paint_deduplicated\":" + std::to_string(replay_plan.paint_deduplicated);
         metadata += ",\"replay_strokes_front_paint\":" + std::to_string(replay_front_paint);
         metadata += ",\"replay_strokes_side_paint\":" + std::to_string(replay_side_paint);
         metadata += ",\"replay_strokes_back_paint\":" + std::to_string(replay_back_paint);
@@ -11169,7 +11166,6 @@ namespace
                     std::string(json_bool(diagnostic_stroke_limit > 0 &&
                                           diagnostic_strokes_before_limit > static_cast<std::size_t>(diagnostic_stroke_limit)));
         const auto base_effective_fill_end = std::min(replay_plan.fill_end, strokes.size());
-        const auto base_effective_coarse_end = std::min(replay_plan.coarse_end, strokes.size());
         std::vector<sdk::FPaintStroke> channel_strokes{};
         channel_strokes.reserve(strokes.size() * paint_target_channel_count);
         for (const auto& stroke : strokes)
@@ -11184,10 +11180,8 @@ namespace
         strokes = std::move(channel_strokes);
         metadata += ",\"production_channel_expanded_strokes\":" + std::to_string(strokes.size());
         const auto effective_fill_end = base_effective_fill_end * paint_target_channel_count;
-        const auto effective_coarse_end = base_effective_coarse_end * paint_target_channel_count;
         metadata += ",\"replay_effective_fill_end\":" + std::to_string(effective_fill_end);
-        metadata += ",\"replay_effective_coarse_end\":" + std::to_string(effective_coarse_end);
-        metadata += ",\"replay_effective_fine_begin\":" + std::to_string(effective_coarse_end);
+        metadata += ",\"replay_effective_paint_begin\":" + std::to_string(effective_fill_end);
         metadata += ",\"replay_world_radius_policy\":\"game_default\"";
         if (research_artifacts)
         {
@@ -11266,8 +11260,7 @@ namespace
                         std::to_string(stroke.EffectiveTemplateResolution);
         };
         append_pass_brush_metadata("fill", 0, effective_fill_end);
-        append_pass_brush_metadata("coarse_paint", effective_fill_end, effective_coarse_end);
-        append_pass_brush_metadata("fine_paint", effective_coarse_end, strokes.size());
+        append_pass_brush_metadata("paint", effective_fill_end, strokes.size());
         metadata += ",\"direct_route_only\":true";
         metadata += ",\"local_route_mode\":\"native_recorded_paint\"";
         metadata += ",\"local_paint_rpc\":\"PaintAtUVWithBrush\"";
@@ -11352,7 +11345,6 @@ namespace
             async_job->replay_side = replay_side;
             async_job->replay_back = replay_back;
             async_job->replay_fill_end = effective_fill_end;
-            async_job->replay_coarse_end = effective_coarse_end;
             async_job->direct_queue_requested_target_strokes =
                 research_direct_queue_target_strokes;
             const int local_sample_batch_limit = runtime_contract::NativeRecordedPaintMaxCallsPerTick;

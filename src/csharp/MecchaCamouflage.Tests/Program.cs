@@ -8,13 +8,13 @@ using MecchaCamouflage.Core;
 
 var tests = new List<(string Name, Action Run)>
 {
-    ("paint defaults expose coarse and detail brushes", PaintDefaultsExposeCoarseAndDetailBrushes),
-    ("brush selection persists", BrushSelectionPersists),
-    ("brush settings clamp to supported ranges", TwoPassBrushSettingsClampToSupportedRanges),
+    ("paint defaults expose a single brush", PaintDefaultsExposeSingleBrush),
+    ("single brush persists and migrates legacy detail settings", SingleBrushPersistsAndMigratesLegacyDetailSettings),
+    ("single brush settings clamp to supported range", SingleBrushSettingsClampToSupportedRange),
     ("app defaults use 99 percent opacity", AppDefaultsUse99PercentOpacity),
-    ("payload sends active brushes", PayloadSendsTwoPassBrushPipeline),
+    ("payload sends a single brush and compression tolerance", PayloadSendsSingleBrushPipeline),
     ("diagnostic stroke limit requires explicit option", DiagnosticStrokeLimitRequiresExplicitOption),
-    ("native accepts the Brush 1 configured range", NativeAcceptsBrush1ConfiguredRange),
+    ("native accepts the single brush configured range", NativeAcceptsSingleBrushConfiguredRange),
     ("native direct radius uses game defaults and fill stays fixed", NativeDirectRadiusUsesGameDefaultsAndFillStaysFixed),
     ("native spatial replay follows the current pose and camera", NativeSpatialReplayFollowsCurrentPoseAndCamera),
     ("native async paint tolerates freecam pawn transitions", NativeAsyncPaintToleratesFreecamPawnTransitions),
@@ -31,8 +31,8 @@ var tests = new List<(string Name, Action Run)>
     ("research event-watch sidecar uses exact staged bridge path", ResearchEventWatchSidecarUsesExactStagedBridgePath),
     ("research texture probe is explicitly dispatched", ResearchTextureProbeIsExplicitlyDispatched),
     ("research runner can isolate one planned replay stroke", ResearchRunnerCanIsolateOnePlannedReplayStroke),
-    ("research runner records two-pass brushes and direct queue mode", ResearchRunnerRecordsTwoPassBrushesAndDirectQueueMode),
-    ("UV replay atlas separates passes and direct radii", UvReplayAtlasSeparatesPassesAndDirectRadii),
+    ("research runner records a single brush and direct queue mode", ResearchRunnerRecordsSingleBrushAndDirectQueueMode),
+    ("UV replay atlas separates Fill and Paint", UvReplayAtlasSeparatesFillAndPaint),
     ("research replay sidecar is staged as a UV PNG", ResearchReplaySidecarIsStagedAsUvPng),
     ("research replay sidecar refuses a non-successful paint", ResearchReplaySidecarRefusesNonSuccessfulPaint),
     ("research texture probes stage an actual delta PNG", ResearchTextureProbesStageActualDeltaPng),
@@ -45,8 +45,8 @@ var tests = new List<(string Name, Action Run)>
     ("front region defaults to fill", FrontRegionDefaultsToFill),
     ("bridge messages are user friendly", BridgeMessagesAreUserFriendly),
     ("settings detect supported system language", SettingsDetectSupportedSystemLanguage),
-    ("ui snapshot exposes two-pass brushes", UiSnapshotExposesTwoPassBrushes),
-    ("web ui exposes two-pass brush sliders", WebUiExposesTwoPassBrushSliders),
+    ("ui snapshot exposes a single brush", UiSnapshotExposesSingleBrush),
+    ("web ui exposes one brush slider and compression tolerance", WebUiExposesSingleBrushSliderAndCompressionTolerance),
     ("web UI keeps theme color on readonly range and checkbox controls", WebUiKeepsThemeColorOnReadonlyControls),
     ("web ui renders pass progress and total eta", WebUiRendersPassProgressAndTotalEta),
     ("raw hotkeys suppress repeat until key-up", RawHotkeysSuppressRepeatUntilKeyUp),
@@ -54,8 +54,7 @@ var tests = new List<(string Name, Action Run)>
     ("native progress exposes replay pass state", NativeProgressExposesReplayPassState),
     ("hotkey validation rejects duplicates", HotkeyValidationRejectsDuplicates),
     ("host session reset restores setting default", HostSessionResetRestoresDefault),
-    ("host session brush updates are independent and detail syncs coverage", HostSessionBrushUpdatesAreIndependentAndDetailSyncsCoverage),
-    ("host session rejects disabling every brush", HostSessionRejectsDisablingEveryBrush),
+    ("host session updates a single brush", HostSessionUpdatesSingleBrush),
     ("host session rolls back invalid hotkey update", HostSessionRollsBackInvalidHotkeyUpdate),
     ("host session applies multiple setting updates atomically", HostSessionAppliesMultipleSettingUpdatesAtomically),
     ("host session rolls back duplicate hotkey batch", HostSessionRollsBackDuplicateHotkeyBatch),
@@ -111,65 +110,58 @@ foreach (var test in tests)
 
 return failed == 0 ? 0 : 1;
 
-static void PaintDefaultsExposeCoarseAndDetailBrushes()
+static void PaintDefaultsExposeSingleBrush()
 {
     var paint = new AppSettings().Paint;
 
-    Assert(!paint.Brush1Enabled, "brush 1 should default off");
-    Assert(paint.Brush2Enabled, "brush 2 should default on");
-    Assert(Math.Abs(paint.Brush1SizeTexels - 25.0) < 0.000001, "brush 1 should default to 25 texels");
-    Assert(Math.Abs(paint.Brush2SizeTexels - 5.0) < 0.000001, "brush 2 should default to 5 texels");
-    Assert(Math.Abs(paint.CoverageStepTexels - paint.Brush2SizeTexels) < 0.000001, "coverage compatibility should follow brush 2");
+    Assert(Math.Abs(paint.BrushSizeTexels - 4.0) < 0.000001, "the single brush should default to 4 texels");
+    Assert(Math.Abs(paint.ColorCompressionTolerance - 4.0) < 0.000001,
+        "color compression should default to 4");
+    Assert(paint.FrontRegionMode == RegionMode.Fill, "front should default to fill");
+    Assert(paint.SideRegionMode == RegionMode.Skip, "side should default to skip");
+    Assert(paint.BackRegionMode == RegionMode.Skip, "back should default to skip");
 }
 
-static void BrushSelectionPersists()
+static void SingleBrushPersistsAndMigratesLegacyDetailSettings()
 {
     using var temp = new TempHome();
     var paths = new AppPaths("brush-selection-persistence-test");
     var settings = new AppSettings();
-    settings.Paint.Brush1Enabled = true;
-    settings.Paint.Brush1SizeTexels = 42.5;
-    settings.Paint.Brush2Enabled = false;
-    settings.Paint.Brush2SizeTexels = 2.5;
+    settings.Paint.BrushSizeTexels = 2.5;
 
     new SettingsStore(paths).Save(settings);
     var loaded = new SettingsStore(paths).Load();
-    Assert(loaded.Paint.Brush1Enabled && !loaded.Paint.Brush2Enabled, "enabled brushes should round-trip");
-    Assert(Math.Abs(loaded.Paint.Brush1SizeTexels - 42.5) < 0.000001, "brush 1 size should round-trip");
-    Assert(Math.Abs(loaded.Paint.Brush2SizeTexels - 2.5) < 0.000001, "brush 2 size should round-trip");
-    Assert(Math.Abs(loaded.Paint.CoverageStepTexels - 42.5) < 0.000001, "coverage should follow the only active brush");
+    Assert(Math.Abs(loaded.Paint.BrushSizeTexels - 2.5) < 0.000001, "single brush size should round-trip");
     using var saved = JsonDocument.Parse(File.ReadAllText(paths.ConfigPath));
-    Assert(saved.RootElement.GetProperty("brush_1_enabled").GetBoolean(), "brush 1 enabled should persist");
-    Assert(!saved.RootElement.GetProperty("brush_2_enabled").GetBoolean(), "brush 2 enabled should persist");
-    Assert(!saved.RootElement.TryGetProperty("batch_auto_adapt", out _), "retired batch settings should not persist");
-    Assert(!saved.RootElement.TryGetProperty("stroke_size_texels", out _), "the legacy brush key should not be persisted");
+    Assert(Math.Abs(saved.RootElement.GetProperty("brush_size_texels").GetDouble() - 2.5) < 0.000001,
+        "single brush size should persist");
+    Assert(!saved.RootElement.TryGetProperty("brush_1_size_texels", out _) &&
+           !saved.RootElement.TryGetProperty("brush_2_size_texels", out _),
+        "legacy two-brush keys should not persist");
+
+    File.WriteAllText(paths.ConfigPath, """
+    { "layout_version": 40, "brush_1_enabled": false, "brush_1_size_texels": 25, "brush_2_enabled": true, "brush_2_size_texels": 3.5 }
+    """);
+    var migrated = new SettingsStore(paths).Load();
+    Assert(Math.Abs(migrated.Paint.BrushSizeTexels - 3.5) < 0.000001,
+        "legacy detail brush should migrate to the single brush");
 }
 
-static void TwoPassBrushSettingsClampToSupportedRanges()
+static void SingleBrushSettingsClampToSupportedRange()
 {
     var settings = new AppSettings();
-    settings.Paint.Brush1SizeTexels = 5.0;
-    settings.Paint.Brush2SizeTexels = 3.0;
-    settings.Paint.CoverageStepTexels = 99.0;
+    settings.Paint.BrushSizeTexels = 15.0;
 
     var clamped = SettingsStore.Clamp(settings);
-
-    Assert(Math.Abs(clamped.Paint.Brush1SizeTexels - 10.0) < 0.000001, "brush 1 should clamp to 10 at the lower bound");
-    Assert(Math.Abs(clamped.Paint.Brush2SizeTexels - 3.0) < 0.000001, "brush 2 should accept values above the new lower bound");
-    Assert(Math.Abs(clamped.Paint.CoverageStepTexels - 3.0) < 0.000001, "coverage should follow the active brush 2");
-
-    settings.Paint.Brush1SizeTexels = 35.0;
-    settings.Paint.Brush2SizeTexels = 15.0;
+    Assert(Math.Abs(clamped.Paint.BrushSizeTexels - 10.0) < 0.000001, "single brush should clamp to 10");
+    settings.Paint.BrushSizeTexels = 0.5;
     clamped = SettingsStore.Clamp(settings);
+    Assert(Math.Abs(clamped.Paint.BrushSizeTexels - 1.0) < 0.000001, "single brush should clamp to 1");
 
-    Assert(Math.Abs(clamped.Paint.Brush1SizeTexels - 35.0) < 0.000001, "brush 1 should accept values below 50");
-    Assert(Math.Abs(clamped.Paint.Brush2SizeTexels - 10.0) < 0.000001, "brush 2 should clamp to 10 at the upper bound");
-
-    settings.Paint.Brush2SizeTexels = 0.5;
-    settings.Paint.Brush1SizeTexels = 55.0;
+    settings.Paint.ColorCompressionTolerance = 100.0;
     clamped = SettingsStore.Clamp(settings);
-    Assert(Math.Abs(clamped.Paint.Brush1SizeTexels - 50.0) < 0.000001, "brush 1 should clamp to 50");
-    Assert(Math.Abs(clamped.Paint.Brush2SizeTexels - 1.0) < 0.000001, "brush 2 should clamp to 1");
+    Assert(Math.Abs(clamped.Paint.ColorCompressionTolerance - 10.0) < 0.000001,
+        "color compression tolerance should clamp to 10");
 }
 
 static void AppDefaultsUse99PercentOpacity()
@@ -182,25 +174,21 @@ static void AppDefaultsUse99PercentOpacity()
     Assert(Math.Abs(loaded.Opacity - 0.99) < 0.000001, "a new persisted settings file should inherit the 99 percent opacity default");
 }
 
-static void PayloadSendsTwoPassBrushPipeline()
+static void PayloadSendsSingleBrushPipeline()
 {
     var settings = new AppSettings();
-    settings.Paint.Brush1SizeTexels = 17.5;
-    settings.Paint.Brush2SizeTexels = 7.5;
-    settings.Paint.Brush1Enabled = true;
-    settings.Paint.Brush2Enabled = false;
+    settings.Paint.BrushSizeTexels = 7.5;
+    settings.Paint.ColorCompressionTolerance = 4.0;
 
     var payload = BridgePayloadBuilder.BuildPaintPayload(settings, 42, "Game.exe", new PaintRequestOptions());
     using var doc = JsonDocument.Parse(payload);
     var tuning = doc.RootElement.GetProperty("tuning");
 
-    Assert(tuning.GetProperty("brush_1_enabled").GetBoolean(), "payload should enable brush 1");
-    Assert(Math.Abs(tuning.GetProperty("brush_1_size_texels").GetDouble() - 17.5) < 0.000001, "payload should send brush 1");
-    Assert(!tuning.GetProperty("brush_2_enabled").GetBoolean(), "payload should disable brush 2");
-    Assert(Math.Abs(tuning.GetProperty("brush_2_size_texels").GetDouble() - 7.5) < 0.000001, "payload should send brush 2");
-    Assert(!tuning.TryGetProperty("brush_pipeline_version", out _), "payload should not version the brush pipeline");
-    Assert(!tuning.TryGetProperty("stroke_size_texels", out _), "payload should not send the legacy stroke size");
-    Assert(Math.Abs(tuning.GetProperty("coverage_step_texels").GetDouble() - 17.5) < 0.000001, "coverage should follow the only active brush");
+    Assert(Math.Abs(tuning.GetProperty("brush_size_texels").GetDouble() - 7.5) < 0.000001, "payload should send the single brush");
+    Assert(Math.Abs(tuning.GetProperty("color_compression_tolerance").GetDouble() - 4.0) < 0.000001,
+        "payload should send the compression tolerance");
+    Assert(!tuning.TryGetProperty("brush_1_size_texels", out _) && !tuning.TryGetProperty("brush_2_size_texels", out _),
+        "payload should not send retired two-brush keys");
 }
 
 static void DiagnosticStrokeLimitRequiresExplicitOption()
@@ -221,15 +209,18 @@ static void DiagnosticStrokeLimitRequiresExplicitOption()
         "the explicitly requested diagnostic limit must reach native paint");
 }
 
-static void NativeAcceptsBrush1ConfiguredRange()
+static void NativeAcceptsSingleBrushConfiguredRange()
 {
     var bridge = File.ReadAllText(Path.Combine(
         FindRepositoryRoot(),
         "src", "native", "bridge", "bridge.cpp"));
 
-    Assert(bridge.Contains("json_number_field(request, \"brush_1_size_texels\", 25.0)", StringComparison.Ordinal) &&
-           bridge.Contains("10.0, 50.0", StringComparison.Ordinal),
-        "native paint payload parsing must preserve the configured 10-50 Brush 1 range");
+    Assert(bridge.Contains("json_number_field(request, \"brush_size_texels\", 4.0)", StringComparison.Ordinal) &&
+           bridge.Contains("1.0, 10.0", StringComparison.Ordinal),
+        "native paint payload parsing must preserve the configured 1-10 single-brush range");
+    Assert(bridge.Contains("json_number_field(request, \"color_compression_tolerance\", 4.0)", StringComparison.Ordinal) &&
+           bridge.Contains("0.0, 10.0", StringComparison.Ordinal),
+        "native paint payload parsing must cap color compression at 10");
 }
 
 static void NativeDirectRadiusUsesGameDefaultsAndFillStaysFixed()
@@ -254,7 +245,7 @@ static void NativeSpatialReplayFollowsCurrentPoseAndCamera()
         "src", "native", "bridge", "bridge.cpp"));
 
     Assert(bridge.Contains("sdk_project_world_to_screen(ref, ctx, sample.world_position", StringComparison.Ordinal) &&
-           bridge.Contains("current_pose_camera_projection", StringComparison.Ordinal),
+           bridge.Contains("current_pose_camera_scanline_before_adaptive_radius_order", StringComparison.Ordinal),
         "replay order should be derived from each current-pose world sample in the current camera");
     Assert(!bridge.Contains("profile_reference_z_desc_rows_camera_right_asc", StringComparison.Ordinal) &&
            !bridge.Contains("sample.reference_position.Z", StringComparison.Ordinal),
@@ -668,12 +659,9 @@ static void SettingsDetectSupportedSystemLanguage()
     }
 }
 
-static void UiSnapshotExposesTwoPassBrushes()
+static void UiSnapshotExposesSingleBrush()
 {
     var snapshot = new PaintSnapshot(
-        true,
-        17.5,
-        false,
         7.5,
         false,
         0.0,
@@ -693,43 +681,27 @@ static void UiSnapshotExposesTwoPassBrushes()
     });
     using var doc = JsonDocument.Parse(json);
 
-    Assert(doc.RootElement.GetProperty("brush1Enabled").GetBoolean(), "snapshot should expose brush 1 enabled");
-    Assert(Math.Abs(doc.RootElement.GetProperty("brush1SizeTexels").GetDouble() - 17.5) < 0.000001, "snapshot should expose brush 1");
-    Assert(!doc.RootElement.GetProperty("brush2Enabled").GetBoolean(), "snapshot should expose brush 2 enabled");
-    Assert(Math.Abs(doc.RootElement.GetProperty("brush2SizeTexels").GetDouble() - 7.5) < 0.000001, "snapshot should expose brush 2");
-    Assert(!doc.RootElement.TryGetProperty("brushSizeTexels", out _), "snapshot should not expose the removed single-brush field");
-    Assert(!doc.RootElement.TryGetProperty("coverageStepTexels", out _), "coverage compatibility should stay internal");
+    Assert(Math.Abs(doc.RootElement.GetProperty("brushSizeTexels").GetDouble() - 7.5) < 0.000001,
+        "snapshot should expose the single brush");
+    Assert(!doc.RootElement.TryGetProperty("brush1SizeTexels", out _) &&
+           !doc.RootElement.TryGetProperty("brush2SizeTexels", out _),
+        "snapshot should not expose retired two-brush fields");
 }
 
-static void WebUiExposesTwoPassBrushSliders()
+static void WebUiExposesSingleBrushSliderAndCompressionTolerance()
 {
     var repository = FindRepositoryRoot();
     var index = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
     var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
-    var styles = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "styles.css"));
-
-    Assert(index.Contains("id=\"brush-1-size\"", StringComparison.Ordinal), "web UI should include the coarse brush slider");
-    Assert(index.Contains("id=\"brush-2-size\"", StringComparison.Ordinal), "web UI should include the detail brush slider");
-    Assert(index.Contains("id=\"brush-1-enabled\"", StringComparison.Ordinal), "web UI should include the brush 1 checkbox");
-    Assert(index.Contains("id=\"brush-2-enabled\"", StringComparison.Ordinal), "web UI should include the brush 2 checkbox");
-    Assert(index.IndexOf("id=\"brush-1-size\"", StringComparison.Ordinal) < index.IndexOf("id=\"brush-2-size\"", StringComparison.Ordinal), "brush 1 should appear above brush 2");
-    Assert(index.Contains("min=\"10\" max=\"50\" step=\"0.5\"", StringComparison.Ordinal), "brush 1 should expose the 10-50 range");
-    Assert(index.Contains("min=\"1\" max=\"10\" step=\"0.5\"", StringComparison.Ordinal), "brush 2 should expose the 1-10 range");
-    Assert(app.Contains("paint.brush1Enabled", StringComparison.Ordinal), "web UI should bind brush 1 enabled");
-    Assert(app.Contains("paint.brush1SizeTexels", StringComparison.Ordinal), "web UI should bind brush 1");
-    Assert(app.Contains("paint.brush2Enabled", StringComparison.Ordinal), "web UI should bind brush 2 enabled");
-    Assert(app.Contains("paint.brush2SizeTexels", StringComparison.Ordinal), "web UI should bind brush 2");
-    Assert(app.Contains("if (!paint.brush1Enabled && !paint.brush2Enabled)", StringComparison.Ordinal) &&
-           app.Contains("showError(\"At least one brush must be enabled.\")", StringComparison.Ordinal),
-        "web UI should retain editing and show an error instead of saving with both brushes off");
-    Assert(app.Contains("!editing || !paint.brush1Enabled", StringComparison.Ordinal) &&
-           app.Contains("!editing || !paint.brush2Enabled", StringComparison.Ordinal),
-        "web UI should disable each brush slider while its checkbox is off");
-    Assert(!app.Contains("paint.brushSizeTexels", StringComparison.Ordinal), "web UI should not send the removed single-brush key");
-    Assert(!app.Contains("coverageStepTexels", StringComparison.Ordinal), "web UI should not expose internal coverage compatibility");
-    Assert(styles.Contains(".brush-toggle > span", StringComparison.Ordinal) &&
-           styles.Contains("font: 700 12px/14px var(--font-mono)", StringComparison.Ordinal),
-        "brush labels should use the same typography as the other Geometry labels");
+    Assert(index.Contains("id=\"brush-size\"", StringComparison.Ordinal), "web UI should include the single brush slider");
+    Assert(index.Contains("id=\"color-compression-tolerance\"", StringComparison.Ordinal), "web UI should include compression tolerance");
+    Assert(index.Contains("min=\"1\" max=\"10\" step=\"0.5\"", StringComparison.Ordinal), "single brush should expose the 1-10 range");
+    Assert(index.Contains("id=\"color-compression-tolerance\" class=\"setting-control\" disabled type=\"range\" min=\"0\" max=\"10\" step=\"1\"", StringComparison.Ordinal),
+        "compression tolerance should expose the 0-10 range");
+    Assert(app.Contains("paint.brushSizeTexels", StringComparison.Ordinal), "web UI should bind the single brush");
+    Assert(app.Contains("paint.colorCompressionTolerance", StringComparison.Ordinal), "web UI should bind compression tolerance");
+    Assert(!app.Contains("paint.brush1", StringComparison.Ordinal) && !app.Contains("paint.brush2", StringComparison.Ordinal),
+        "web UI should not retain two-brush bindings");
 }
 
 static void WebUiKeepsThemeColorOnReadonlyControls()
@@ -842,56 +814,27 @@ static void HostSessionResetRestoresDefault()
     using var temp = new TempHome();
     var session = new HostSession("host-reset-test");
 
-    var update = session.UpdateSettings([
-        new SettingChange("paint.brush1SizeTexels", JsonSerializer.SerializeToElement(17.5)),
-        new SettingChange("paint.brush2SizeTexels", JsonSerializer.SerializeToElement(7.5))
-    ]);
+    var update = session.UpdateSetting("paint.brushSizeTexels", JsonSerializer.SerializeToElement(7.5));
     Assert(update.Success, update.Message);
-    Assert(Math.Abs(session.Settings.Paint.Brush1SizeTexels - 17.5) < 0.000001, "brush 1 should update");
-    Assert(Math.Abs(session.Settings.Paint.Brush2SizeTexels - 7.5) < 0.000001, "brush 2 should update");
+    Assert(Math.Abs(session.Settings.Paint.BrushSizeTexels - 7.5) < 0.000001, "single brush should update");
 
-    var reset = session.ResetSetting("paint.brush1SizeTexels");
+    var reset = session.ResetSetting("paint.brushSizeTexels");
     Assert(reset.Success, reset.Message);
-    Assert(Math.Abs(session.Settings.Paint.Brush1SizeTexels - new AppSettings().Paint.Brush1SizeTexels) < 0.000001, "brush 1 should reset");
-    Assert(Math.Abs(session.Settings.Paint.Brush2SizeTexels - 7.5) < 0.000001, "brush 1 reset must preserve brush 2");
+    Assert(Math.Abs(session.Settings.Paint.BrushSizeTexels - new AppSettings().Paint.BrushSizeTexels) < 0.000001,
+        "single brush should reset");
 }
 
-static void HostSessionBrushUpdatesAreIndependentAndDetailSyncsCoverage()
+static void HostSessionUpdatesSingleBrush()
 {
     using var temp = new TempHome();
     var session = new HostSession("host-brush-sync-test");
-    var originalBrush2 = session.Settings.Paint.Brush2SizeTexels;
+    var update = session.UpdateSetting("paint.brushSizeTexels", JsonSerializer.SerializeToElement(6.5));
 
-    var coarseUpdate = session.UpdateSetting("paint.brush1SizeTexels", JsonSerializer.SerializeToElement(17.5));
-    Assert(coarseUpdate.Success, coarseUpdate.Message);
-    Assert(Math.Abs(session.Settings.Paint.Brush1SizeTexels - 17.5) < 0.000001, "brush 1 should update independently");
-    Assert(Math.Abs(session.Settings.Paint.Brush2SizeTexels - originalBrush2) < 0.000001, "brush 1 should not change brush 2");
-
-    var detailUpdate = session.UpdateSetting("paint.brush2SizeTexels", JsonSerializer.SerializeToElement(6.5));
-
-    Assert(detailUpdate.Success, detailUpdate.Message);
-    Assert(Math.Abs(session.Settings.Paint.Brush1SizeTexels - 17.5) < 0.000001, "brush 2 should not change brush 1");
-    Assert(Math.Abs(session.Settings.Paint.Brush2SizeTexels - 6.5) < 0.000001, "brush 2 should update");
-    Assert(Math.Abs(session.Settings.Paint.CoverageStepTexels - 6.5) < 0.000001, "coverage compatibility should follow brush 2");
+    Assert(update.Success, update.Message);
+    Assert(Math.Abs(session.Settings.Paint.BrushSizeTexels - 6.5) < 0.000001, "single brush should update");
 
     var snapshot = session.GetSnapshotAsync().GetAwaiter().GetResult();
-    Assert(Math.Abs(snapshot.Settings.Paint.Brush1SizeTexels - 17.5) < 0.000001, "snapshot should expose brush 1");
-    Assert(Math.Abs(snapshot.Settings.Paint.Brush2SizeTexels - 6.5) < 0.000001, "snapshot should expose brush 2");
-}
-
-static void HostSessionRejectsDisablingEveryBrush()
-{
-    using var temp = new TempHome();
-    var session = new HostSession("host-brush-required-test");
-
-    var result = session.UpdateSettings([
-        new SettingChange("paint.brush1Enabled", JsonSerializer.SerializeToElement(false)),
-        new SettingChange("paint.brush2Enabled", JsonSerializer.SerializeToElement(false))
-    ]);
-
-    Assert(!result.Success, "disabling every brush should be rejected");
-    Assert(result.Message.Contains("At least one brush", StringComparison.Ordinal), "the rejection should explain the requirement");
-    Assert(session.Settings.Paint.Brush2Enabled, "rejected settings must roll back");
+    Assert(Math.Abs(snapshot.Settings.Paint.BrushSizeTexels - 6.5) < 0.000001, "snapshot should expose the single brush");
 }
 
 static void HostSessionRollsBackInvalidHotkeyUpdate()
@@ -911,13 +854,13 @@ static void HostSessionAppliesMultipleSettingUpdatesAtomically()
     var session = new HostSession("host-batch-valid-test");
 
     var update = session.UpdateSettings([
-        new SettingChange("paint.brush1SizeTexels", JsonSerializer.SerializeToElement(17.5)),
+        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(7.5)),
         new SettingChange("paint.fillColor", JsonSerializer.SerializeToElement("#112233")),
         new SettingChange("app.processName", JsonSerializer.SerializeToElement("Game.exe"))
     ]);
 
     Assert(update.Success, update.Message);
-    Assert(Math.Abs(session.Settings.Paint.Brush1SizeTexels - 17.5) < 0.000001, "brush 1 should update");
+    Assert(Math.Abs(session.Settings.Paint.BrushSizeTexels - 7.5) < 0.000001, "single brush should update");
     Assert(session.Settings.Paint.FillColor.ToHex() == "#112233", "fill color should update");
     Assert(session.Settings.GameProcessName == "Game.exe", "process name should update");
 }
@@ -926,16 +869,16 @@ static void HostSessionRollsBackDuplicateHotkeyBatch()
 {
     using var temp = new TempHome();
     var session = new HostSession("host-batch-hotkey-rollback-test");
-    var originalBrush = session.Settings.Paint.Brush1SizeTexels;
+    var originalBrush = session.Settings.Paint.BrushSizeTexels;
     var originalPreview = session.Settings.PreviewHotkey;
 
     var update = session.UpdateSettings([
-        new SettingChange("paint.brush1SizeTexels", JsonSerializer.SerializeToElement(17.5)),
+        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(7.5)),
         new SettingChange("app.previewHotkey", JsonSerializer.SerializeToElement(session.Settings.StartHotkey))
     ]);
 
     Assert(!update.Success, "duplicate hotkey batch should fail");
-    Assert(Math.Abs(session.Settings.Paint.Brush1SizeTexels - originalBrush) < 0.000001, "non-hotkey change should roll back");
+    Assert(Math.Abs(session.Settings.Paint.BrushSizeTexels - originalBrush) < 0.000001, "single brush change should roll back");
     Assert(session.Settings.PreviewHotkey == originalPreview, "hotkey change should roll back");
 }
 
@@ -943,16 +886,16 @@ static void HostSessionRollsBackInvalidFillColorBatch()
 {
     using var temp = new TempHome();
     var session = new HostSession("host-batch-color-rollback-test");
-    var originalBrush = session.Settings.Paint.Brush1SizeTexels;
+    var originalBrush = session.Settings.Paint.BrushSizeTexels;
     var originalColor = session.Settings.Paint.FillColor;
 
     var update = session.UpdateSettings([
-        new SettingChange("paint.brush1SizeTexels", JsonSerializer.SerializeToElement(17.5)),
+        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(7.5)),
         new SettingChange("paint.fillColor", JsonSerializer.SerializeToElement("not-a-color"))
     ]);
 
     Assert(!update.Success, "invalid color batch should fail");
-    Assert(Math.Abs(session.Settings.Paint.Brush1SizeTexels - originalBrush) < 0.000001, "brush 1 should roll back");
+    Assert(Math.Abs(session.Settings.Paint.BrushSizeTexels - originalBrush) < 0.000001, "single brush should roll back");
     Assert(session.Settings.Paint.FillColor == originalColor, "fill color should roll back");
 }
 
@@ -960,16 +903,16 @@ static void HostSessionRollsBackInvalidThemeColorBatch()
 {
     using var temp = new TempHome();
     var session = new HostSession("host-batch-theme-rollback-test");
-    var originalBrush = session.Settings.Paint.Brush1SizeTexels;
+    var originalBrush = session.Settings.Paint.BrushSizeTexels;
     var originalTheme = session.Settings.ThemeColor;
 
     var update = session.UpdateSettings([
-        new SettingChange("paint.brush1SizeTexels", JsonSerializer.SerializeToElement(17.5)),
+        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(7.5)),
         new SettingChange("app.themeColor", JsonSerializer.SerializeToElement("not-a-color"))
     ]);
 
     Assert(!update.Success, "invalid theme color batch should fail");
-    Assert(Math.Abs(session.Settings.Paint.Brush1SizeTexels - originalBrush) < 0.000001, "brush 1 should roll back");
+    Assert(Math.Abs(session.Settings.Paint.BrushSizeTexels - originalBrush) < 0.000001, "single brush should roll back");
     Assert(session.Settings.ThemeColor == originalTheme, "theme color should roll back");
 }
 
@@ -977,16 +920,16 @@ static void HostSessionRollsBackInvalidRegionModeBatch()
 {
     using var temp = new TempHome();
     var session = new HostSession("host-batch-region-rollback-test");
-    var originalBrush = session.Settings.Paint.Brush1SizeTexels;
+    var originalBrush = session.Settings.Paint.BrushSizeTexels;
     var originalMode = session.Settings.Paint.FrontRegionMode;
 
     var update = session.UpdateSettings([
-        new SettingChange("paint.brush1SizeTexels", JsonSerializer.SerializeToElement(17.5)),
+        new SettingChange("paint.brushSizeTexels", JsonSerializer.SerializeToElement(7.5)),
         new SettingChange("paint.frontRegionMode", JsonSerializer.SerializeToElement("invalid"))
     ]);
 
     Assert(!update.Success, "invalid region mode batch should fail");
-    Assert(Math.Abs(session.Settings.Paint.Brush1SizeTexels - originalBrush) < 0.000001, "brush 1 should roll back");
+    Assert(Math.Abs(session.Settings.Paint.BrushSizeTexels - originalBrush) < 0.000001, "single brush should roll back");
     Assert(session.Settings.Paint.FrontRegionMode == originalMode, "region mode should roll back");
 }
 
@@ -1099,7 +1042,7 @@ static void HostSessionPresentsNativePassProgressAndQueueBackpressure()
       "native_queue_component_last_strokes":4,
       "native_queue_target_strokes":4,
       "replay_progress_source":"native_queue_backpressure",
-      "replay_current_pass":"coarse_paint",
+      "replay_current_pass":"paint",
       "replay_current_pass_start":109,
       "replay_current_pass_end":1442,
       "replay_current_pass_completed":704,
@@ -1113,7 +1056,7 @@ static void HostSessionPresentsNativePassProgressAndQueueBackpressure()
 
     Assert(snapshot.Runtime.ProgressVisible, "valid preferred progress should be visible");
     Assert(snapshot.Runtime.PaintProgressSource == "native_queue_backpressure", "native progress source should be retained");
-    Assert(snapshot.Runtime.PaintPass == "Brush 1", "coarse paint should be presented as Brush 1");
+    Assert(snapshot.Runtime.PaintPass == "Paint", "single paint pass should be presented as Paint");
     Assert(snapshot.Runtime.PaintPassProgress == "704/1333 (53%)", "pass-local count and percent should be presented together");
     Assert(snapshot.Runtime.PaintPassEta == "7s", "pass ETA should be formatted independently");
     Assert(snapshot.Runtime.PaintEta == "58s", "paint ETA should remain the total ETA");
@@ -1127,20 +1070,20 @@ static void HostSessionLogsEachPassTransitionOnce()
     Directory.CreateDirectory(session.Paths.BridgeProgressDirectory);
     ConfigureLiveProgressSession(session, preferred);
 
-    WritePass("submission", "coarse_paint", 200, 1333, 5000);
+    WritePass("submission", "paint", 200, 1333, 5000);
     _ = session.GetSnapshotAsync().GetAwaiter().GetResult();
     _ = session.GetSnapshotAsync().GetAwaiter().GetResult();
-    WritePass("native_queue_backpressure", "coarse_paint", 400, 1333, 4000);
+    WritePass("native_queue_backpressure", "paint", 400, 1333, 4000);
     _ = session.GetSnapshotAsync().GetAwaiter().GetResult();
     _ = session.GetSnapshotAsync().GetAwaiter().GetResult();
-    WritePass("native_queue_backpressure", "fine_paint", 10, 4154, 50000);
+    WritePass("native_queue_backpressure", "complete", 4154, 4154, 0);
     _ = session.GetSnapshotAsync().GetAwaiter().GetResult();
     _ = session.GetSnapshotAsync().GetAwaiter().GetResult();
 
-    Assert(CountOccurrences(session.Log.Text, "Paint: pass Brush 1") == 1,
-        "Brush 1 should be logged once even when the progress source changes");
-    Assert(CountOccurrences(session.Log.Text, "Paint: pass Brush 2") == 1,
-        "Brush 2 should be logged once despite repeated snapshots");
+    Assert(CountOccurrences(session.Log.Text, "Paint: pass Paint") == 1,
+        "Paint should be logged once even when the progress source changes");
+    Assert(CountOccurrences(session.Log.Text, "Paint: pass Complete") == 1,
+        "Complete should be logged once despite repeated snapshots");
 
     void WritePass(string source, string pass, int completed, int total, double etaMs)
     {
@@ -1860,7 +1803,7 @@ static void NativeResearchReplayPlanPreservesActualPassStrokes()
         "native bridge should write the actual replay-plan sidecar after planning");
     Assert(native.Contains("research_uv_replay_plan_written", StringComparison.Ordinal),
         "native reply must say whether the replay-plan sidecar was written");
-    Assert(native.Contains("effective_fill_end", StringComparison.Ordinal) && native.Contains("effective_coarse_end", StringComparison.Ordinal),
+    Assert(native.Contains("effective_fill_end", StringComparison.Ordinal) && native.Contains("effective_paint_begin", StringComparison.Ordinal),
         "native replay sidecar must use the post-truncation pass boundaries");
 }
 
@@ -1884,7 +1827,7 @@ static void ResearchRunnerCanIsolateOnePlannedReplayStroke()
         "native selector should rebuild pass boundaries from exactly the selected entry");
 }
 
-static void ResearchRunnerRecordsTwoPassBrushesAndDirectQueueMode()
+static void ResearchRunnerRecordsSingleBrushAndDirectQueueMode()
 {
     var root = FindRepositoryRoot();
     var source = File.ReadAllText(Path.Combine(
@@ -1895,11 +1838,8 @@ static void ResearchRunnerRecordsTwoPassBrushesAndDirectQueueMode()
         "src", "csharp", "MecchaCamouflage.Controller", "RuntimeBridgeService.cs"));
     var native = File.ReadAllText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
 
-    Assert(source.Contains("brush_1_enabled = paint.Brush1Enabled", StringComparison.Ordinal), "research artifacts should record brush 1 enabled");
-    Assert(source.Contains("brush_1_size_texels = paint.Brush1SizeTexels", StringComparison.Ordinal), "research artifacts should record brush 1");
-    Assert(source.Contains("brush_2_enabled = paint.Brush2Enabled", StringComparison.Ordinal), "research artifacts should record brush 2 enabled");
-    Assert(source.Contains("brush_2_size_texels = paint.Brush2SizeTexels", StringComparison.Ordinal), "research artifacts should record brush 2");
-    Assert(!source.Contains("brush_pipeline_version = 2", StringComparison.Ordinal), "research artifacts should not version the brush pipeline");
+    Assert(source.Contains("brush_size_texels = paint.BrushSizeTexels", StringComparison.Ordinal), "research artifacts should record the single brush");
+    Assert(source.Contains("color_compression_tolerance = paint.ColorCompressionTolerance", StringComparison.Ordinal), "research artifacts should record compression tolerance");
     Assert(!source.Contains("--paint-mode", StringComparison.Ordinal), "research runner must not reintroduce an alternate paint transport");
     Assert(source.Contains("research_uv_replay_atlas", StringComparison.Ordinal), "research paint should explicitly request a pass-aware UV replay atlas");
     Assert(source.Contains("ResearchUvReplayArtifacts.StageAndRender", StringComparison.Ordinal), "research runs should retain the native replay plan and render its PNG atlas");
@@ -1949,29 +1889,28 @@ static void ResearchRunnerRecordsTwoPassBrushesAndDirectQueueMode()
         "a texture snapshot must reject scheduled shutdown because it cannot safely produce an after image");
 }
 
-static void UvReplayAtlasSeparatesPassesAndDirectRadii()
+static void UvReplayAtlasSeparatesFillAndPaint()
 {
     var plan = new UvReplayPlan(
         TextureSize: 128,
         Strokes:
         [
             new UvReplayStroke(0.25, 0.25, 0.10, UvReplayPass.Fill, "front", "torso"),
-            new UvReplayStroke(0.50, 0.50, 0.08, UvReplayPass.CoarsePaint, "side", "arm"),
-            new UvReplayStroke(0.75, 0.75, 0.04, UvReplayPass.FinePaint, "back", "arm")
+            new UvReplayStroke(0.75, 0.75, 0.04, UvReplayPass.Paint, "back", "arm")
         ]);
 
     var atlas = UvReplayAtlasRasterizer.Render(plan, tileSize: 64);
-    Assert(atlas.Width == 192 && atlas.Height == 64, "the atlas should be a one-row, three-pass direct-paint grid");
+    Assert(atlas.Width == 128 && atlas.Height == 64, "the atlas should be a one-row, two-pass direct-paint grid");
 
     var plannerFillCenter = atlas.RgbaAt(16, 47);
     Assert(plannerFillCenter.SequenceEqual(UvReplayAtlasRasterizer.FillColor), "fill must occupy the planner row");
     Assert(atlas.RgbaAt(26, 47).SequenceEqual(UvReplayAtlasRasterizer.BackgroundColor),
         "the direct planner radius should define the rendered footprint");
-    Assert(atlas.RgbaAt(175, 16).SequenceEqual(UvReplayAtlasRasterizer.FineColor),
-        "brush 2 must occupy the fine-pass column rather than the coarse column");
+    Assert(atlas.RgbaAt(111, 16).SequenceEqual(UvReplayAtlasRasterizer.PaintColor),
+        "paint must occupy the Paint column");
 
     var bounded = UvReplayAtlasRasterizer.Render(new UvReplayPlan(65_536, []));
-    Assert(bounded.Width == 3_072 && bounded.Height == 1_024,
+    Assert(bounded.Width == 2_048 && bounded.Height == 1_024,
         "a large game texture should produce a bounded proportional atlas rather than fail or allocate at source size");
 
     var directory = Path.Combine(Path.GetTempPath(), "meccha-uv-atlas-" + Guid.NewGuid().ToString("N"));
@@ -2003,7 +1942,7 @@ static void ResearchReplaySidecarIsStagedAsUvPng()
           "schema": "meccha_uv_replay_plan_v1",
           "texture_size": 64,
           "strokes": [
-            { "u": 0.5, "v": 0.5, "planner_radius_uv": 0.1, "pass": "fine_paint", "region": "front", "body_region": "arm" }
+            { "u": 0.5, "v": 0.5, "planner_radius_uv": 0.1, "pass": "paint", "region": "front", "body_region": "arm" }
           ]
         }
         """);

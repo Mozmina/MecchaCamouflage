@@ -54,11 +54,17 @@ public sealed class SettingsStore
         settings.LogRetentionDays = ReadInt(root, "log_retention_days", settings.LogRetentionDays);
 
         var paint = settings.Paint;
-        paint.Brush1Enabled = ReadBool(root, "brush_1_enabled", paint.Brush1Enabled);
-        paint.Brush1SizeTexels = ReadDouble(root, "brush_1_size_texels", paint.Brush1SizeTexels);
-        paint.Brush2Enabled = ReadBool(root, "brush_2_enabled", paint.Brush2Enabled);
-        paint.Brush2SizeTexels = ReadDouble(root, "brush_2_size_texels", paint.Brush2SizeTexels);
-        paint.CoverageStepTexels = CoverageStepFor(paint);
+        // v1.6.3 retires the two-pass brush pipeline. Existing configs retain
+        // the detail brush, falling back to Brush 1 only when it was the sole
+        // enabled legacy brush.
+        var hasSingleBrush = root.TryGetPropertyValue("brush_size_texels", out _);
+        var legacyBrush1Enabled = ReadBool(root, "brush_1_enabled", false);
+        var legacyBrush1Size = ReadDouble(root, "brush_1_size_texels", 25.0);
+        var legacyBrush2Enabled = ReadBool(root, "brush_2_enabled", true);
+        var legacyBrush2Size = ReadDouble(root, "brush_2_size_texels", paint.BrushSizeTexels);
+        paint.BrushSizeTexels = hasSingleBrush
+            ? ReadDouble(root, "brush_size_texels", paint.BrushSizeTexels)
+            : legacyBrush2Enabled || !legacyBrush1Enabled ? legacyBrush2Size : legacyBrush1Size;
         paint.SideSourceMaxUv = ReadDouble(root, "side_source_max_uv", paint.SideSourceMaxUv);
         paint.FrontBackSourceMaxUv = ReadDouble(root, "front_back_source_max_uv", paint.FrontBackSourceMaxUv);
         paint.FrontRegionMode = ReadRegionMode(root, "front_region_mode", paint.FrontRegionMode);
@@ -126,9 +132,7 @@ public sealed class SettingsStore
         if (string.IsNullOrWhiteSpace(settings.StopHotkey))
             settings.StopHotkey = "F4";
 
-        settings.Paint.Brush1SizeTexels = Math.Clamp(settings.Paint.Brush1SizeTexels, 10.0, 50.0);
-        settings.Paint.Brush2SizeTexels = Math.Clamp(settings.Paint.Brush2SizeTexels, 1.0, 10.0);
-        settings.Paint.CoverageStepTexels = CoverageStepFor(settings.Paint);
+        settings.Paint.BrushSizeTexels = Math.Clamp(settings.Paint.BrushSizeTexels, 1.0, 10.0);
         settings.Paint.SideSourceMaxUv = Math.Clamp(settings.Paint.SideSourceMaxUv, 0.001, 0.50);
         settings.Paint.FrontBackSourceMaxUv = Math.Clamp(settings.Paint.FrontBackSourceMaxUv, 0.001, 2.00);
         settings.Paint.Metallic = Math.Clamp(settings.Paint.Metallic, 0.0, 1.0);
@@ -137,7 +141,7 @@ public sealed class SettingsStore
         settings.Paint.FillMetallic = Math.Clamp(settings.Paint.FillMetallic, 0.0, 1.0);
         settings.Paint.FillRoughness = Math.Clamp(settings.Paint.FillRoughness, 0.0, 1.0);
         settings.Paint.FillEmissive = Math.Clamp(settings.Paint.FillEmissive, 0.0, 1.0);
-        settings.Paint.ColorCompressionTolerance = Math.Clamp(settings.Paint.ColorCompressionTolerance, 0.0, 100.0);
+        settings.Paint.ColorCompressionTolerance = Math.Clamp(settings.Paint.ColorCompressionTolerance, 0.0, 10.0);
         return settings;
     }
 
@@ -158,11 +162,7 @@ public sealed class SettingsStore
         preview_hotkey = settings.PreviewHotkey,
         unpreview_hotkey = settings.UnPreviewHotkey,
         stop_hotkey = settings.StopHotkey,
-        brush_1_enabled = settings.Paint.Brush1Enabled,
-        brush_1_size_texels = settings.Paint.Brush1SizeTexels,
-        brush_2_enabled = settings.Paint.Brush2Enabled,
-        brush_2_size_texels = settings.Paint.Brush2SizeTexels,
-        coverage_step_texels = settings.Paint.CoverageStepTexels,
+        brush_size_texels = settings.Paint.BrushSizeTexels,
         side_source_max_uv = settings.Paint.SideSourceMaxUv,
         front_back_source_max_uv = settings.Paint.FrontBackSourceMaxUv,
         front_region_mode = RegionModeText(settings.Paint.FrontRegionMode),
@@ -178,15 +178,6 @@ public sealed class SettingsStore
         fill_emissive = settings.Paint.FillEmissive,
         color_compression_tolerance = settings.Paint.ColorCompressionTolerance
     };
-
-    public static double CoverageStepFor(PaintSettings paint)
-    {
-        if (paint.Brush1Enabled && paint.Brush2Enabled)
-            return Math.Min(paint.Brush1SizeTexels, paint.Brush2SizeTexels);
-        if (paint.Brush1Enabled)
-            return paint.Brush1SizeTexels;
-        return paint.Brush2SizeTexels;
-    }
 
     public static string RegionModeText(RegionMode mode) => mode switch
     {

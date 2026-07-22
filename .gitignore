@@ -28,6 +28,7 @@
 *.usmap
 
 # Research tool artifacts
+/comparison_video/
 /src/csharp/**/bin/
 /src/csharp/**/obj/
 /tools/**/bin/

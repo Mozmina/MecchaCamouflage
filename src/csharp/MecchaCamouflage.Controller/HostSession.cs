@@ -11,10 +11,8 @@ public sealed class HostSession
 
     private static readonly string[] ResetKeys =
     [
-        "paint.brush1Enabled",
-        "paint.brush1SizeTexels",
-        "paint.brush2Enabled",
-        "paint.brush2SizeTexels",
+        "paint.brushSizeTexels",
+        "paint.colorCompressionTolerance",
         "paint.autoMaterial",
         "paint.metallic",
         "paint.roughness",
@@ -184,11 +182,8 @@ public sealed class HostSession
                 return new HostCommandResult(true);
             case "paint.geometry":
             case "geometry":
-                next.Paint.Brush1Enabled = defaults.Paint.Brush1Enabled;
-                next.Paint.Brush1SizeTexels = defaults.Paint.Brush1SizeTexels;
-                next.Paint.Brush2Enabled = defaults.Paint.Brush2Enabled;
-                next.Paint.Brush2SizeTexels = defaults.Paint.Brush2SizeTexels;
-                next.Paint.CoverageStepTexels = defaults.Paint.CoverageStepTexels;
+                next.Paint.BrushSizeTexels = defaults.Paint.BrushSizeTexels;
+                next.Paint.ColorCompressionTolerance = defaults.Paint.ColorCompressionTolerance;
                 break;
             case "paint.material":
             case "material":
@@ -718,11 +713,6 @@ public sealed class HostSession
     private HostCommandResult CommitSettings(AppSettings next, AppSettings previous)
     {
         next = SettingsStore.Clamp(next);
-        if (!next.Paint.Brush1Enabled && !next.Paint.Brush2Enabled)
-        {
-            Settings = previous;
-            return new HostCommandResult(false, "At least one brush must be enabled.");
-        }
         var hotkeys = HotkeySet.From(next);
         if (!hotkeys.TryValidate(out var message))
         {
@@ -853,10 +843,7 @@ public sealed class HostSession
         var paint = settings.Paint;
         return new SettingsSnapshot(
             new PaintSnapshot(
-                paint.Brush1Enabled,
-                paint.Brush1SizeTexels,
-                paint.Brush2Enabled,
-                paint.Brush2SizeTexels,
+                paint.BrushSizeTexels,
                 paint.AutoMaterial,
                 paint.Metallic,
                 paint.Roughness,
@@ -886,8 +873,7 @@ public sealed class HostSession
         var map = ResetKeys.ToDictionary(key => key, key => !SettingEquals(settings, defaults, key), StringComparer.OrdinalIgnoreCase);
         var sections = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
         {
-            ["paint.geometry"] = map["paint.brush1Enabled"] || map["paint.brush1SizeTexels"] ||
-                                 map["paint.brush2Enabled"] || map["paint.brush2SizeTexels"],
+            ["paint.geometry"] = map["paint.brushSizeTexels"] || map["paint.colorCompressionTolerance"],
             ["paint.material"] = map["paint.autoMaterial"] || map["paint.metallic"] || map["paint.roughness"] || map["paint.emissive"],
             ["regions"] = map["paint.frontRegionMode"] || map["paint.sideRegionMode"] || map["paint.backRegionMode"],
             ["fill.material"] = map["paint.fillColor"] || map["paint.fillMetallic"] || map["paint.fillRoughness"] || map["paint.fillEmissive"],
@@ -899,10 +885,7 @@ public sealed class HostSession
 
     private static bool SettingEquals(AppSettings left, AppSettings right, string key) => key switch
     {
-        "paint.brush1Enabled" => left.Paint.Brush1Enabled == right.Paint.Brush1Enabled,
-        "paint.brush1SizeTexels" => Nearly(left.Paint.Brush1SizeTexels, right.Paint.Brush1SizeTexels),
-        "paint.brush2Enabled" => left.Paint.Brush2Enabled == right.Paint.Brush2Enabled,
-        "paint.brush2SizeTexels" => Nearly(left.Paint.Brush2SizeTexels, right.Paint.Brush2SizeTexels),
+        "paint.brushSizeTexels" => Nearly(left.Paint.BrushSizeTexels, right.Paint.BrushSizeTexels),
         "paint.autoMaterial" => left.Paint.AutoMaterial == right.Paint.AutoMaterial,
         "paint.metallic" => Nearly(left.Paint.Metallic, right.Paint.Metallic),
         "paint.roughness" => Nearly(left.Paint.Roughness, right.Paint.Roughness),
@@ -930,13 +913,7 @@ public sealed class HostSession
     {
         switch (key)
         {
-            case "paint.brush1Enabled": settings.Paint.Brush1Enabled = defaults.Paint.Brush1Enabled; break;
-            case "paint.brush1SizeTexels": settings.Paint.Brush1SizeTexels = defaults.Paint.Brush1SizeTexels; break;
-            case "paint.brush2Enabled": settings.Paint.Brush2Enabled = defaults.Paint.Brush2Enabled; break;
-            case "paint.brush2SizeTexels":
-                settings.Paint.Brush2SizeTexels = defaults.Paint.Brush2SizeTexels;
-                settings.Paint.CoverageStepTexels = SettingsStore.CoverageStepFor(settings.Paint);
-                break;
+            case "paint.brushSizeTexels": settings.Paint.BrushSizeTexels = defaults.Paint.BrushSizeTexels; break;
             case "paint.autoMaterial": settings.Paint.AutoMaterial = defaults.Paint.AutoMaterial; break;
             case "paint.metallic": settings.Paint.Metallic = defaults.Paint.Metallic; break;
             case "paint.roughness": settings.Paint.Roughness = defaults.Paint.Roughness; break;
@@ -965,13 +942,7 @@ public sealed class HostSession
     {
         switch (key)
         {
-            case "paint.brush1Enabled": settings.Paint.Brush1Enabled = value.GetBoolean(); break;
-            case "paint.brush1SizeTexels": settings.Paint.Brush1SizeTexels = value.GetDouble(); break;
-            case "paint.brush2Enabled": settings.Paint.Brush2Enabled = value.GetBoolean(); break;
-            case "paint.brush2SizeTexels":
-                settings.Paint.Brush2SizeTexels = value.GetDouble();
-                settings.Paint.CoverageStepTexels = SettingsStore.CoverageStepFor(settings.Paint);
-                break;
+            case "paint.brushSizeTexels": settings.Paint.BrushSizeTexels = value.GetDouble(); break;
             case "paint.autoMaterial": settings.Paint.AutoMaterial = value.GetBoolean(); break;
             case "paint.metallic": settings.Paint.Metallic = value.GetDouble(); break;
             case "paint.roughness": settings.Paint.Roughness = value.GetDouble(); break;
@@ -1203,7 +1174,7 @@ public sealed class HostSession
         if (!currentProgressIsServerPaint || progress is null)
             return;
         var key = progress.ReplayCurrentPass.Trim().ToLowerInvariant();
-        if (key is not ("fill" or "coarse_paint" or "fine_paint" or "complete"))
+        if (key is not ("fill" or "paint" or "complete"))
             return;
         lock (replayPassLogGate)
         {
@@ -1240,8 +1211,7 @@ public sealed class HostSession
     private static string ReplayPassLabel(string value) => value.Trim().ToLowerInvariant() switch
     {
         "fill" => "Fill",
-        "coarse_paint" => "Brush 1",
-        "fine_paint" => "Brush 2",
+        "paint" => "Paint",
         "complete" => "Complete",
         "" => "-",
         _ => value.Trim()

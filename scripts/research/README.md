@@ -84,7 +84,7 @@ Auto Detect selects the game-reported global dominant pattern for Paint;
 Fill always uses its explicit manual material.
 
 Every successful research paint requests a post-plan UV sidecar and renders a
-bounded `uv-replay-atlas.png`. Its three columns are Fill, Brush 1, and Brush 2;
+bounded `uv-replay-atlas.png`. Its two columns are Fill and Paint;
 each footprint uses the direct planner radius. The PNG is diagnostic data, not a
 screenshot or proof of in-game rendering.
 

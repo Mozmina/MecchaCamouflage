@@ -43,7 +43,9 @@ assertions without a binary-layout test or live verification.
 ### LEGACY_FALLBACK
 
 There is no legacy paint transport to retain. Do not reintroduce compact,
-adaptive, send-custom, packed, no-resend, or receiver-queue paint paths. A
+send-custom, packed, no-resend, or receiver-queue paint paths. Planner-only
+adaptive sizing may coalesce safe direct strokes before dispatch, but it must
+not create another transport or bypass the game-owned recorded-stroke queue. A
 missing direct `PaintAtUVWithBrush` schema is an explicit paint failure.
 
 ### RESEARCH_ONLY

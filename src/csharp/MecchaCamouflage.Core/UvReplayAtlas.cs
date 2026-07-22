@@ -6,8 +6,7 @@ namespace MecchaCamouflage.Core;
 public enum UvReplayPass
 {
     Fill,
-    CoarsePaint,
-    FinePaint
+    Paint
 }
 
 /// <summary>
@@ -38,15 +37,14 @@ public sealed record UvReplayAtlas(int Width, int Height, byte[] Rgba)
 
 /// <summary>
 /// Produces a pass-aware UV diagnostic, not a simulation of the game's mesh/world-space brush.
-/// The atlas is three columns (Fill, Coarse/Brush 1, Fine/Brush 2), all rendered from the
+/// The atlas is two columns (Fill, Paint), both rendered from the
 /// direct planner radius that the game receives.
 /// </summary>
 public static class UvReplayAtlasRasterizer
 {
     public static readonly byte[] BackgroundColor = [8, 8, 12, 255];
     public static readonly byte[] FillColor = [255, 170, 64, 255];
-    public static readonly byte[] CoarseColor = [255, 96, 196, 255];
-    public static readonly byte[] FineColor = [70, 210, 255, 255];
+    public static readonly byte[] PaintColor = [70, 210, 255, 255];
 
     public static UvReplayAtlas Render(UvReplayPlan plan, int? tileSize = null)
     {
@@ -58,7 +56,7 @@ public static class UvReplayAtlasRasterizer
         if (size is < 16 or > 2048)
             throw new ArgumentOutOfRangeException(nameof(tileSize), "The UV replay tile size must be from 16 through 2048.");
 
-        var width = checked(size * 3);
+        var width = checked(size * 2);
         var height = size;
         var rgba = new byte[checked(width * height * 4)];
         for (var offset = 0; offset < rgba.Length; offset += 4)
@@ -86,16 +84,14 @@ public static class UvReplayAtlasRasterizer
     private static int PassColumn(UvReplayPass pass) => pass switch
     {
         UvReplayPass.Fill => 0,
-        UvReplayPass.CoarsePaint => 1,
-        UvReplayPass.FinePaint => 2,
+        UvReplayPass.Paint => 1,
         _ => throw new ArgumentOutOfRangeException(nameof(pass), pass, "Unknown replay pass.")
     };
 
     private static byte[] PassColor(UvReplayPass pass) => pass switch
     {
         UvReplayPass.Fill => FillColor,
-        UvReplayPass.CoarsePaint => CoarseColor,
-        UvReplayPass.FinePaint => FineColor,
+        UvReplayPass.Paint => PaintColor,
         _ => throw new ArgumentOutOfRangeException(nameof(pass), pass, "Unknown replay pass.")
     };
 

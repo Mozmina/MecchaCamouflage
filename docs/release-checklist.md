@@ -97,7 +97,7 @@ These require MECCHA CHAMELEON.
   - cancel with no active paint shows a guard warning.
   - normal paint completes.
   - with any one region set to Fill, the initial fixed-100 Fill pass covers
-    Front, Side, and Back (including Paint/Skip regions), then enabled Brushes
+    Front, Side, and Back (including Paint/Skip regions), then the single Paint pass
     overwrite only Paint regions.
   - progress reports native queue backpressure, submitted strokes, and
     completed strokes. It must not report completion while the queue is nonzero.
@@ -166,7 +166,7 @@ Collect these separately for painter-as-host and painter-as-joining-client:
   dump or the character as well: a regular point grid with gaps is a failure
   even when changed-texel count is nontrivial
   - normal Paint must not apply the completed Preview texture at start. Confirm
-    the painter progresses through Fill and enabled Brush passes while the
+    the painter progresses through Fill and the Paint pass while the
     game-owned recorded-paint queue follows submitted direct work. When investigating
   FPS drops, record `local_dispatch_total_ms`, `local_cpu_budget_yields`, and
   `local_write_budget_yields`; do not remove the 1 ms scheduler yield to make

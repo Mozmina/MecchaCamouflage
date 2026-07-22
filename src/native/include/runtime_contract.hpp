@@ -162,8 +162,7 @@ namespace runtime_contract
     enum class ReplayPass
     {
         Fill,
-        CoarsePaint,
-        FinePaint,
+        Paint,
         Complete,
     };
 
@@ -180,11 +179,9 @@ namespace runtime_contract
     // remain safe even when a runtime limit truncates the planned stream.
     constexpr ReplayPassWindow replay_pass_window(std::size_t offset,
                                                   std::size_t total,
-                                                  std::size_t fill_end,
-                                                  std::size_t coarse_end)
+                                                  std::size_t fill_end)
     {
         const std::size_t safe_fill_end = std::min(fill_end, total);
-        const std::size_t safe_coarse_end = std::min(std::max(coarse_end, safe_fill_end), total);
         const std::size_t safe_offset = std::min(offset, total);
         if (safe_offset >= total)
         {
@@ -194,14 +191,10 @@ namespace runtime_contract
         {
             return {ReplayPass::Fill, 0, safe_fill_end};
         }
-        if (safe_offset < safe_coarse_end)
-        {
-            return {ReplayPass::CoarsePaint, safe_fill_end, safe_coarse_end};
-        }
-        return {ReplayPass::FinePaint, safe_coarse_end, total};
+        return {ReplayPass::Paint, safe_fill_end, total};
     }
 
-    struct TwoBrushReplayCandidate
+    struct ReplayCandidate
     {
         std::size_t sample_index;
         ReplayRegion region;
@@ -216,7 +209,7 @@ namespace runtime_contract
         std::size_t original_ordinal;
     };
 
-    struct TwoBrushReplayEntry
+    struct ReplayEntry
     {
         std::size_t sample_index;
         ReplayPass pass;
@@ -224,35 +217,29 @@ namespace runtime_contract
         SpatialScanlineKey spatial_key;
     };
 
-    struct TwoBrushReplayPlan
+    struct ReplayPlan
     {
-        std::vector<TwoBrushReplayEntry> entries{};
+        std::vector<ReplayEntry> entries{};
         std::size_t fill_end{0};
-        std::size_t coarse_end{0};
         std::size_t fill_count{0};
-        std::size_t coarse_paint_count{0};
-        std::size_t fine_paint_count{0};
+        std::size_t paint_count{0};
         std::size_t fill_candidates{0};
         std::size_t fill_deduplicated{0};
-        std::size_t coarse_paint_candidates{0};
-        std::size_t coarse_paint_deduplicated{0};
+        std::size_t paint_candidates{0};
+        std::size_t paint_deduplicated{0};
         bool current_view_projection_fallback_used{false};
         std::size_t current_view_projection_fallback_candidates{0};
     };
 
-    inline TwoBrushReplayPlan build_two_brush_replay_plan(
-        const std::vector<TwoBrushReplayCandidate>& candidates,
+    inline ReplayPlan build_single_brush_replay_plan(
+        const std::vector<ReplayCandidate>& candidates,
         int texture_size,
-        bool brush_1_enabled,
-        double brush_1_size_texels,
-        bool brush_2_enabled,
-        double brush_2_size_texels,
+        double brush_size_texels,
         double fill_radius_texels)
     {
-        TwoBrushReplayPlan plan{};
+        ReplayPlan plan{};
         const double texture_size_double = static_cast<double>(max_value(1, texture_size));
         const double fill_cell_uv = fill_radius_texels * 0.75 / texture_size_double;
-        const double coarse_cell_uv = brush_1_size_texels / texture_size_double;
         bool fill_all_regions = false;
         for (const auto& candidate : candidates)
         {
@@ -265,7 +252,7 @@ namespace runtime_contract
         double vertical_top = 0.0;
         double vertical_bottom = 0.0;
         bool have_vertical_bounds = false;
-        const auto selected_vertical = [](const TwoBrushReplayCandidate& candidate) {
+        const auto selected_vertical = [](const ReplayCandidate& candidate) {
             return candidate.has_current_view_position && std::isfinite(candidate.current_view_vertical)
                        ? candidate.current_view_vertical
                        : (std::isfinite(candidate.fallback_view_vertical)
@@ -304,7 +291,7 @@ namespace runtime_contract
                                double row_size_texels,
                                bool include_all_regions = false) {
             std::set<std::tuple<int, int, int, int>> emitted_cells{};
-            std::vector<TwoBrushReplayEntry> pending{};
+            std::vector<ReplayEntry> pending{};
             const double row_height = std::max(
                 0.000001,
                 vertical_span * std::max(0.001, row_size_texels) / texture_size_double);
@@ -318,9 +305,9 @@ namespace runtime_contract
                 {
                     ++plan.fill_candidates;
                 }
-                else if (pass == ReplayPass::CoarsePaint)
+                else if (pass == ReplayPass::Paint)
                 {
-                    ++plan.coarse_paint_candidates;
+                    ++plan.paint_candidates;
                 }
                 if (dedupe_cell_uv > 0.000001)
                 {
@@ -340,9 +327,9 @@ namespace runtime_contract
                         {
                             ++plan.fill_deduplicated;
                         }
-                        else if (pass == ReplayPass::CoarsePaint)
+                        else if (pass == ReplayPass::Paint)
                         {
-                            ++plan.coarse_paint_deduplicated;
+                            ++plan.paint_deduplicated;
                         }
                         continue;
                     }
@@ -370,23 +357,193 @@ namespace runtime_contract
                     fill_all_regions);
         plan.fill_end = plan.entries.size();
         plan.fill_count = plan.fill_end;
-        if (brush_1_enabled)
+        append_pass(ReplayPass::Paint,
+                    ReplayRegionMode::Paint,
+                    0.0,
+                    brush_size_texels);
+        plan.paint_count = plan.entries.size() - plan.fill_end;
+        return plan;
+    }
+
+    // Compression is intentionally plan-local: a widened direct stroke may
+    // cover only samples that share its region, UV island, and final material
+    // payload.  Fill entries are never compressed.
+    struct AdaptivePaintSample
+    {
+        double u;
+        double v;
+        ReplayRegion region;
+        int uv_island;
+        double r;
+        double g;
+        double b;
+        bool paint_eligible;
+        bool safe;
+        std::uint64_t material_key;
+    };
+
+    struct AdaptiveReplayEntry
+    {
+        ReplayEntry replay;
+        double radius_multiplier{1.0};
+    };
+
+    struct AdaptivePaintPlan
+    {
+        std::vector<AdaptiveReplayEntry> entries{};
+        std::size_t compressed_paint_entries{0};
+        std::size_t expanded_paint_entries{0};
+    };
+
+    inline AdaptivePaintPlan build_adaptive_paint_plan(
+        const std::vector<ReplayEntry>& replay_entries,
+        const std::vector<AdaptivePaintSample>& samples,
+        double base_radius_uv,
+        double tolerance_percent,
+        double edge_margin_uv = 0.0)
+    {
+        AdaptivePaintPlan plan{};
+        plan.entries.reserve(replay_entries.size());
+        if (replay_entries.empty())
         {
-            append_pass(ReplayPass::CoarsePaint,
-                        ReplayRegionMode::Paint,
-                        coarse_cell_uv,
-                        brush_1_size_texels);
+            return plan;
         }
-        plan.coarse_end = plan.entries.size();
-        plan.coarse_paint_count = plan.coarse_end - plan.fill_end;
-        if (brush_2_enabled)
+        if (tolerance_percent <= 0.0 || base_radius_uv <= 0.000001 || samples.empty())
         {
-            append_pass(ReplayPass::FinePaint,
-                        ReplayRegionMode::Paint,
-                        0.0,
-                        brush_2_size_texels);
+            for (const auto& entry : replay_entries)
+            {
+                plan.entries.push_back({entry, 1.0});
+            }
+            return plan;
         }
-        plan.fine_paint_count = plan.entries.size() - plan.coarse_end;
+
+        int grid_size = 128;
+        if (samples.size() > 200000)
+        {
+            grid_size = 256;
+        }
+        if (samples.size() > 500000)
+        {
+            grid_size = 512;
+        }
+        std::vector<std::vector<std::size_t>> grid(
+            static_cast<std::size_t>(grid_size * grid_size));
+        const auto cell_coordinate = [&](double value) {
+            const double finite_value = std::isfinite(value) ? value : 0.0;
+            return std::clamp(static_cast<int>(std::floor(finite_value * grid_size)), 0, grid_size - 1);
+        };
+        for (std::size_t index = 0; index < samples.size(); ++index)
+        {
+            const auto& sample = samples[index];
+            grid[static_cast<std::size_t>(cell_coordinate(sample.v) * grid_size +
+                                          cell_coordinate(sample.u))]
+                .push_back(index);
+        }
+
+        const double threshold = std::clamp(tolerance_percent, 0.0, 10.0) / 100.0 * std::sqrt(3.0);
+        const double threshold_squared = threshold * threshold;
+        const auto same_payload = [](const AdaptivePaintSample& center,
+                                     const AdaptivePaintSample& other) {
+            return center.paint_eligible && center.safe && other.paint_eligible && other.safe &&
+                   center.region == other.region && center.uv_island == other.uv_island &&
+                   center.material_key == other.material_key;
+        };
+        const auto color_distance_squared = [](const AdaptivePaintSample& left,
+                                               const AdaptivePaintSample& right) {
+            const double dr = left.r - right.r;
+            const double dg = left.g - right.g;
+            const double db = left.b - right.b;
+            return dr * dr + dg * dg + db * db;
+        };
+        const auto visit_nearby = [&](const AdaptivePaintSample& center,
+                                      double radius_uv,
+                                      const auto& visit) {
+            const double safe_radius = std::max(0.0, radius_uv);
+            const double radius_squared = safe_radius * safe_radius;
+            const int min_u = cell_coordinate(center.u - safe_radius);
+            const int max_u = cell_coordinate(center.u + safe_radius);
+            const int min_v = cell_coordinate(center.v - safe_radius);
+            const int max_v = cell_coordinate(center.v + safe_radius);
+            for (int cell_v = min_v; cell_v <= max_v; ++cell_v)
+            {
+                for (int cell_u = min_u; cell_u <= max_u; ++cell_u)
+                {
+                    for (const auto other_index : grid[static_cast<std::size_t>(cell_v * grid_size + cell_u)])
+                    {
+                        const auto& other = samples[other_index];
+                        const double du = other.u - center.u;
+                        const double dv = other.v - center.v;
+                        if (du * du + dv * dv <= radius_squared)
+                        {
+                            visit(other_index, other);
+                        }
+                    }
+                }
+            }
+        };
+
+        std::vector<bool> covered(samples.size(), false);
+        std::vector<AdaptiveReplayEntry> paint_entries{};
+        paint_entries.reserve(replay_entries.size());
+        constexpr std::array<double, 4> multipliers{4.0, 3.0, 2.0, 1.5};
+        for (const auto& entry : replay_entries)
+        {
+            if (entry.pass != ReplayPass::Paint || entry.sample_index >= samples.size())
+            {
+                plan.entries.push_back({entry, 1.0});
+                continue;
+            }
+            if (covered[entry.sample_index])
+            {
+                ++plan.compressed_paint_entries;
+                continue;
+            }
+
+            const auto& center = samples[entry.sample_index];
+            double multiplier = 1.0;
+            if (center.paint_eligible && center.safe)
+            {
+                for (const auto candidate_multiplier : multipliers)
+                {
+                    const double check_radius = std::max(
+                        0.0, candidate_multiplier * base_radius_uv - std::max(0.0, edge_margin_uv));
+                    bool valid = true;
+                    visit_nearby(center, check_radius, [&](std::size_t, const AdaptivePaintSample& other) {
+                        if (!same_payload(center, other) ||
+                            color_distance_squared(center, other) > threshold_squared)
+                        {
+                            valid = false;
+                        }
+                    });
+                    if (valid)
+                    {
+                        multiplier = candidate_multiplier;
+                        break;
+                    }
+                }
+            }
+
+            paint_entries.push_back({entry, multiplier});
+            if (multiplier > 1.0)
+            {
+                ++plan.expanded_paint_entries;
+            }
+            covered[entry.sample_index] = true;
+            const double coverage_radius = std::max(
+                0.0, multiplier * base_radius_uv - std::max(0.0, edge_margin_uv));
+            visit_nearby(center, coverage_radius, [&](std::size_t other_index,
+                                                       const AdaptivePaintSample& other) {
+                if (same_payload(center, other) &&
+                    color_distance_squared(center, other) <= threshold_squared)
+                {
+                    covered[other_index] = true;
+                }
+            });
+        }
+        std::stable_sort(paint_entries.begin(), paint_entries.end(), [](const auto& left, const auto& right) {
+            return left.radius_multiplier > right.radius_multiplier;
+        });
+        plan.entries.insert(plan.entries.end(), paint_entries.begin(), paint_entries.end());
         return plan;
     }
 

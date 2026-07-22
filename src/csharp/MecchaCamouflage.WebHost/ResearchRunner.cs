@@ -992,11 +992,8 @@ internal static class ResearchRunner
         var paint = SettingsStore.Clamp(settings).Paint;
         return new
         {
-            brush_1_enabled = paint.Brush1Enabled,
-            brush_1_size_texels = paint.Brush1SizeTexels,
-            brush_2_enabled = paint.Brush2Enabled,
-            brush_2_size_texels = paint.Brush2SizeTexels,
-            coverage_step_texels = paint.CoverageStepTexels,
+            brush_size_texels = paint.BrushSizeTexels,
+            color_compression_tolerance = paint.ColorCompressionTolerance,
             front_region_mode = SettingsStore.RegionModeText(paint.FrontRegionMode),
             side_region_mode = SettingsStore.RegionModeText(paint.SideRegionMode),
             back_region_mode = SettingsStore.RegionModeText(paint.BackRegionMode),
