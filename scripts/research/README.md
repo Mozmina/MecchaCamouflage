@@ -15,9 +15,9 @@ The runner requires `MECCHA_RESEARCH_ARTIFACTS=1` and an exact game PID:
 ```text
 meccha-camouflage.exe --research-replication --pid <pid> \
   --role host|joining-client --out <local-artifact-directory> [--paint] \
-  [--hold-seconds N] [--pressure-sample-ms N] [--texture-snapshot] \
+  [--hold-seconds N] [--pressure-sample-ms N] [--texture-snapshot] [--texture-sample-ms N] \
   [--texture-target resolved|inventory-all|eventwatch-direct-receiver --texture-discovery-seconds N] \
-  [--stroke-limit N] [--replay-stroke-index N] \
+  [--stroke-limit N] [--queue-target N] [--replay-stroke-index N] \
   [--front-mode paint|fill|skip] [--side-mode paint|fill|skip] [--back-mode paint|fill|skip] \
   [--cancel-after-ms N | --shutdown-after-ms N] [--fill-color '#RRGGBB'] \
   [--paint-color '#RRGGBB'] [--metallic 0..1] [--roughness 0..1] [--emissive 0..1]
@@ -50,6 +50,12 @@ Treat a terminal reply as valid only after the native queue is idle. Compare
 painter and joining-client results independently; a fast paint submission does
 not prove remote visible completion.
 
+`--queue-target N` (1 through 16) is a research-only high-water-mark override
+for the game's recorded-paint queue. It does not change normal application
+settings. Use it to compare one fixed stroke plan at `1`, `4`, `8`, and `16`;
+the game-reported per-tick capacity remains an upper bound on the effective
+value.
+
 ## Texture and material probes
 
 `--texture-snapshot` performs low-frequency before/after exports of the
@@ -64,6 +70,13 @@ peer paint, so it can prove a remote texture mutation even when replication
 does not enter `ProcessEvent`. It is deliberately not used for sender timing
 or normal paint verification, and it retains raw JSON inventories rather than
 rendering a single-target PNG delta.
+
+With `--texture-snapshot`, `--texture-sample-ms N` records a compact texture
+time series while a non-paint observer is holding. Each sample preserves the
+initial per-component baseline, so changed-pixel counts show the game's actual
+replicated render-target drain rather than only the final checksum. It requires
+a positive `--hold-seconds`; use it sparingly because channel exports run on
+the game thread.
 
 For material investigations, use distinguishable values such as
 `M=.21/R=.83/E=.47`. Manual Paint values apply only when Auto Detect is off.

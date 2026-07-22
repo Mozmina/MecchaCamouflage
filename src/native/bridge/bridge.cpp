@@ -6253,12 +6253,16 @@ namespace
     std::mutex g_mesh_first_preview_mutex;
     MeshFirstPreviewSnapshot g_mesh_first_preview_snapshot{};
     std::mutex g_mesh_first_research_texture_mutex;
-    MeshFirstResearchTextureSnapshot g_mesh_first_research_texture_snapshot{};
+    // Texture probes can inventory both local and replicated components. Keep
+    // each baseline by component; one shared baseline makes every later item
+    // in an inventory look like a different target and hides real deltas.
+    std::unordered_map<std::uintptr_t, MeshFirstResearchTextureSnapshot>
+        g_mesh_first_research_texture_snapshots{};
 
     auto mesh_first_clear_research_texture_snapshot() -> void
     {
         std::lock_guard<std::mutex> lock(g_mesh_first_research_texture_mutex);
-        g_mesh_first_research_texture_snapshot = {};
+        g_mesh_first_research_texture_snapshots.clear();
     }
 
     auto mesh_first_store_preview_snapshot(std::uintptr_t component,
@@ -6669,7 +6673,8 @@ namespace
     }
 
     auto mesh_first_capture_research_texture_delta(Reflection& ref,
-                                                   std::uintptr_t component) -> MeshFirstResearchTextureDelta
+                                                   std::uintptr_t component,
+                                                   bool preserve_baseline = false) -> MeshFirstResearchTextureDelta
     {
         MeshFirstResearchTextureDelta out{};
         const auto albedo = mesh_first_export_channel_bytes(ref, component, sdk::EPaintChannel::Albedo);
@@ -6766,9 +6771,13 @@ namespace
         }
         {
             std::lock_guard<std::mutex> lock(g_mesh_first_research_texture_mutex);
-            const auto& baseline = g_mesh_first_research_texture_snapshot;
-            out.baseline_available = baseline.available;
-            out.baseline_component_match = baseline.available && baseline.component == component;
+            const auto baseline_it = g_mesh_first_research_texture_snapshots.find(component);
+            const auto baseline_available = baseline_it != g_mesh_first_research_texture_snapshots.end() &&
+                                            baseline_it->second.available;
+            const MeshFirstResearchTextureSnapshot empty_baseline{};
+            const auto& baseline = baseline_available ? baseline_it->second : empty_baseline;
+            out.baseline_available = baseline_available;
+            out.baseline_component_match = baseline_available;
             const bool comparable = out.baseline_component_match &&
                                     baseline.albedo_bytes.size() == albedo.bytes.size() &&
                                     baseline.metallic_bytes.size() == metallic.bytes.size() &&
@@ -6861,12 +6870,16 @@ namespace
                 populate_after_values(changed_after_values[3], out.emissive_after_values);
             }
 
-            g_mesh_first_research_texture_snapshot.available = true;
-            g_mesh_first_research_texture_snapshot.component = component;
-            g_mesh_first_research_texture_snapshot.albedo_bytes = albedo.bytes;
-            g_mesh_first_research_texture_snapshot.metallic_bytes = metallic.bytes;
-            g_mesh_first_research_texture_snapshot.roughness_bytes = roughness.bytes;
-            g_mesh_first_research_texture_snapshot.emissive_bytes = emissive.bytes;
+            if (!preserve_baseline || !baseline_available)
+            {
+                auto& stored = g_mesh_first_research_texture_snapshots[component];
+                stored.available = true;
+                stored.component = component;
+                stored.albedo_bytes = albedo.bytes;
+                stored.metallic_bytes = metallic.bytes;
+                stored.roughness_bytes = roughness.bytes;
+                stored.emissive_bytes = emissive.bytes;
+            }
         }
         out.capture_ok = true;
         out.failure = out.baseline_component_match ? "ok" : "baseline_captured";
@@ -9101,6 +9114,9 @@ namespace
         int direct_queue_last_global_strokes{-1};
         int direct_queue_last_pressure_strokes{-1};
         int direct_queue_last_max_strokes_per_tick{-1};
+        // Research-only high-water mark override. Zero preserves the production
+        // default, and the game-reported per-tick capacity remains a hard cap.
+        int direct_queue_requested_target_strokes{0};
         int direct_queue_target_strokes{runtime_contract::NativeRecordedPaintQueueTargetStrokes};
         int direct_queue_peak_component_strokes{0};
         int direct_queue_samples{0};
@@ -9275,9 +9291,13 @@ namespace
         return pending;
     }
 
-    auto direct_paint_queue_target_strokes(const DirectPaintQueueSnapshot& snapshot) -> int
+    auto direct_paint_queue_target_strokes(
+        const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
+        const DirectPaintQueueSnapshot& snapshot) -> int
     {
-        int target = runtime_contract::NativeRecordedPaintQueueTargetStrokes;
+        int target = job && job->direct_queue_requested_target_strokes > 0
+                         ? job->direct_queue_requested_target_strokes
+                         : runtime_contract::NativeRecordedPaintQueueTargetStrokes;
         // The replication manager exposes the number it can process in one
         // game tick. Never build a lead larger than that native capacity.
         if (snapshot.pressure_available && snapshot.max_strokes_per_tick > 0)
@@ -9304,7 +9324,7 @@ namespace
         job->direct_queue_last_global_strokes = snapshot.manager_strokes;
         job->direct_queue_last_pressure_strokes = snapshot.pressure_strokes;
         job->direct_queue_last_max_strokes_per_tick = snapshot.max_strokes_per_tick;
-        job->direct_queue_target_strokes = direct_paint_queue_target_strokes(snapshot);
+        job->direct_queue_target_strokes = direct_paint_queue_target_strokes(job, snapshot);
         if (snapshot.component_available || snapshot.recorded_available)
         {
             job->direct_queue_peak_component_strokes =
@@ -9652,6 +9672,10 @@ namespace
         const int research_stroke_limit = research_artifacts
                                               ? json_int_field(request, "research_stroke_limit", 0, 0, 100000)
                                               : 0;
+        const int research_direct_queue_target_strokes =
+            research_artifacts
+                ? json_int_field(request, "research_direct_queue_target_strokes", 0, 0, 16)
+                : 0;
         const int diagnostic_stroke_limit =
             json_int_field(request, "diagnostic_stroke_limit", 0, 0, 10000);
         const int research_replay_stroke_index = research_artifacts
@@ -11255,6 +11279,11 @@ namespace
         metadata += ",\"local_visual_sync_required\":true";
         metadata += ",\"local_texture_import_required\":false";
         metadata += ",\"authoritative_replay\":\"direct_game_recorded_strokes\"";
+        if (research_direct_queue_target_strokes > 0)
+        {
+            metadata += ",\"research_direct_queue_target_strokes\":" +
+                        std::to_string(research_direct_queue_target_strokes);
+        }
         if (!ctx.local_paint_at_uv_function)
         {
             return response_json(false,
@@ -11324,6 +11353,8 @@ namespace
             async_job->replay_back = replay_back;
             async_job->replay_fill_end = effective_fill_end;
             async_job->replay_coarse_end = effective_coarse_end;
+            async_job->direct_queue_requested_target_strokes =
+                research_direct_queue_target_strokes;
             const int local_sample_batch_limit = runtime_contract::NativeRecordedPaintMaxCallsPerTick;
             async_job->local_render_target_write_budget =
                 local_sample_batch_limit * std::max(1, paint_target_render_writes);
@@ -11665,7 +11696,7 @@ namespace
             direct_paint_record_queue_snapshot(job, queue_after_cancel);
             const int pending_after_cancel = direct_paint_owned_queue_strokes(queue_after_cancel);
             const int queue_target_after_cancel =
-                direct_paint_queue_target_strokes(queue_after_cancel);
+                direct_paint_queue_target_strokes(job, queue_after_cancel);
             if (job->direct_queue_observer_available && pending_after_cancel > 0)
             {
                 // Cancellation stops admission immediately, but the game still
@@ -11732,7 +11763,7 @@ namespace
         const auto queue_before = direct_paint_capture_queue_snapshot(job);
         direct_paint_record_queue_snapshot(job, queue_before);
         const int pending_before = direct_paint_owned_queue_strokes(queue_before);
-        const int queue_target_before = direct_paint_queue_target_strokes(queue_before);
+        const int queue_target_before = direct_paint_queue_target_strokes(job, queue_before);
         if (pending_before >= queue_target_before)
         {
             ++job->direct_queue_waits;
@@ -11799,7 +11830,7 @@ namespace
             direct_paint_record_queue_snapshot(job, queue_after_call);
             const int pending_after_call = direct_paint_owned_queue_strokes(queue_after_call);
             const int queue_target_after_call =
-                direct_paint_queue_target_strokes(queue_after_call);
+                direct_paint_queue_target_strokes(job, queue_after_call);
             if (pending_after_call >= queue_target_after_call)
             {
                 // This is backpressure from the game-owned renderer, not an
@@ -12295,7 +12326,9 @@ namespace
                                                          const std::string& texture_export_target_source = "",
                                                          int texture_export_target_eventwatch_calls = 0,
                                                          const std::string& texture_export_target_expected_component = "",
-                                                         bool texture_export_all_components = false) -> std::string
+                                                         bool texture_export_all_components = false,
+                                                         bool compact_inventory = false,
+                                                         bool preserve_texture_baseline = false) -> std::string
     {
         constexpr std::size_t MaxInventoryComponents = 32;
         const auto component_class = ref.find_class("RuntimePaintableComponent");
@@ -12423,7 +12456,10 @@ namespace
                 // ExportChannelToBytes is the existing non-import/readback path used by the
                 // research paint flow. Limit it to the selected target: unrelated component
                 // readbacks add game-thread work and invalidate a joining-client timing sample.
-                item.texture_delta = mesh_first_capture_research_texture_delta(ref, object);
+                item.texture_delta = mesh_first_capture_research_texture_delta(
+                    ref,
+                    object,
+                    preserve_texture_baseline);
                 item.albedo_checksum = item.texture_delta.albedo_checksum;
                 item.metallic_checksum = item.texture_delta.metallic_checksum;
                 item.roughness_checksum = item.texture_delta.roughness_checksum;
@@ -12471,6 +12507,58 @@ namespace
             }
             metadata += "{\"component\":\"" + hex_address(item.component) + "\"";
             metadata += ",\"component_name\":\"" + json_escape(item.component_name) + "\"";
+            if (compact_inventory)
+            {
+                metadata += ",\"owner\":\"" + hex_address(item.owner) + "\"";
+                metadata += ",\"owner_name\":\"" + json_escape(item.owner_name) + "\"";
+                metadata += ",\"matches_resolved_component\":" +
+                            std::string(json_bool(item.matches_resolved_component));
+                metadata += ",\"matches_texture_export_target\":" +
+                            std::string(json_bool(item.matches_texture_export_target));
+                metadata += ",\"belongs_to_controller_pawn\":" +
+                            std::string(json_bool(item.belongs_to_controller_pawn));
+                metadata += ",\"owner_local_role\":" + std::to_string(item.owner_local_role);
+                metadata += ",\"owner_remote_role\":" + std::to_string(item.owner_remote_role);
+                metadata += ",\"channel_export_eligible\":" +
+                            std::string(json_bool(item.channel_export_eligible));
+                auto append_checksum = [&](const char* key, const MeshFirstChannelChecksum& checksum) {
+                    metadata += ",\"" + std::string(key) + "\":{\"ok\":" +
+                                std::string(json_bool(checksum.ok)) +
+                                ",\"bytes\":" + std::to_string(checksum.bytes) +
+                                ",\"hash\":\"" + std::to_string(checksum.hash) + "\"" +
+                                ",\"failure\":\"" + json_escape(checksum.failure) + "\"}";
+                };
+                append_checksum("albedo_export", item.albedo_checksum);
+                append_checksum("metallic_export", item.metallic_checksum);
+                append_checksum("roughness_export", item.roughness_checksum);
+                append_checksum("emissive_export", item.emissive_checksum);
+                const double changed_ratio = item.texture_delta.pixels_total > 0
+                                                 ? static_cast<double>(item.texture_delta.pixels_changed_any_channel) /
+                                                       static_cast<double>(item.texture_delta.pixels_total)
+                                                 : 0.0;
+                metadata += ",\"texture_delta\":{\"capture_ok\":" +
+                            std::string(json_bool(item.texture_delta.capture_ok));
+                metadata += ",\"baseline_available\":" +
+                            std::string(json_bool(item.texture_delta.baseline_available));
+                metadata += ",\"baseline_component_match\":" +
+                            std::string(json_bool(item.texture_delta.baseline_component_match));
+                metadata += ",\"pixels_total\":" + std::to_string(item.texture_delta.pixels_total);
+                metadata += ",\"pixels_changed_any_channel\":" +
+                            std::to_string(item.texture_delta.pixels_changed_any_channel);
+                metadata += ",\"pixels_changed_ratio\":" + std::to_string(changed_ratio);
+                metadata += ",\"albedo_pixels_changed\":" +
+                            std::to_string(item.texture_delta.albedo_pixels_changed);
+                metadata += ",\"metallic_pixels_changed\":" +
+                            std::to_string(item.texture_delta.metallic_pixels_changed);
+                metadata += ",\"roughness_pixels_changed\":" +
+                            std::to_string(item.texture_delta.roughness_pixels_changed);
+                metadata += ",\"emissive_pixels_changed\":" +
+                            std::to_string(item.texture_delta.emissive_pixels_changed);
+                metadata += ",\"failure\":\"" + json_escape(item.texture_delta.failure) + "\"}";
+                metadata += ",\"replication\":" + sdk_replication_snapshot_json(item.replication);
+                metadata += "}";
+                continue;
+            }
             metadata += ",\"component_path\":\"" + json_escape(item.component_path) + "\"";
             metadata += ",\"component_class\":\"" + json_escape(ref.class_name(item.component)) + "\"";
             metadata += ",\"owner\":\"" + hex_address(item.owner) + "\"";
@@ -14912,15 +15000,33 @@ namespace
         if (request.find("\"type\":\"paint_replication_pressure_probe\"") != std::string::npos || texture_probe)
         {
             const char* route = texture_probe ? "paint_replication_texture_probe" : "paint_replication_pressure_probe";
+            const bool compact_texture_research =
+                texture_probe && json_bool_field(request, "research_compact", false);
+            const bool preserve_texture_baseline =
+                texture_probe && json_bool_field(request, "research_texture_preserve_baseline", false);
             std::string pressure_metadata = "\"route\":\"" + std::string(route) + "\"";
-            pressure_metadata += paint_replication_global_probe_metadata(ref);
+            if (compact_texture_research)
+            {
+                pressure_metadata += ",\"research_compact\":true";
+            }
+            if (preserve_texture_baseline)
+            {
+                pressure_metadata += ",\"research_texture_preserve_baseline\":true";
+            }
+            else
+            {
+                pressure_metadata += paint_replication_global_probe_metadata(ref);
+            }
             if (!ctx.ok)
             {
                 return response_json(false, ctx.stage.c_str(), 0, 1, ctx.message, pressure_metadata);
             }
             pressure_metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
-            pressure_metadata += ",\"component_class\":\"" + json_escape(ref.class_name(ctx.component)) + "\"";
-            pressure_metadata += sdk_replication_snapshot_metadata("replication", sdk_capture_replication_snapshot(ref, ctx.component));
+            if (!compact_texture_research)
+            {
+                pressure_metadata += ",\"component_class\":\"" + json_escape(ref.class_name(ctx.component)) + "\"";
+                pressure_metadata += sdk_replication_snapshot_metadata("replication", sdk_capture_replication_snapshot(ref, ctx.component));
+            }
             std::uintptr_t texture_export_target = texture_probe ? ctx.component : 0;
             std::string texture_export_target_source = texture_probe ? "resolved_component" : "";
             int texture_export_target_eventwatch_calls = 0;
@@ -15056,7 +15162,9 @@ namespace
                 texture_export_target_source,
                 texture_export_target_eventwatch_calls,
                 texture_export_target_expected_component,
-                texture_export_all_components);
+                texture_export_all_components,
+                compact_texture_research,
+                preserve_texture_baseline);
             return response_json(true,
                                  route,
                                  0,

@@ -181,8 +181,20 @@ public sealed class RuntimeBridgeService
         ResearchTextureTarget textureTarget,
         string? expectedTextureComponent,
         CancellationToken cancellationToken = default) =>
+        SendResearchProbeAsync(kind, textureTarget, expectedTextureComponent, false, cancellationToken);
+
+    /// <summary>
+    /// Sends a research texture probe that can retain its initial baseline for a compact
+    /// time-series. This remains inside the authenticated research bridge protocol.
+    /// </summary>
+    public Task<BridgeReply> SendResearchProbeAsync(
+        ResearchProbeKind kind,
+        ResearchTextureTarget textureTarget,
+        string? expectedTextureComponent,
+        bool preserveTextureBaseline,
+        CancellationToken cancellationToken = default) =>
         RequestActiveAsync(client => client.RequestAsync(
-            ResearchProbePayload(kind, textureTarget, expectedTextureComponent),
+            ResearchProbePayload(kind, textureTarget, expectedTextureComponent, preserveTextureBaseline),
             cancellationToken));
 
     public async Task<BridgeReply> ShutdownAsync(CancellationToken cancellationToken = default)
@@ -534,33 +546,42 @@ public sealed class RuntimeBridgeService
     private static string ResearchProbePayload(
         ResearchProbeKind kind,
         ResearchTextureTarget textureTarget,
-        string? expectedTextureComponent) => kind switch
+        string? expectedTextureComponent,
+        bool preserveTextureBaseline = false) => kind switch
     {
         ResearchProbeKind.Replication => "{\"type\":\"paint_replication_probe\"}",
         ResearchProbeKind.ReplicationPressure => "{\"type\":\"paint_replication_pressure_probe\"}",
-        ResearchProbeKind.ReplicationTexture => ResearchTextureProbePayload(textureTarget, expectedTextureComponent),
+        ResearchProbeKind.ReplicationTexture => ResearchTextureProbePayload(
+            textureTarget,
+            expectedTextureComponent,
+            preserveTextureBaseline),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unsupported research probe.")
     };
 
     private static string ResearchTextureProbePayload(
         ResearchTextureTarget textureTarget,
-        string? expectedTextureComponent) => textureTarget switch
+        string? expectedTextureComponent,
+        bool preserveTextureBaseline)
+    {
+        var preserve = preserveTextureBaseline ? ",\"research_texture_preserve_baseline\":true" : "";
+        return textureTarget switch
     {
         ResearchTextureTarget.ResolvedComponent when string.IsNullOrWhiteSpace(expectedTextureComponent) =>
-            "{\"type\":\"paint_replication_texture_probe\",\"research_texture_target\":\"resolved\"}",
+            "{\"type\":\"paint_replication_texture_probe\",\"research_texture_target\":\"resolved\",\"research_compact\":true" + preserve + "}",
         ResearchTextureTarget.ResolvedComponent => throw new ArgumentException(
             "A texture component pin is only supported for an event-watch direct receiver.",
             nameof(expectedTextureComponent)),
         ResearchTextureTarget.EventwatchDirectReceiver =>
-            "{\"type\":\"paint_replication_texture_probe\",\"research_texture_target\":\"eventwatch_direct_receiver\",\"research_texture_expected_component\":\"" +
+            "{\"type\":\"paint_replication_texture_probe\",\"research_texture_target\":\"eventwatch_direct_receiver\",\"research_compact\":true" + preserve + ",\"research_texture_expected_component\":\"" +
             NormalizeNonZeroHexAddress(expectedTextureComponent) + "\"}",
         ResearchTextureTarget.AllRuntimePaintComponents when string.IsNullOrWhiteSpace(expectedTextureComponent) =>
-            "{\"type\":\"paint_replication_texture_probe\",\"research_texture_target\":\"inventory_all\"}",
+            "{\"type\":\"paint_replication_texture_probe\",\"research_texture_target\":\"inventory_all\",\"research_compact\":true" + preserve + "}",
         ResearchTextureTarget.AllRuntimePaintComponents => throw new ArgumentException(
             "An all-components texture probe does not accept a component pin.",
             nameof(expectedTextureComponent)),
         _ => throw new ArgumentOutOfRangeException(nameof(textureTarget), textureTarget, "Unsupported research texture target.")
     };
+    }
 
     private static string NormalizeNonZeroHexAddress(string? value)
     {

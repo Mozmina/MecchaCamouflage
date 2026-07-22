@@ -301,6 +301,17 @@ static void NativeProductionLocalSyncUsesPerStrokePaint()
     Assert(bridge.Contains("json_int_field(request, \"diagnostic_stroke_limit\", 0, 0, 10000)", StringComparison.Ordinal) &&
            bridge.Contains("diagnostic_stroke_limit_applied", StringComparison.Ordinal),
         "diagnostic runs must report their explicit stroke limit without changing normal paint");
+    Assert(bridge.Contains("json_int_field(request, \"research_direct_queue_target_strokes\", 0, 0, 16)", StringComparison.Ordinal) &&
+           bridge.Contains("direct_queue_requested_target_strokes", StringComparison.Ordinal),
+        "research runs must vary the direct queue high-water mark without changing production defaults");
+    Assert(bridge.Contains("compact_texture_research", StringComparison.Ordinal) &&
+           bridge.Contains("research_compact", StringComparison.Ordinal),
+        "research texture probes must return compact, complete evidence instead of truncating diagnostics");
+    Assert(bridge.Contains("g_mesh_first_research_texture_snapshots", StringComparison.Ordinal) &&
+           bridge.Contains("g_mesh_first_research_texture_snapshots.find(component)", StringComparison.Ordinal),
+        "research texture inventories must retain one baseline per component");
+    Assert(bridge.Contains("research_texture_preserve_baseline", StringComparison.Ordinal),
+        "research texture time-series probes must preserve their initial component baselines");
 }
 
 static void NativePreviewAppliesPbrAndEmissiveChannels()

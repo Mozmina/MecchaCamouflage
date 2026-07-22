@@ -26,9 +26,11 @@ internal static class ResearchRunner
         int HoldSeconds,
         int PressureSampleMs,
         bool TextureSnapshot,
+        int TextureSampleMs,
         ResearchTextureTarget TextureTarget,
         int TextureDiscoverySeconds,
         int StrokeLimit,
+        int? QueueTarget,
         int? ReplayStrokeIndex,
         int? TargetChannelOverride,
         int? ApplyModeOverride,
@@ -101,9 +103,11 @@ internal static class ResearchRunner
             ["hold_seconds"] = options.HoldSeconds,
             ["pressure_sample_ms"] = options.PressureSampleMs,
             ["texture_snapshot_requested"] = options.TextureSnapshot,
+            ["texture_sample_ms"] = options.TextureSampleMs,
             ["research_texture_target"] = options.TextureTarget.ToString(),
             ["texture_discovery_seconds"] = options.TextureDiscoverySeconds,
             ["stroke_limit"] = options.StrokeLimit,
+            ["queue_target"] = options.QueueTarget,
             ["replay_stroke_index"] = options.ReplayStrokeIndex,
             ["target_channel_override"] = options.TargetChannelOverride,
             ["apply_mode_override"] = options.ApplyModeOverride,
@@ -262,7 +266,7 @@ internal static class ResearchRunner
                         requested_utc = DateTimeOffset.UtcNow,
                         settings = PaintSettingsArtifact(session.Settings),
                         payload
-                    });
+                });
                 var paintTask = SendPaintWithTimingAsync(session.Runtime, payload);
                 var progressTimelineTask = CapturePaintProgressTimelineAsync(session.Runtime.ProgressPath, paintTask);
                 Task<CancelTimedReply>? cancelTask = options.CancelAfterMs is int cancelAfterMs
@@ -433,7 +437,11 @@ internal static class ResearchRunner
 
             if (options.ShutdownAfterMs is null)
             {
-                await HoldWithPressureSamplesAsync(session, options, runDirectory);
+                await HoldWithPressureSamplesAsync(
+                    session,
+                    options,
+                    runDirectory,
+                    textureExpectedComponent);
 
                 SnapshotEventWatch(eventWatchPath, Path.Combine(runDirectory, "eventwatch-before-post-probes.json"));
                 await CaptureProbeAsync(session, ResearchProbeKind.ReplicationPressure, "pressure-after", runDirectory);
@@ -556,10 +564,15 @@ internal static class ResearchRunner
         string name,
         string artifactDirectory,
         ResearchTextureTarget textureTarget = ResearchTextureTarget.ResolvedComponent,
-        string? expectedTextureComponent = null)
+        string? expectedTextureComponent = null,
+        bool preserveTextureBaseline = false)
     {
         var started = DateTimeOffset.UtcNow;
-        var reply = await session.Runtime.SendResearchProbeAsync(kind, textureTarget, expectedTextureComponent);
+        var reply = await session.Runtime.SendResearchProbeAsync(
+            kind,
+            textureTarget,
+            expectedTextureComponent,
+            preserveTextureBaseline);
         WriteJson(Path.Combine(artifactDirectory, name + ".json"), new ReplyArtifact(name, started, DateTimeOffset.UtcNow, reply));
         if (!reply.Ok || !reply.Success)
             throw new InvalidOperationException($"Research probe {name} failed: {reply.Message}");
@@ -766,35 +779,59 @@ internal static class ResearchRunner
     private static async Task HoldWithPressureSamplesAsync(
         HostSession session,
         Options options,
-        string artifactDirectory)
+        string artifactDirectory,
+        string? textureExpectedComponent)
     {
         if (options.HoldSeconds <= 0)
             return;
-        if (options.PressureSampleMs <= 0)
+        if (options.PressureSampleMs <= 0 && options.TextureSampleMs <= 0)
         {
             await Task.Delay(TimeSpan.FromSeconds(options.HoldSeconds));
             return;
         }
 
         var pressureSample = 0;
+        var textureSample = 0;
         var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(options.HoldSeconds);
-        var nextPressure = DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(options.PressureSampleMs);
+        var nextPressure = options.PressureSampleMs > 0
+            ? DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(options.PressureSampleMs)
+            : DateTimeOffset.MaxValue;
+        var nextTexture = options.TextureSampleMs > 0
+            ? DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(options.TextureSampleMs)
+            : DateTimeOffset.MaxValue;
         while (DateTimeOffset.UtcNow < deadline)
         {
             var now = DateTimeOffset.UtcNow;
-            var delay = (nextPressure < deadline ? nextPressure : deadline) - now;
+            var next = nextPressure < nextTexture ? nextPressure : nextTexture;
+            var delay = (next < deadline ? next : deadline) - now;
             if (delay > TimeSpan.Zero)
                 await Task.Delay(delay);
             now = DateTimeOffset.UtcNow;
             if (now >= deadline)
                 break;
-            await CaptureProbeAsync(
-                session,
-                ResearchProbeKind.ReplicationPressure,
-                $"pressure-sample-{pressureSample:D3}",
-                artifactDirectory);
-            ++pressureSample;
-            nextPressure = DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(options.PressureSampleMs);
+            if (now >= nextPressure)
+            {
+                await CaptureProbeAsync(
+                    session,
+                    ResearchProbeKind.ReplicationPressure,
+                    $"pressure-sample-{pressureSample:D3}",
+                    artifactDirectory);
+                ++pressureSample;
+                nextPressure = DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(options.PressureSampleMs);
+            }
+            if (now >= nextTexture)
+            {
+                await CaptureProbeAsync(
+                    session,
+                    ResearchProbeKind.ReplicationTexture,
+                    $"texture-sample-{textureSample:D3}",
+                    artifactDirectory,
+                    options.TextureTarget,
+                    textureExpectedComponent,
+                    preserveTextureBaseline: true);
+                ++textureSample;
+                nextTexture = DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(options.TextureSampleMs);
+            }
         }
     }
 
@@ -982,6 +1019,8 @@ internal static class ResearchRunner
             ?? throw new InvalidOperationException("Normal paint payload was not a JSON object.");
         root["research_stroke_limit"] = options.StrokeLimit;
         root["research_uv_replay_atlas"] = true;
+        if (options.QueueTarget is int queueTarget)
+            root["research_direct_queue_target_strokes"] = queueTarget;
         if (options.ReplayStrokeIndex is int replayStrokeIndex)
             root["research_replay_stroke_index"] = replayStrokeIndex;
         if (options.TargetChannelOverride is int targetChannel)
@@ -1037,9 +1076,11 @@ internal static class ResearchRunner
                 case "--out":
                 case "--hold-seconds":
                 case "--pressure-sample-ms":
+                case "--texture-sample-ms":
                 case "--texture-target":
                 case "--texture-discovery-seconds":
                 case "--stroke-limit":
+                case "--queue-target":
                 case "--replay-stroke-index":
                 case "--target-channel":
                 case "--apply-mode":
@@ -1111,6 +1152,17 @@ internal static class ResearchRunner
         {
             throw new ArgumentException("a non-default --texture-target requires --texture-snapshot.");
         }
+        var textureSampleMs = 0;
+        if (values.TryGetValue("--texture-sample-ms", out var textureSampleText) &&
+            (!int.TryParse(textureSampleText, NumberStyles.None, CultureInfo.InvariantCulture, out textureSampleMs) ||
+             (textureSampleMs != 0 && (textureSampleMs < 250 || textureSampleMs > 10_000))))
+        {
+            throw new ArgumentException("--texture-sample-ms must be 0 or an integer from 250 through 10000.");
+        }
+        if (textureSampleMs > 0 && !textureSnapshot)
+            throw new ArgumentException("--texture-sample-ms requires --texture-snapshot.");
+        if (textureSampleMs > 0 && holdSeconds == 0)
+            throw new ArgumentException("--texture-sample-ms requires a positive --hold-seconds.");
         var textureDiscoverySeconds = 0;
         if (values.TryGetValue("--texture-discovery-seconds", out var discoveryText) &&
             (!int.TryParse(discoveryText, NumberStyles.None, CultureInfo.InvariantCulture, out textureDiscoverySeconds) ||
@@ -1134,6 +1186,19 @@ internal static class ResearchRunner
         {
             throw new ArgumentException("--stroke-limit must be an integer from 0 through 100000; 0 means unlimited.");
         }
+
+        int? queueTarget = null;
+        if (values.TryGetValue("--queue-target", out var queueTargetText))
+        {
+            if (!int.TryParse(queueTargetText, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedQueueTarget) ||
+                parsedQueueTarget < 1 || parsedQueueTarget > 16)
+            {
+                throw new ArgumentException("--queue-target must be an integer from 1 through 16.");
+            }
+            queueTarget = parsedQueueTarget;
+        }
+        if (queueTarget is not null && !paint)
+            throw new ArgumentException("--queue-target requires --paint.");
 
         int? replayStrokeIndex = null;
         if (values.TryGetValue("--replay-stroke-index", out var replayStrokeIndexText))
@@ -1277,9 +1342,11 @@ internal static class ResearchRunner
             holdSeconds,
             pressureSampleMs,
             textureSnapshot,
+            textureSampleMs,
             textureTarget,
             textureDiscoverySeconds,
             strokeLimit,
+            queueTarget,
             replayStrokeIndex,
             targetChannelOverride,
             applyModeOverride,
