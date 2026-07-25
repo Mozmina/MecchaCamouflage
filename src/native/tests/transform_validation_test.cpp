@@ -350,16 +350,14 @@ int main()
     // Natural paint color batching (stage 2/3): strokes must be regrouped so every
     // stroke of one color batch is painted before the next batch starts, like a
     // painter blocking in one color mass at a time, instead of a scanline sweep that
-    // interleaves colors as it crosses the surface. Two Fill entries are included to
-    // confirm the Fill portion is left completely untouched.
+    // interleaves colors as it crosses the surface. The Paint-only candidates are run
+    // through the real planner first (so entries carry real spatial keys); two synthetic
+    // Fill entries are then prepended by hand to confirm the Fill portion is left
+    // completely untouched. (Candidates are built Paint-only here — mixing in Fill-mode
+    // candidates would pull every candidate into the base Fill pass via `fill_all_regions`,
+    // which is unrelated existing behavior this test does not want to exercise.)
     std::vector<runtime_contract::ReplayCandidate> color_batch_candidates{};
-    color_batch_candidates.reserve(14);
-    color_batch_candidates.push_back(
-        {0, runtime_contract::ReplayRegion::Back, runtime_contract::ReplayRegionMode::Fill,
-         0, 0.01, 0.01, true, 100.0, 100.0, -50.0, 0});
-    color_batch_candidates.push_back(
-        {1, runtime_contract::ReplayRegion::Back, runtime_contract::ReplayRegionMode::Fill,
-         0, 0.02, 0.02, true, 100.0, 100.0, -40.0, 1});
+    color_batch_candidates.reserve(12);
     for (int row = 0; row < 4; ++row)
     {
         for (int column = 0; column < 3; ++column)
@@ -374,64 +372,71 @@ int main()
         }
     }
 
-    const auto color_batch_plan = runtime_contract::build_single_brush_replay_plan(
+    const auto color_batch_paint_plan = runtime_contract::build_single_brush_replay_plan(
         color_batch_candidates, 1024, 5.0, 80.0);
-    if (color_batch_plan.entries.size() != color_batch_candidates.size() ||
-        color_batch_plan.fill_end != 2 ||
-        color_batch_plan.paint_count != 12)
+    if (color_batch_paint_plan.entries.size() != color_batch_candidates.size() ||
+        color_batch_paint_plan.fill_end != 0 ||
+        color_batch_paint_plan.paint_count != 12)
     {
         return 40;
     }
 
     std::vector<runtime_contract::ReplaySampleColor> color_batch_sample_colors(color_batch_candidates.size());
-    for (std::size_t index = 2; index < color_batch_candidates.size(); ++index)
+    for (std::size_t index = 0; index < color_batch_candidates.size(); ++index)
     {
         color_batch_sample_colors[index] = (index % 2 == 0)
             ? runtime_contract::ReplaySampleColor{0.9, 0.05, 0.05}
             : runtime_contract::ReplaySampleColor{0.05, 0.05, 0.9};
     }
 
-    auto color_batch_entries = color_batch_plan.entries;
-    const std::vector<runtime_contract::ReplayEntry> fill_entries_before(
-        color_batch_entries.begin(),
-        color_batch_entries.begin() + static_cast<std::ptrdiff_t>(color_batch_plan.fill_end));
+    constexpr std::size_t color_batch_fill_end = 2;
+    const std::vector<runtime_contract::ReplayEntry> color_batch_fill_entries{
+        {100, runtime_contract::ReplayPass::Fill, runtime_contract::ReplayRegion::Back, {0, 0.0, 0}},
+        {101, runtime_contract::ReplayPass::Fill, runtime_contract::ReplayRegion::Back, {0, 1.0, 1}},
+    };
+
+    auto color_batch_entries = color_batch_fill_entries;
+    color_batch_entries.insert(color_batch_entries.end(),
+                               color_batch_paint_plan.entries.begin(),
+                               color_batch_paint_plan.entries.end());
+    if (color_batch_entries.size() != color_batch_fill_end + color_batch_candidates.size())
+    {
+        return 40;
+    }
 
     runtime_contract::reorder_paint_entries_by_color_batch(
         color_batch_entries,
-        color_batch_plan.fill_end,
+        color_batch_fill_end,
         color_batch_sample_colors,
         runtime_contract::ColorBatchOptions{true, 0.3, 8, 555u});
 
-    for (std::size_t index = 0; index < color_batch_plan.fill_end; ++index)
+    for (std::size_t index = 0; index < color_batch_fill_end; ++index)
     {
-        if (color_batch_entries[index].sample_index != fill_entries_before[index].sample_index)
+        if (color_batch_entries[index].sample_index != color_batch_fill_entries[index].sample_index)
         {
             return 41;
         }
     }
 
-    std::array<bool, 14> color_batch_seen{};
-    for (std::size_t index = color_batch_plan.fill_end; index < color_batch_entries.size(); ++index)
+    std::array<bool, 12> color_batch_seen{};
+    for (std::size_t index = color_batch_fill_end; index < color_batch_entries.size(); ++index)
     {
         const auto sample_index = color_batch_entries[index].sample_index;
-        if (sample_index < 2 || sample_index >= color_batch_seen.size() || color_batch_seen[sample_index])
+        if (sample_index >= color_batch_seen.size() || color_batch_seen[sample_index])
         {
             return 42;
         }
         color_batch_seen[sample_index] = true;
     }
-    for (std::size_t index = 2; index < color_batch_seen.size(); ++index)
+    if (std::any_of(color_batch_seen.begin(), color_batch_seen.end(), [](bool value) { return !value; }))
     {
-        if (!color_batch_seen[index])
-        {
-            return 42;
-        }
+        return 42;
     }
 
     int color_batch_switch_count = 0;
     bool have_previous_color_batch = false;
     bool previous_is_red = false;
-    for (std::size_t index = color_batch_plan.fill_end; index < color_batch_entries.size(); ++index)
+    for (std::size_t index = color_batch_fill_end; index < color_batch_entries.size(); ++index)
     {
         const auto sample_index = color_batch_entries[index].sample_index;
         const bool is_red = (sample_index % 2 == 0);
@@ -447,10 +452,13 @@ int main()
         return 43;
     }
 
-    auto color_batch_entries_repeat = color_batch_plan.entries;
+    auto color_batch_entries_repeat = color_batch_fill_entries;
+    color_batch_entries_repeat.insert(color_batch_entries_repeat.end(),
+                                      color_batch_paint_plan.entries.begin(),
+                                      color_batch_paint_plan.entries.end());
     runtime_contract::reorder_paint_entries_by_color_batch(
         color_batch_entries_repeat,
-        color_batch_plan.fill_end,
+        color_batch_fill_end,
         color_batch_sample_colors,
         runtime_contract::ColorBatchOptions{true, 0.3, 8, 555u});
     for (std::size_t index = 0; index < color_batch_entries.size(); ++index)
