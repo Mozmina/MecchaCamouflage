@@ -65,6 +65,7 @@ Core development references:
 - [Paint replication validation](docs/runtime-paint-replication-validation.md)
 - [Research tools](docs/research-tools.md)
 - [Release checklist](docs/release-checklist.md)
+- [Feature roadmap](docs/roadmap.md)
 
 ## License
 

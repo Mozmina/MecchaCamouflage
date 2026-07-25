@@ -9680,6 +9680,17 @@ namespace
                                             : -1;
         const bool research_uv_replay_atlas =
             research_artifacts && json_bool_field(request, "research_uv_replay_atlas", false);
+        const bool tuning_natural_stroke_order = json_bool_field(request, "natural_stroke_order", false);
+        const std::uint32_t tuning_natural_stroke_order_seed =
+            static_cast<std::uint32_t>(json_int_field(request, "natural_stroke_order_seed", 0, 0, 2147483647));
+        const bool tuning_flat_average_color = json_bool_field(request, "paint_flat_average_color", false);
+        const bool tuning_color_batch_enabled = json_bool_field(request, "natural_color_batch_enabled", false);
+        const double tuning_color_batch_split_threshold =
+            clamp_range(json_number_field(request, "natural_color_batch_split_threshold", 0.12), 0.0, 1.0);
+        const int tuning_color_batch_max_clusters =
+            json_int_field(request, "natural_color_batch_max_clusters", 8, 1, 64);
+        const std::uint32_t tuning_color_batch_seed =
+            static_cast<std::uint32_t>(json_int_field(request, "natural_color_batch_seed", 0, 0, 2147483647));
         const double tuning_brush_size_texels =
             clamp_range(json_number_field(request, "brush_size_texels", 4.0), 1.0, 10.0);
         const double tuning_color_compression_tolerance =
@@ -10564,6 +10575,55 @@ namespace
             {
                 return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
             }
+            // Natural paint stage 1 ("base coat"): once real colors are captured, replace
+            // every enabled, safe sample's color with the mean color across those samples,
+            // so this pass paints one flat tone that matches the surface's real average
+            // instead of an arbitrary configured Fill color.
+            if (tuning_flat_average_color)
+            {
+                double average_sum_r = 0.0;
+                double average_sum_g = 0.0;
+                double average_sum_b = 0.0;
+                int average_sample_count = 0;
+                for (const auto& sample : plan_samples)
+                {
+                    const bool region_enabled = (sample.region == MeshFirstRegion::Front && enable_front) ||
+                                                (sample.region == MeshFirstRegion::Side && enable_side) ||
+                                                (sample.region == MeshFirstRegion::Back && enable_back);
+                    if (!region_enabled || sample.unsafe)
+                    {
+                        continue;
+                    }
+                    average_sum_r += sample.r;
+                    average_sum_g += sample.g;
+                    average_sum_b += sample.b;
+                    ++average_sample_count;
+                }
+                metadata += ",\"paint_flat_average_color_applied\":" +
+                            std::string(json_bool(average_sample_count > 0));
+                if (average_sample_count > 0)
+                {
+                    const double average_r = clamp01(average_sum_r / average_sample_count);
+                    const double average_g = clamp01(average_sum_g / average_sample_count);
+                    const double average_b = clamp01(average_sum_b / average_sample_count);
+                    for (auto& sample : plan_samples)
+                    {
+                        const bool region_enabled = (sample.region == MeshFirstRegion::Front && enable_front) ||
+                                                    (sample.region == MeshFirstRegion::Side && enable_side) ||
+                                                    (sample.region == MeshFirstRegion::Back && enable_back);
+                        if (!region_enabled || sample.unsafe)
+                        {
+                            continue;
+                        }
+                        sample.r = average_r;
+                        sample.g = average_g;
+                        sample.b = average_b;
+                    }
+                    metadata += ",\"paint_flat_average_color_r\":" + std::to_string(average_r);
+                    metadata += ",\"paint_flat_average_color_g\":" + std::to_string(average_g);
+                    metadata += ",\"paint_flat_average_color_b\":" + std::to_string(average_b);
+                }
+            }
         }
         else
         {
@@ -10742,7 +10802,27 @@ namespace
             replay_candidates,
             active_texture_size,
             tuning_brush_size_texels,
-            fill_stroke_radius_texels);
+            fill_stroke_radius_texels,
+            runtime_contract::NaturalOrderOptions{tuning_natural_stroke_order,
+                                                   tuning_natural_stroke_order_seed});
+        if (tuning_color_batch_enabled)
+        {
+            std::vector<runtime_contract::ReplaySampleColor> replay_sample_colors;
+            replay_sample_colors.reserve(plan_samples.size());
+            for (const auto& sample : plan_samples)
+            {
+                replay_sample_colors.push_back({sample.r, sample.g, sample.b});
+            }
+            runtime_contract::reorder_paint_entries_by_color_batch(
+                replay_plan.entries,
+                replay_plan.fill_end,
+                replay_sample_colors,
+                runtime_contract::ColorBatchOptions{tuning_color_batch_enabled,
+                                                    tuning_color_batch_split_threshold,
+                                                    tuning_color_batch_max_clusters,
+                                                    tuning_color_batch_seed});
+        }
+        metadata += ",\"replay_natural_color_batch_enabled\":" + std::string(json_bool(tuning_color_batch_enabled));
         if (research_replay_stroke_index >= 0)
         {
             const auto selected = static_cast<std::size_t>(research_replay_stroke_index);
@@ -10927,7 +11007,8 @@ namespace
                 ++replay_spatial_sort_partitions;
                 have_previous_partition_entry = true;
             }
-            else if (runtime_contract::spatial_scanline_less(entry.spatial_key,
+            else if (!tuning_natural_stroke_order &&
+                     runtime_contract::spatial_scanline_less(entry.spatial_key,
                                                              previous_spatial_key))
             {
                 ++replay_spatial_order_violations;
@@ -11105,6 +11186,7 @@ namespace
         metadata += ",\"replay_fill_end\":" + std::to_string(replay_plan.fill_end);
         metadata += ",\"replay_paint_begin\":" + std::to_string(replay_plan.fill_end);
         metadata += ",\"replay_spatial_order\":\"current_pose_camera_scanline_before_adaptive_radius_order\"";
+        metadata += ",\"replay_natural_stroke_order\":" + std::string(json_bool(tuning_natural_stroke_order));
         metadata += ",\"replay_spatial_current_view_vertical_min\":" +
                     std::to_string(replay_current_view_vertical_min);
         metadata += ",\"replay_spatial_current_view_vertical_max\":" +

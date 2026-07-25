@@ -47,7 +47,9 @@ public sealed record PaintSnapshot(
     bool UsesFill,
     double ColorCompressionTolerance = 0.0,
     double SecondPassBrushSizeTexels = 1.0,
-    double SecondPassColorCompressionTolerance = 0.0);
+    double SecondPassColorCompressionTolerance = 0.0,
+    double NaturalPaintJitterPercent = 25.0,
+    int NaturalPaintLayerCount = 3);
 
 public sealed record AppSnapshot(
     string ProcessName,
@@ -58,7 +60,9 @@ public sealed record AppSnapshot(
     string PreviewHotkey,
     string UnPreviewHotkey,
     string StopHotkey,
-    string SecondPassHotkey = "F5");
+    string SecondPassHotkey = "F5",
+    string NaturalFirstPassHotkey = "F6",
+    string NaturalSecondPassHotkey = "F7");
 
 public sealed record ResetSnapshot(
     IReadOnlyDictionary<string, bool> Settings,
@@ -87,10 +91,18 @@ public sealed record ProgressSnapshot(
     int ReplayCurrentPassTotal = -1,
     double ReplayCurrentPassEtaMs = -1.0);
 
-public sealed record HotkeySet(string Start, string Preview, string UnPreview, string Stop, string SecondPass)
+public sealed record HotkeySet(
+    string Start,
+    string Preview,
+    string UnPreview,
+    string Stop,
+    string SecondPass,
+    string NaturalFirst,
+    string NaturalSecond)
 {
     public static HotkeySet From(AppSettings settings) =>
-        new(settings.StartHotkey, settings.PreviewHotkey, settings.UnPreviewHotkey, settings.StopHotkey, settings.SecondPassHotkey);
+        new(settings.StartHotkey, settings.PreviewHotkey, settings.UnPreviewHotkey, settings.StopHotkey,
+            settings.SecondPassHotkey, settings.NaturalFirstPassHotkey, settings.NaturalSecondPassHotkey);
 
     public void ApplyTo(AppSettings settings)
     {
@@ -99,12 +111,14 @@ public sealed record HotkeySet(string Start, string Preview, string UnPreview, s
         settings.UnPreviewHotkey = UnPreview;
         settings.StopHotkey = Stop;
         settings.SecondPassHotkey = SecondPass;
+        settings.NaturalFirstPassHotkey = NaturalFirst;
+        settings.NaturalSecondPassHotkey = NaturalSecond;
     }
 
     public bool TryValidate(out string message)
     {
         message = "";
-        var values = new[] { Start, Preview, UnPreview, Stop, SecondPass };
+        var values = new[] { Start, Preview, UnPreview, Stop, SecondPass, NaturalFirst, NaturalSecond };
         foreach (var value in values)
         {
             if (!IsFunctionKey(value))

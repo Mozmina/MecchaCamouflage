@@ -34,7 +34,11 @@ public sealed class HostSession
         "app.previewHotkey",
         "app.unpreviewHotkey",
         "app.stopHotkey",
-        "app.secondPassHotkey"
+        "app.secondPassHotkey",
+        "paint.naturalPaintJitterPercent",
+        "paint.naturalPaintLayerCount",
+        "app.naturalFirstPassHotkey",
+        "app.naturalSecondPassHotkey"
     ];
 
     private enum PaintCancelState
@@ -85,6 +89,10 @@ public sealed class HostSession
     // least once since this process launched. This is intentionally in-memory only: it
     // resets every time the app starts, it is never persisted to settings.
     private bool hasCompletedFirstPass;
+    // The natural second pass (F7) may only run after a natural first pass (F6) has
+    // completed at least once since this process launched, mirroring hasCompletedFirstPass.
+    private bool hasCompletedNaturalFirstPass;
+    private readonly Random naturalPaintRandom = new();
 
     public async Task<UiSnapshot> GetSnapshotAsync(CancellationToken cancellationToken = default)
     {
@@ -193,6 +201,8 @@ public sealed class HostSession
                 next.Paint.ColorCompressionTolerance = defaults.Paint.ColorCompressionTolerance;
                 next.Paint.SecondPassBrushSizeTexels = defaults.Paint.SecondPassBrushSizeTexels;
                 next.Paint.SecondPassColorCompressionTolerance = defaults.Paint.SecondPassColorCompressionTolerance;
+                next.Paint.NaturalPaintJitterPercent = defaults.Paint.NaturalPaintJitterPercent;
+                next.Paint.NaturalPaintLayerCount = defaults.Paint.NaturalPaintLayerCount;
                 break;
             case "paint.material":
             case "material":
@@ -223,6 +233,8 @@ public sealed class HostSession
                 next.UnPreviewHotkey = defaults.UnPreviewHotkey;
                 next.StopHotkey = defaults.StopHotkey;
                 next.SecondPassHotkey = defaults.SecondPassHotkey;
+                next.NaturalFirstPassHotkey = defaults.NaturalFirstPassHotkey;
+                next.NaturalSecondPassHotkey = defaults.NaturalSecondPassHotkey;
                 break;
             default:
                 return new HostCommandResult(false, $"Unknown section: {section}");
@@ -257,7 +269,20 @@ public sealed class HostSession
         Store.Save(Settings);
     }
 
-    public async Task<HostCommandResult> RunPaintAsync(bool previewOnly, bool unpreviewOnly, bool secondPass = false, CancellationToken cancellationToken = default)
+    public async Task<HostCommandResult> RunPaintAsync(
+        bool previewOnly,
+        bool unpreviewOnly,
+        bool secondPass = false,
+        CancellationToken cancellationToken = default,
+        AppSettings? settingsOverride = null,
+        string? startedMessageOverride = null,
+        bool naturalStrokeOrder = false,
+        int naturalStrokeOrderSeed = 0,
+        bool flatAverageColor = false,
+        bool naturalColorBatchEnabled = false,
+        double naturalColorBatchSplitThreshold = 0.12,
+        int naturalColorBatchMaxClusters = 8,
+        int naturalColorBatchSeed = 0)
     {
         if (secondPass && !hasCompletedFirstPass)
         {
@@ -303,9 +328,10 @@ public sealed class HostSession
             }
             if (!ready)
                 return new HostCommandResult(false, "Bridge is not connected.");
-            var startedMessage = previewOnly ? "Preview: started." : (unpreviewOnly ? "UnPreview: started." : (secondPass ? "Second pass: started." : "Paint: started."));
+            var startedMessage = startedMessageOverride ??
+                (previewOnly ? "Preview: started." : (unpreviewOnly ? "UnPreview: started." : (secondPass ? "Second pass: started." : "Paint: started.")));
             Log.Info(startedMessage);
-            var effectiveSettings = secondPass ? BuildSecondPassSettings(Settings) : Settings;
+            var effectiveSettings = settingsOverride ?? (secondPass ? BuildSecondPassSettings(Settings) : Settings);
             var payload = BridgePayloadBuilder.BuildPaintPayload(
                 effectiveSettings,
                 process.Id,
@@ -314,7 +340,14 @@ public sealed class HostSession
                     PreviewOnly: previewOnly,
                     UnPreviewOnly: unpreviewOnly,
                     ResearchArtifacts: BuildFeatures.ResearchArtifactsEnabled,
-                    DiagnosticStrokeLimit: diagnosticStrokeLimit));
+                    DiagnosticStrokeLimit: diagnosticStrokeLimit,
+                    NaturalStrokeOrder: naturalStrokeOrder,
+                    NaturalStrokeOrderSeed: naturalStrokeOrderSeed,
+                    FlatAverageColor: flatAverageColor,
+                    NaturalColorBatchEnabled: naturalColorBatchEnabled,
+                    NaturalColorBatchSplitThreshold: naturalColorBatchSplitThreshold,
+                    NaturalColorBatchMaxClusters: naturalColorBatchMaxClusters,
+                    NaturalColorBatchSeed: naturalColorBatchSeed));
             if (!TryBeginPaintDispatch(runGeneration))
             {
                 const string canceledBeforeDispatch = "Paint: canceled.";
@@ -391,6 +424,106 @@ public sealed class HostSession
             }
             currentProgressIsServerPaint = false;
         }
+    }
+
+    /// <summary>
+    /// "Natural paint" mimics how a person actually paints, in three stages, instead of a
+    /// single mechanically-uniform pass. The first natural pass (F6) runs all three stages in
+    /// sequence:
+    ///   1. Base coat — one flat pass using the real average color detected across the
+    ///      surface, like a painter blocking in the dominant tone before anything else.
+    ///   2. Color blocks — strokes are grouped into color batches (the number of batches
+    ///      adapts automatically to how colorful the design is) and each batch is painted as
+    ///      one contiguous block, largest color mass first, instead of a left-to-right sweep.
+    ///   3. Detail — a final pass with stroke merging disabled and much finer color batches,
+    ///      so remaining differences get painted one color at a time.
+    /// The second natural pass (F7) is gated on the first having completed at least once, and
+    /// continues that work with one more, even finer detail-only pass (second-pass brush size
+    /// and tolerance, tighter color batches) — it does not repeat the base coat or color-block
+    /// stages, and — like the regular second pass — only re-touches regions already set to
+    /// Paint. Nothing here mutates the persisted settings, and nothing here touches the native
+    /// bridge directly; every stage is a full, independent request through
+    /// <see cref="RunPaintAsync"/>.
+    /// </summary>
+    public async Task<HostCommandResult> RunNaturalPaintAsync(bool secondPass, CancellationToken cancellationToken = default)
+    {
+        if (secondPass && !hasCompletedNaturalFirstPass)
+        {
+            const string gated = "Natural paint (2nd pass): run the natural first pass (F6) at least once first.";
+            Log.Warn(gated);
+            return new HostCommandResult(false, gated);
+        }
+
+        if (secondPass)
+        {
+            var detailSettings = BuildSecondPassSettings(Settings);
+            detailSettings.Paint.ColorCompressionTolerance = 0.0;
+            var detailSeed = naturalPaintRandom.Next(0, int.MaxValue);
+            return await RunPaintAsync(
+                previewOnly: false,
+                unpreviewOnly: false,
+                secondPass: false,
+                cancellationToken,
+                settingsOverride: detailSettings,
+                startedMessageOverride: "Natural paint (2nd pass, detail fin): started.",
+                naturalColorBatchEnabled: true,
+                naturalColorBatchSplitThreshold: 0.02,
+                naturalColorBatchMaxClusters: 48,
+                naturalColorBatchSeed: detailSeed);
+        }
+
+        // Stage 1/3 — base coat: one flat pass at the surface's real average color.
+        var baseSettings = Clone(Settings);
+        var baseSeed = naturalPaintRandom.Next(0, int.MaxValue);
+        var stage1 = await RunPaintAsync(
+            previewOnly: false,
+            unpreviewOnly: false,
+            secondPass: false,
+            cancellationToken,
+            settingsOverride: baseSettings,
+            startedMessageOverride: "Natural paint (1/3, couche de base): started.",
+            naturalStrokeOrder: true,
+            naturalStrokeOrderSeed: baseSeed,
+            flatAverageColor: true);
+        if (!stage1.Success)
+            return stage1;
+
+        // Stage 2/3 — color blocks: batch by real captured color, biggest mass first.
+        var blockSettings = Clone(Settings);
+        var blockSeed = naturalPaintRandom.Next(0, int.MaxValue);
+        var stage2 = await RunPaintAsync(
+            previewOnly: false,
+            unpreviewOnly: false,
+            secondPass: false,
+            cancellationToken,
+            settingsOverride: blockSettings,
+            startedMessageOverride: "Natural paint (2/3, blocs de couleur): started.",
+            naturalColorBatchEnabled: true,
+            naturalColorBatchSplitThreshold: 0.12,
+            naturalColorBatchMaxClusters: 8,
+            naturalColorBatchSeed: blockSeed);
+        if (!stage2.Success)
+            return stage2;
+
+        // Stage 3/3 — detail: no stroke merging, much finer color batches.
+        var detailStageSettings = Clone(Settings);
+        detailStageSettings.Paint.ColorCompressionTolerance = 0.0;
+        var detailStageSeed = naturalPaintRandom.Next(0, int.MaxValue);
+        var stage3 = await RunPaintAsync(
+            previewOnly: false,
+            unpreviewOnly: false,
+            secondPass: false,
+            cancellationToken,
+            settingsOverride: detailStageSettings,
+            startedMessageOverride: "Natural paint (3/3, detail par couleur): started.",
+            naturalColorBatchEnabled: true,
+            naturalColorBatchSplitThreshold: 0.03,
+            naturalColorBatchMaxClusters: 32,
+            naturalColorBatchSeed: detailStageSeed);
+
+        if (stage3.Success)
+            hasCompletedNaturalFirstPass = true;
+        return stage3;
     }
 
     public async Task<HostCommandResult> StopPaintAsync(CancellationToken cancellationToken = default)
@@ -637,14 +770,37 @@ public sealed class HostSession
             }
             string[] fields =
             [
-                "local_visual_sync_failure"
+                "local_visual_sync_failure",
+                // Surfaced when a paint request is blocked because the mesh-first planner found
+                // "unsafe color-transfer candidates" (the friendly "mesh sampling was unsafe"
+                // message). These break down exactly which regions and which sampling strategy
+                // failed, instead of leaving the log with only the generic message.
+                "unsafe_enabled",
+                "unsafe_candidates",
+                "unsafe_front",
+                "unsafe_side",
+                "unsafe_back",
+                "unsafe_projection_color",
+                "unsafe_body_region",
+                "unsafe_limb_group",
+                "unsafe_source_distance",
+                "source_projection_color_available",
+                "front_capture_ok",
+                "front_capture_failure"
             ];
             var parts = new List<string>();
             foreach (var field in fields)
             {
-                if (!metadata.TryGetProperty(field, out var value) || value.ValueKind != JsonValueKind.String)
+                if (!metadata.TryGetProperty(field, out var value))
                     continue;
-                var text = value.GetString();
+                string? text = value.ValueKind switch
+                {
+                    JsonValueKind.String => value.GetString(),
+                    JsonValueKind.Number => value.ToString(),
+                    JsonValueKind.True => "true",
+                    JsonValueKind.False => "false",
+                    _ => null
+                };
                 if (string.IsNullOrWhiteSpace(text))
                     continue;
                 parts.Add(field + "=" + text);
@@ -898,7 +1054,9 @@ public sealed class HostSession
                 paint.UsesFill,
                 paint.ColorCompressionTolerance,
                 paint.SecondPassBrushSizeTexels,
-                paint.SecondPassColorCompressionTolerance),
+                paint.SecondPassColorCompressionTolerance,
+                paint.NaturalPaintJitterPercent,
+                paint.NaturalPaintLayerCount),
             new AppSnapshot(
                 settings.GameProcessName,
                 settings.AlwaysOnTop,
@@ -908,7 +1066,9 @@ public sealed class HostSession
                 settings.PreviewHotkey,
                 settings.UnPreviewHotkey,
                 settings.StopHotkey,
-                settings.SecondPassHotkey));
+                settings.SecondPassHotkey,
+                settings.NaturalFirstPassHotkey,
+                settings.NaturalSecondPassHotkey));
     }
 
     private static ResetSnapshot BuildResetSnapshot(AppSettings settings, AppSettings defaults)
@@ -917,13 +1077,14 @@ public sealed class HostSession
         var sections = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
         {
             ["paint.geometry"] = map["paint.brushSizeTexels"] || map["paint.colorCompressionTolerance"] ||
-                    map["paint.secondPassBrushSizeTexels"] || map["paint.secondPassColorCompressionTolerance"],
+                    map["paint.secondPassBrushSizeTexels"] || map["paint.secondPassColorCompressionTolerance"] ||
+                    map["paint.naturalPaintJitterPercent"] || map["paint.naturalPaintLayerCount"],
             ["paint.material"] = map["paint.autoMaterial"] || map["paint.metallic"] || map["paint.roughness"] || map["paint.emissive"],
             ["regions"] = map["paint.frontRegionMode"] || map["paint.sideRegionMode"] || map["paint.backRegionMode"],
             ["fill.material"] = map["paint.fillColor"] || map["paint.fillMetallic"] || map["paint.fillRoughness"] || map["paint.fillEmissive"],
             ["app"] = map["app.processName"] || map["app.alwaysOnTop"] || map["app.opacity"] || map["app.themeColor"] ||
                     map["app.startHotkey"] || map["app.previewHotkey"] || map["app.unpreviewHotkey"] || map["app.stopHotkey"] ||
-                    map["app.secondPassHotkey"]
+                    map["app.secondPassHotkey"] || map["app.naturalFirstPassHotkey"] || map["app.naturalSecondPassHotkey"]
         };
         return new ResetSnapshot(map, sections);
     }
@@ -945,6 +1106,8 @@ public sealed class HostSession
         "paint.colorCompressionTolerance" => Nearly(left.Paint.ColorCompressionTolerance, right.Paint.ColorCompressionTolerance),
         "paint.secondPassBrushSizeTexels" => Nearly(left.Paint.SecondPassBrushSizeTexels, right.Paint.SecondPassBrushSizeTexels),
         "paint.secondPassColorCompressionTolerance" => Nearly(left.Paint.SecondPassColorCompressionTolerance, right.Paint.SecondPassColorCompressionTolerance),
+        "paint.naturalPaintJitterPercent" => Nearly(left.Paint.NaturalPaintJitterPercent, right.Paint.NaturalPaintJitterPercent),
+        "paint.naturalPaintLayerCount" => left.Paint.NaturalPaintLayerCount == right.Paint.NaturalPaintLayerCount,
         "app.processName" => left.GameProcessName == right.GameProcessName,
         "app.alwaysOnTop" => left.AlwaysOnTop == right.AlwaysOnTop,
         "app.opacity" => Nearly(left.Opacity, right.Opacity),
@@ -954,6 +1117,8 @@ public sealed class HostSession
         "app.unpreviewHotkey" => left.UnPreviewHotkey == right.UnPreviewHotkey,
         "app.stopHotkey" => left.StopHotkey == right.StopHotkey,
         "app.secondPassHotkey" => left.SecondPassHotkey == right.SecondPassHotkey,
+        "app.naturalFirstPassHotkey" => left.NaturalFirstPassHotkey == right.NaturalFirstPassHotkey,
+        "app.naturalSecondPassHotkey" => left.NaturalSecondPassHotkey == right.NaturalSecondPassHotkey,
         _ => true
     };
 
@@ -976,6 +1141,8 @@ public sealed class HostSession
             case "paint.colorCompressionTolerance": settings.Paint.ColorCompressionTolerance = defaults.Paint.ColorCompressionTolerance; break;
             case "paint.secondPassBrushSizeTexels": settings.Paint.SecondPassBrushSizeTexels = defaults.Paint.SecondPassBrushSizeTexels; break;
             case "paint.secondPassColorCompressionTolerance": settings.Paint.SecondPassColorCompressionTolerance = defaults.Paint.SecondPassColorCompressionTolerance; break;
+            case "paint.naturalPaintJitterPercent": settings.Paint.NaturalPaintJitterPercent = defaults.Paint.NaturalPaintJitterPercent; break;
+            case "paint.naturalPaintLayerCount": settings.Paint.NaturalPaintLayerCount = defaults.Paint.NaturalPaintLayerCount; break;
             case "app.processName": settings.GameProcessName = defaults.GameProcessName; break;
             case "app.alwaysOnTop": settings.AlwaysOnTop = defaults.AlwaysOnTop; break;
             case "app.opacity": settings.Opacity = defaults.Opacity; break;
@@ -985,6 +1152,8 @@ public sealed class HostSession
             case "app.unpreviewHotkey": settings.UnPreviewHotkey = defaults.UnPreviewHotkey; break;
             case "app.stopHotkey": settings.StopHotkey = defaults.StopHotkey; break;
             case "app.secondPassHotkey": settings.SecondPassHotkey = defaults.SecondPassHotkey; break;
+            case "app.naturalFirstPassHotkey": settings.NaturalFirstPassHotkey = defaults.NaturalFirstPassHotkey; break;
+            case "app.naturalSecondPassHotkey": settings.NaturalSecondPassHotkey = defaults.NaturalSecondPassHotkey; break;
             default: throw new ArgumentException($"Unknown setting: {key}");
         }
     }
@@ -1012,6 +1181,8 @@ public sealed class HostSession
             case "paint.colorCompressionTolerance": settings.Paint.ColorCompressionTolerance = value.GetDouble(); break;
             case "paint.secondPassBrushSizeTexels": settings.Paint.SecondPassBrushSizeTexels = value.GetDouble(); break;
             case "paint.secondPassColorCompressionTolerance": settings.Paint.SecondPassColorCompressionTolerance = value.GetDouble(); break;
+            case "paint.naturalPaintJitterPercent": settings.Paint.NaturalPaintJitterPercent = value.GetDouble(); break;
+            case "paint.naturalPaintLayerCount": settings.Paint.NaturalPaintLayerCount = RoundedInteger(value); break;
             case "app.language": settings.Language = value.GetString() ?? settings.Language; break;
             case "app.processName": settings.GameProcessName = value.GetString() ?? settings.GameProcessName; break;
             case "app.alwaysOnTop": settings.AlwaysOnTop = value.GetBoolean(); break;
@@ -1026,6 +1197,8 @@ public sealed class HostSession
             case "app.unpreviewHotkey": settings.UnPreviewHotkey = HotkeySet.Normalize(value.GetString()); break;
             case "app.stopHotkey": settings.StopHotkey = HotkeySet.Normalize(value.GetString()); break;
             case "app.secondPassHotkey": settings.SecondPassHotkey = HotkeySet.Normalize(value.GetString()); break;
+            case "app.naturalFirstPassHotkey": settings.NaturalFirstPassHotkey = HotkeySet.Normalize(value.GetString()); break;
+            case "app.naturalSecondPassHotkey": settings.NaturalSecondPassHotkey = HotkeySet.Normalize(value.GetString()); break;
             default: throw new ArgumentException($"Unknown setting: {key}");
         }
     }

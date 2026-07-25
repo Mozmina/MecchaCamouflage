@@ -258,6 +258,12 @@ body.editing .group-title {
   gap: 4px;
 }
 
+.setting-note {
+  margin: 0;
+  color: var(--muted);
+  font: 400 12px/18px var(--font-ui);
+}
+
 .field > span,
 .brush-toggle > span,
 .hotkey-row > span {

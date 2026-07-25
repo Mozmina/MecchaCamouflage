@@ -804,18 +804,21 @@ static void NativeProgressExposesReplayPassState()
 
 static void HotkeyValidationRejectsDuplicates()
 {
-    var hotkeys = new HotkeySet("F1", "F1", "F3", "F4", "F5");
+    var hotkeys = new HotkeySet("F1", "F1", "F3", "F4", "F5", "F6", "F7");
     Assert(!hotkeys.TryValidate(out var message), "duplicate hotkeys should be rejected");
     Assert(message.Contains("duplicated", StringComparison.OrdinalIgnoreCase), "duplicate message should explain the problem");
 
-    var invalid = new HotkeySet("A", "F2", "F3", "F4", "F5");
+    var invalid = new HotkeySet("A", "F2", "F3", "F4", "F5", "F6", "F7");
     Assert(!invalid.TryValidate(out _), "non-function hotkeys should be rejected");
 
-    var validWithSecondPass = new HotkeySet("F1", "F2", "F3", "F4", "F5");
-    Assert(validWithSecondPass.TryValidate(out _), "five distinct function-key hotkeys should be accepted");
+    var validWithSecondPass = new HotkeySet("F1", "F2", "F3", "F4", "F5", "F6", "F7");
+    Assert(validWithSecondPass.TryValidate(out _), "seven distinct function-key hotkeys should be accepted");
 
-    var duplicateSecondPass = new HotkeySet("F1", "F2", "F3", "F4", "F1");
+    var duplicateSecondPass = new HotkeySet("F1", "F2", "F3", "F4", "F1", "F6", "F7");
     Assert(!duplicateSecondPass.TryValidate(out _), "second pass hotkey duplicating another hotkey should be rejected");
+
+    var duplicateNaturalPass = new HotkeySet("F1", "F2", "F3", "F4", "F5", "F6", "F6");
+    Assert(!duplicateNaturalPass.TryValidate(out _), "natural pass hotkeys duplicating each other should be rejected");
 }
 
 static void HostSessionResetRestoresDefault()

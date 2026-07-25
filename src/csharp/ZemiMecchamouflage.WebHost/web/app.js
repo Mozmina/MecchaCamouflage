@@ -26,7 +26,9 @@ const hotkeyKeys = [
   "app.previewHotkey",
   "app.unpreviewHotkey",
   "app.stopHotkey",
-  "app.secondPassHotkey"
+  "app.secondPassHotkey",
+  "app.naturalFirstPassHotkey",
+  "app.naturalSecondPassHotkey"
 ];
 
 let liveSnapshot = null;
@@ -289,6 +291,8 @@ function renderSettings(snapshot) {
   setValue("unpreview-hotkey", app.unPreviewHotkey);
   setValue("stop-hotkey", app.stopHotkey);
   setValue("second-pass-hotkey", app.secondPassHotkey);
+  setValue("natural-first-pass-hotkey", app.naturalFirstPassHotkey);
+  setValue("natural-second-pass-hotkey", app.naturalSecondPassHotkey);
 
   const language = byId("language");
   if (language.options.length === 0) {
@@ -554,7 +558,9 @@ function diffSnapshots(before, after) {
     "app.previewHotkey",
     "app.unpreviewHotkey",
     "app.stopHotkey",
-    "app.secondPassHotkey"
+    "app.secondPassHotkey",
+    "app.naturalFirstPassHotkey",
+    "app.naturalSecondPassHotkey"
   ];
   const changes = [];
   for (const key of keys) {

@@ -7,7 +7,14 @@ public sealed record PaintRequestOptions(
     bool PreviewOnly = false,
     bool UnPreviewOnly = false,
     bool ResearchArtifacts = false,
-    int DiagnosticStrokeLimit = 0);
+    int DiagnosticStrokeLimit = 0,
+    bool NaturalStrokeOrder = false,
+    int NaturalStrokeOrderSeed = 0,
+    bool FlatAverageColor = false,
+    bool NaturalColorBatchEnabled = false,
+    double NaturalColorBatchSplitThreshold = 0.12,
+    int NaturalColorBatchMaxClusters = 8,
+    int NaturalColorBatchSeed = 0);
 
 public static class BridgePayloadBuilder
 {
@@ -46,7 +53,14 @@ public static class BridgePayloadBuilder
                 ["fill_metallic"] = paint.FillMetallic,
                 ["fill_roughness"] = paint.FillRoughness,
                 ["fill_emissive"] = paint.FillEmissive,
-                ["color_compression_tolerance"] = paint.ColorCompressionTolerance
+                ["color_compression_tolerance"] = paint.ColorCompressionTolerance,
+                ["natural_stroke_order"] = options.NaturalStrokeOrder,
+                ["natural_stroke_order_seed"] = options.NaturalStrokeOrderSeed,
+                ["paint_flat_average_color"] = options.FlatAverageColor,
+                ["natural_color_batch_enabled"] = options.NaturalColorBatchEnabled,
+                ["natural_color_batch_split_threshold"] = options.NaturalColorBatchSplitThreshold,
+                ["natural_color_batch_max_clusters"] = options.NaturalColorBatchMaxClusters,
+                ["natural_color_batch_seed"] = options.NaturalColorBatchSeed
             }
         };
         if (options.DiagnosticStrokeLimit > 0)

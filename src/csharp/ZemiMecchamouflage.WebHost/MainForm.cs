@@ -20,6 +20,8 @@ public sealed class MainForm : Form
     private const int HotkeyUnPreview = 3;
     private const int HotkeyStop = 4;
     private const int HotkeySecondPass = 5;
+    private const int HotkeyNaturalFirstPass = 6;
+    private const int HotkeyNaturalSecondPass = 7;
     private const int WmInput = 0x00FF;
     private const uint RidInput = 0x10000003;
     private const uint RimTypeKeyboard = 1;
@@ -803,6 +805,10 @@ public sealed class MainForm : Form
                 return ApplyResult(await RunPaintCommandAsync(previewOnly: false, unpreviewOnly: true));
             case "secondPass":
                 return ApplyResult(await RunPaintCommandAsync(previewOnly: false, unpreviewOnly: false, secondPass: true));
+            case "naturalFirstPass":
+                return ApplyResult(await RunNaturalPaintCommandAsync(secondPass: false));
+            case "naturalSecondPass":
+                return ApplyResult(await RunNaturalPaintCommandAsync(secondPass: true));
             case "stop":
                 return ApplyResult(await session.StopPaintAsync());
             default:
@@ -819,6 +825,31 @@ public sealed class MainForm : Form
         try
         {
             return await session.RunPaintAsync(previewOnly, unpreviewOnly, secondPass);
+        }
+        finally
+        {
+            refresh.Cancel();
+            try
+            {
+                await refreshTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            statusTimer.Interval = session.PaintRunning ? 500 : previousInterval;
+            await PushSnapshotAsync();
+        }
+    }
+
+    private async Task<HostCommandResult> RunNaturalPaintCommandAsync(bool secondPass)
+    {
+        var previousInterval = statusTimer.Interval;
+        statusTimer.Interval = 250;
+        using var refresh = new CancellationTokenSource();
+        var refreshTask = RefreshSnapshotsUntilCancelledAsync(refresh.Token);
+        try
+        {
+            return await session.RunNaturalPaintAsync(secondPass);
         }
         finally
         {
@@ -920,6 +951,12 @@ public sealed class MainForm : Form
                 break;
             case HotkeySecondPass:
                 _ = await RunPaintCommandAsync(previewOnly: false, unpreviewOnly: false, secondPass: true);
+                break;
+            case HotkeyNaturalFirstPass:
+                _ = await RunNaturalPaintCommandAsync(secondPass: false);
+                break;
+            case HotkeyNaturalSecondPass:
+                _ = await RunNaturalPaintCommandAsync(secondPass: true);
                 break;
         }
         await PushSnapshotAsync();
@@ -1114,7 +1151,9 @@ public sealed class MainForm : Form
             (HotkeyPreview, session.Settings.PreviewHotkey),
             (HotkeyUnPreview, session.Settings.UnPreviewHotkey),
             (HotkeyStop, session.Settings.StopHotkey),
-            (HotkeySecondPass, session.Settings.SecondPassHotkey)
+            (HotkeySecondPass, session.Settings.SecondPassHotkey),
+            (HotkeyNaturalFirstPass, session.Settings.NaturalFirstPassHotkey),
+            (HotkeyNaturalSecondPass, session.Settings.NaturalSecondPassHotkey)
         };
         foreach (var (id, key) in keys)
         {

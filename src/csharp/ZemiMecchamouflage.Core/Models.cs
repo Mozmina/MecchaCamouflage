@@ -54,6 +54,8 @@ public sealed class PaintSettings
     public double ColorCompressionTolerance { get; set; } = 4.0;
     public double SecondPassBrushSizeTexels { get; set; } = 1.0;
     public double SecondPassColorCompressionTolerance { get; set; } = 0.0;
+    public double NaturalPaintJitterPercent { get; set; } = 25.0;
+    public int NaturalPaintLayerCount { get; set; } = 3;
 
     public bool UsesFill =>
         FrontRegionMode == RegionMode.Fill ||
@@ -80,5 +82,7 @@ public sealed class AppSettings
     public string UnPreviewHotkey { get; set; } = "F3";
     public string StopHotkey { get; set; } = "F4";
     public string SecondPassHotkey { get; set; } = "F5";
+    public string NaturalFirstPassHotkey { get; set; } = "F6";
+    public string NaturalSecondPassHotkey { get; set; } = "F7";
     public PaintSettings Paint { get; set; } = new();
 }

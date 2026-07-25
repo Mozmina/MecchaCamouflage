@@ -52,6 +52,8 @@ public sealed class SettingsStore
         settings.PreviewHotkey = ReadString(root, "preview_hotkey", settings.PreviewHotkey);
         settings.UnPreviewHotkey = ReadString(root, "unpreview_hotkey", settings.UnPreviewHotkey);
         settings.SecondPassHotkey = ReadString(root, "second_pass_hotkey", settings.SecondPassHotkey);
+        settings.NaturalFirstPassHotkey = ReadString(root, "natural_first_pass_hotkey", settings.NaturalFirstPassHotkey);
+        settings.NaturalSecondPassHotkey = ReadString(root, "natural_second_pass_hotkey", settings.NaturalSecondPassHotkey);
         settings.LogRetentionDays = ReadInt(root, "log_retention_days", settings.LogRetentionDays);
 
         var paint = settings.Paint;
@@ -83,6 +85,8 @@ public sealed class SettingsStore
         paint.ColorCompressionTolerance = ReadDouble(root, "color_compression_tolerance", paint.ColorCompressionTolerance);
         paint.SecondPassBrushSizeTexels = ReadDouble(root, "second_pass_brush_size_texels", paint.SecondPassBrushSizeTexels);
         paint.SecondPassColorCompressionTolerance = ReadDouble(root, "second_pass_color_compression_tolerance", paint.SecondPassColorCompressionTolerance);
+        paint.NaturalPaintJitterPercent = ReadDouble(root, "natural_paint_jitter_percent", paint.NaturalPaintJitterPercent);
+        paint.NaturalPaintLayerCount = ReadInt(root, "natural_paint_layer_count", paint.NaturalPaintLayerCount);
         var hasPersistedFillPbr =
             root.TryGetPropertyValue("fill_metallic", out _) &&
             root.TryGetPropertyValue("fill_roughness", out _) &&
@@ -136,6 +140,10 @@ public sealed class SettingsStore
             settings.StopHotkey = "F4";
         if (string.IsNullOrWhiteSpace(settings.SecondPassHotkey))
             settings.SecondPassHotkey = "F5";
+        if (string.IsNullOrWhiteSpace(settings.NaturalFirstPassHotkey))
+            settings.NaturalFirstPassHotkey = "F6";
+        if (string.IsNullOrWhiteSpace(settings.NaturalSecondPassHotkey))
+            settings.NaturalSecondPassHotkey = "F7";
 
         settings.Paint.BrushSizeTexels = Math.Clamp(settings.Paint.BrushSizeTexels, 1.0, 10.0);
         settings.Paint.SideSourceMaxUv = Math.Clamp(settings.Paint.SideSourceMaxUv, 0.001, 0.50);
@@ -149,6 +157,8 @@ public sealed class SettingsStore
         settings.Paint.ColorCompressionTolerance = Math.Clamp(settings.Paint.ColorCompressionTolerance, 0.0, 10.0);
         settings.Paint.SecondPassBrushSizeTexels = Math.Clamp(settings.Paint.SecondPassBrushSizeTexels, 1.0, 10.0);
         settings.Paint.SecondPassColorCompressionTolerance = Math.Clamp(settings.Paint.SecondPassColorCompressionTolerance, 0.0, 10.0);
+        settings.Paint.NaturalPaintJitterPercent = Math.Clamp(settings.Paint.NaturalPaintJitterPercent, 0.0, 100.0);
+        settings.Paint.NaturalPaintLayerCount = Math.Clamp(settings.Paint.NaturalPaintLayerCount, 1, 8);
         return settings;
     }
 
@@ -170,6 +180,8 @@ public sealed class SettingsStore
         unpreview_hotkey = settings.UnPreviewHotkey,
         stop_hotkey = settings.StopHotkey,
         second_pass_hotkey = settings.SecondPassHotkey,
+        natural_first_pass_hotkey = settings.NaturalFirstPassHotkey,
+        natural_second_pass_hotkey = settings.NaturalSecondPassHotkey,
         brush_size_texels = settings.Paint.BrushSizeTexels,
         side_source_max_uv = settings.Paint.SideSourceMaxUv,
         front_back_source_max_uv = settings.Paint.FrontBackSourceMaxUv,
@@ -186,7 +198,9 @@ public sealed class SettingsStore
         fill_emissive = settings.Paint.FillEmissive,
         color_compression_tolerance = settings.Paint.ColorCompressionTolerance,
         second_pass_brush_size_texels = settings.Paint.SecondPassBrushSizeTexels,
-        second_pass_color_compression_tolerance = settings.Paint.SecondPassColorCompressionTolerance
+        second_pass_color_compression_tolerance = settings.Paint.SecondPassColorCompressionTolerance,
+        natural_paint_jitter_percent = settings.Paint.NaturalPaintJitterPercent,
+        natural_paint_layer_count = settings.Paint.NaturalPaintLayerCount
     };
 
     public static string RegionModeText(RegionMode mode) => mode switch

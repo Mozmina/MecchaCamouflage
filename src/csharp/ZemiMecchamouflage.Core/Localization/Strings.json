@@ -91,7 +91,13 @@
     "group.second.pass": "Second pass",
     "second.pass.brush.size": "Second pass brush size",
     "second.pass.color.compression.tolerance": "Second pass color compression tolerance",
-    "second.pass.hotkey": "Second pass hotkey"
+    "second.pass.hotkey": "Second pass hotkey",
+    "group.natural.paint": "Natural paint",
+    "natural.paint.jitter": "Natural paint variation (%)",
+    "natural.paint.layers": "Natural paint layers",
+    "natural.paint.description": "Natural paint (F6/F7) always runs automatically in three stages: base coat, color blocks, then fine per-color detail. Nothing to configure here.",
+    "natural.first.pass.hotkey": "Natural first pass hotkey",
+    "natural.second.pass.hotkey": "Natural second pass hotkey"
   },
   "ja": {
     "app.title": "Zemi Mecchamouflage",
@@ -185,7 +191,13 @@
     "group.second.pass": "2回目の塗装",
     "second.pass.brush.size": "2回目のブラシサイズ",
     "second.pass.color.compression.tolerance": "2回目の色圧縮許容誤差",
-    "second.pass.hotkey": "2回目のホットキー"
+    "second.pass.hotkey": "2回目のホットキー",
+    "group.natural.paint": "ナチュラルペイント",
+    "natural.paint.jitter": "ナチュラルペイントのばらつき(%)",
+    "natural.paint.layers": "ナチュラルペイントのレイヤー数",
+    "natural.paint.description": "ナチュラルペイント(F6/F7)は常に自動で3段階(下地→色のブロック→色ごとの仕上げ)で実行されます。設定項目はありません。",
+    "natural.first.pass.hotkey": "ナチュラル1回目のホットキー",
+    "natural.second.pass.hotkey": "ナチュラル2回目のホットキー"
   },
   "ko": {
     "app.title": "Zemi Mecchamouflage",
@@ -279,7 +291,13 @@
     "group.second.pass": "2차 도색",
     "second.pass.brush.size": "2차 브러시 크기",
     "second.pass.color.compression.tolerance": "2차 색상 압축 허용 오차",
-    "second.pass.hotkey": "2차 단축키"
+    "second.pass.hotkey": "2차 단축키",
+    "group.natural.paint": "내추럴 페인트",
+    "natural.paint.jitter": "내추럴 페인트 변화량(%)",
+    "natural.paint.layers": "내추럴 페인트 레이어 수",
+    "natural.paint.description": "내추럴 페인트(F6/F7)는 항상 3단계(밑칠 → 색상 블록 → 색상별 디테일)로 자동 진행됩니다. 설정할 항목이 없습니다.",
+    "natural.first.pass.hotkey": "내추럴 1차 단축키",
+    "natural.second.pass.hotkey": "내추럴 2차 단축키"
   },
   "es": {
     "app.title": "Zemi Mecchamouflage",
@@ -373,7 +391,13 @@
     "group.second.pass": "Segunda pasada",
     "second.pass.brush.size": "Tamaño de pincel (segunda pasada)",
     "second.pass.color.compression.tolerance": "Tolerancia de compresión de color (segunda pasada)",
-    "second.pass.hotkey": "Tecla de acceso rápido (segunda pasada)"
+    "second.pass.hotkey": "Tecla de acceso rápido (segunda pasada)",
+    "group.natural.paint": "Pintura natural",
+    "natural.paint.jitter": "Variación de pintura natural (%)",
+    "natural.paint.layers": "Capas de pintura natural",
+    "natural.paint.description": "La pintura natural (F6/F7) siempre se ejecuta automáticamente en tres etapas: capa base, bloques de color y luego detalle por color. No hay nada que configurar aquí.",
+    "natural.first.pass.hotkey": "Tecla de acceso rápido (primera pasada natural)",
+    "natural.second.pass.hotkey": "Tecla de acceso rápido (segunda pasada natural)"
   },
   "fr": {
     "app.title": "Zemi Mecchamouflage",
@@ -467,7 +491,13 @@
     "group.second.pass": "Deuxième passage",
     "second.pass.brush.size": "Taille de pinceau (deuxième passage)",
     "second.pass.color.compression.tolerance": "Tolérance de compression des couleurs (deuxième passage)",
-    "second.pass.hotkey": "Raccourci du deuxième passage"
+    "second.pass.hotkey": "Raccourci du deuxième passage",
+    "group.natural.paint": "Peinture naturelle",
+    "natural.paint.jitter": "Variation de la peinture naturelle (%)",
+    "natural.paint.layers": "Couches de peinture naturelle",
+    "natural.paint.description": "La peinture naturelle (F6/F7) s'exécute toujours automatiquement en trois étapes : couche de base, blocs de couleur, puis détail couleur par couleur. Rien à configurer ici.",
+    "natural.first.pass.hotkey": "Raccourci du premier passage naturel",
+    "natural.second.pass.hotkey": "Raccourci du deuxième passage naturel"
   },
   "de": {
     "app.title": "Zemi Mecchamouflage",
@@ -561,7 +591,13 @@
     "group.second.pass": "Zweiter Durchgang",
     "second.pass.brush.size": "Pinselgröße (zweiter Durchgang)",
     "second.pass.color.compression.tolerance": "Farbkompressionstoleranz (zweiter Durchgang)",
-    "second.pass.hotkey": "Hotkey für zweiten Durchgang"
+    "second.pass.hotkey": "Hotkey für zweiten Durchgang",
+    "group.natural.paint": "Natürliches Malen",
+    "natural.paint.jitter": "Variation der natürlichen Malerei (%)",
+    "natural.paint.layers": "Ebenen der natürlichen Malerei",
+    "natural.paint.description": "Natürliches Malen (F6/F7) läuft immer automatisch in drei Phasen ab: Grundschicht, Farbblöcke, dann Detailarbeit je Farbe. Hier gibt es nichts einzustellen.",
+    "natural.first.pass.hotkey": "Hotkey für ersten natürlichen Durchgang",
+    "natural.second.pass.hotkey": "Hotkey für zweiten natürlichen Durchgang"
   },
   "pt-BR": {
     "app.title": "Zemi Mecchamouflage",
@@ -655,7 +691,13 @@
     "group.second.pass": "Segunda passada",
     "second.pass.brush.size": "Tamanho do pincel (segunda passada)",
     "second.pass.color.compression.tolerance": "Tolerância de compressão de cores (segunda passada)",
-    "second.pass.hotkey": "Tecla de atalho (segunda passada)"
+    "second.pass.hotkey": "Tecla de atalho (segunda passada)",
+    "group.natural.paint": "Pintura natural",
+    "natural.paint.jitter": "Variação da pintura natural (%)",
+    "natural.paint.layers": "Camadas de pintura natural",
+    "natural.paint.description": "A pintura natural (F6/F7) sempre é executada automaticamente em três etapas: camada base, blocos de cor e depois detalhe por cor. Não há nada para configurar aqui.",
+    "natural.first.pass.hotkey": "Tecla de atalho (primeira passada natural)",
+    "natural.second.pass.hotkey": "Tecla de atalho (segunda passada natural)"
   },
   "zh-Hans": {
     "app.title": "Zemi Mecchamouflage",
@@ -749,7 +791,13 @@
     "group.second.pass": "第二遍",
     "second.pass.brush.size": "第二遍笔刷大小",
     "second.pass.color.compression.tolerance": "第二遍颜色压缩容差",
-    "second.pass.hotkey": "第二遍快捷键"
+    "second.pass.hotkey": "第二遍快捷键",
+    "group.natural.paint": "自然涂装",
+    "natural.paint.jitter": "自然涂装变化幅度(%)",
+    "natural.paint.layers": "自然涂装层数",
+    "natural.paint.description": "自然涂装(F6/F7)始终自动分三个阶段进行:底色层、色块,然后按颜色精细处理。此处无需配置。",
+    "natural.first.pass.hotkey": "自然第一遍快捷键",
+    "natural.second.pass.hotkey": "自然第二遍快捷键"
   },
   "zh-Hant": {
     "app.title": "Zemi Mecchamouflage",
@@ -843,7 +891,13 @@
     "group.second.pass": "第二遍",
     "second.pass.brush.size": "第二遍筆刷大小",
     "second.pass.color.compression.tolerance": "第二遍顏色壓縮容差",
-    "second.pass.hotkey": "第二遍快捷鍵"
+    "second.pass.hotkey": "第二遍快捷鍵",
+    "group.natural.paint": "自然塗裝",
+    "natural.paint.jitter": "自然塗裝變化幅度(%)",
+    "natural.paint.layers": "自然塗裝層數",
+    "natural.paint.description": "自然塗裝(F6/F7)一律自動分三個階段進行:底色層、色塊,然後依顏色精細處理。此處無需設定。",
+    "natural.first.pass.hotkey": "自然第一遍快捷鍵",
+    "natural.second.pass.hotkey": "自然第二遍快捷鍵"
   },
   "ru": {
     "app.title": "Zemi Mecchamouflage",
@@ -937,7 +991,13 @@
     "group.second.pass": "Второй проход",
     "second.pass.brush.size": "Размер кисти (второй проход)",
     "second.pass.color.compression.tolerance": "Допуск сжатия цвета (второй проход)",
-    "second.pass.hotkey": "Горячая клавиша второго прохода"
+    "second.pass.hotkey": "Горячая клавиша второго прохода",
+    "group.natural.paint": "Естественная покраска",
+    "natural.paint.jitter": "Вариативность естественной покраски (%)",
+    "natural.paint.layers": "Слои естественной покраски",
+    "natural.paint.description": "Естественная покраска (F6/F7) всегда выполняется автоматически в три этапа: базовый слой, цветовые блоки, затем детализация по цвету. Здесь нечего настраивать.",
+    "natural.first.pass.hotkey": "Горячая клавиша первого естественного прохода",
+    "natural.second.pass.hotkey": "Горячая клавиша второго естественного прохода"
   },
   "pl": {
     "app.title": "Zemi Mecchamouflage",
@@ -1031,7 +1091,13 @@
     "group.second.pass": "Drugi przebieg",
     "second.pass.brush.size": "Rozmiar pędzla (drugi przebieg)",
     "second.pass.color.compression.tolerance": "Tolerancja kompresji koloru (drugi przebieg)",
-    "second.pass.hotkey": "Skrót drugiego przebiegu"
+    "second.pass.hotkey": "Skrót drugiego przebiegu",
+    "group.natural.paint": "Naturalne malowanie",
+    "natural.paint.jitter": "Zmienność naturalnego malowania (%)",
+    "natural.paint.layers": "Warstwy naturalnego malowania",
+    "natural.paint.description": "Naturalne malowanie (F6/F7) zawsze przebiega automatycznie w trzech etapach: warstwa bazowa, bloki kolorów, a następnie detale kolor po kolorze. Nie ma tu nic do skonfigurowania.",
+    "natural.first.pass.hotkey": "Skrót pierwszego naturalnego przebiegu",
+    "natural.second.pass.hotkey": "Skrót drugiego naturalnego przebiegu"
   },
   "tr": {
     "app.title": "Zemi Mecchamouflage",
@@ -1125,7 +1191,13 @@
     "group.second.pass": "İkinci geçiş",
     "second.pass.brush.size": "İkinci geçiş fırça boyutu",
     "second.pass.color.compression.tolerance": "İkinci geçiş renk sıkıştırma toleransı",
-    "second.pass.hotkey": "İkinci geçiş kısayolu"
+    "second.pass.hotkey": "İkinci geçiş kısayolu",
+    "group.natural.paint": "Doğal boyama",
+    "natural.paint.jitter": "Doğal boyama varyasyonu (%)",
+    "natural.paint.layers": "Doğal boyama katmanları",
+    "natural.paint.description": "Doğal boyama (F6/F7) her zaman otomatik olarak üç aşamada çalışır: temel kat, renk blokları, ardından renge göre ince detay. Burada yapılandırılacak bir şey yok.",
+    "natural.first.pass.hotkey": "Doğal birinci geçiş kısayolu",
+    "natural.second.pass.hotkey": "Doğal ikinci geçiş kısayolu"
   },
   "id": {
     "app.title": "Zemi Mecchamouflage",
@@ -1219,7 +1291,13 @@
     "group.second.pass": "Lintasan kedua",
     "second.pass.brush.size": "Ukuran kuas lintasan kedua",
     "second.pass.color.compression.tolerance": "Toleransi kompresi warna lintasan kedua",
-    "second.pass.hotkey": "Pintasan lintasan kedua"
+    "second.pass.hotkey": "Pintasan lintasan kedua",
+    "group.natural.paint": "Cat alami",
+    "natural.paint.jitter": "Variasi cat alami (%)",
+    "natural.paint.layers": "Lapisan cat alami",
+    "natural.paint.description": "Cat alami (F6/F7) selalu berjalan otomatis dalam tiga tahap: lapisan dasar, blok warna, lalu detail per warna. Tidak ada yang perlu dikonfigurasi di sini.",
+    "natural.first.pass.hotkey": "Pintasan lintasan alami pertama",
+    "natural.second.pass.hotkey": "Pintasan lintasan alami kedua"
   },
   "it": {
     "app.title": "Zemi Mecchamouflage",
@@ -1313,7 +1391,13 @@
     "group.second.pass": "Secondo passaggio",
     "second.pass.brush.size": "Dimensione pennello (secondo passaggio)",
     "second.pass.color.compression.tolerance": "Tolleranza di compressione colore (secondo passaggio)",
-    "second.pass.hotkey": "Tasto di scelta rapida (secondo passaggio)"
+    "second.pass.hotkey": "Tasto di scelta rapida (secondo passaggio)",
+    "group.natural.paint": "Pittura naturale",
+    "natural.paint.jitter": "Variazione della pittura naturale (%)",
+    "natural.paint.layers": "Livelli di pittura naturale",
+    "natural.paint.description": "La pittura naturale (F6/F7) viene sempre eseguita automaticamente in tre fasi: strato di base, blocchi di colore, poi dettaglio colore per colore. Non c'è nulla da configurare qui.",
+    "natural.first.pass.hotkey": "Tasto di scelta rapida (primo passaggio naturale)",
+    "natural.second.pass.hotkey": "Tasto di scelta rapida (secondo passaggio naturale)"
   },
   "nl": {
     "app.title": "Zemi Mecchamouflage",
@@ -1407,7 +1491,13 @@
     "group.second.pass": "Tweede ronde",
     "second.pass.brush.size": "Penseelgrootte (tweede ronde)",
     "second.pass.color.compression.tolerance": "Kleurcompressietolerantie (tweede ronde)",
-    "second.pass.hotkey": "Sneltoets tweede ronde"
+    "second.pass.hotkey": "Sneltoets tweede ronde",
+    "group.natural.paint": "Natuurlijk schilderen",
+    "natural.paint.jitter": "Variatie natuurlijk schilderen (%)",
+    "natural.paint.layers": "Lagen natuurlijk schilderen",
+    "natural.paint.description": "Natuurlijk schilderen (F6/F7) verloopt altijd automatisch in drie fasen: basislaag, kleurblokken en vervolgens detail per kleur. Hier is niets in te stellen.",
+    "natural.first.pass.hotkey": "Sneltoets eerste natuurlijke ronde",
+    "natural.second.pass.hotkey": "Sneltoets tweede natuurlijke ronde"
   },
   "vi": {
     "app.title": "Zemi Mecchamouflage",
@@ -1501,6 +1591,12 @@
     "group.second.pass": "Lượt thứ hai",
     "second.pass.brush.size": "Kích thước cọ (lượt thứ hai)",
     "second.pass.color.compression.tolerance": "Dung sai nén màu (lượt thứ hai)",
-    "second.pass.hotkey": "Phím tắt lượt thứ hai"
+    "second.pass.hotkey": "Phím tắt lượt thứ hai",
+    "group.natural.paint": "Sơn tự nhiên",
+    "natural.paint.jitter": "Độ biến thiên sơn tự nhiên (%)",
+    "natural.paint.layers": "Số lớp sơn tự nhiên",
+    "natural.paint.description": "Sơn tự nhiên (F6/F7) luôn tự động chạy qua ba giai đoạn: lớp nền, khối màu, rồi chi tiết theo từng màu. Không có gì để cấu hình ở đây.",
+    "natural.first.pass.hotkey": "Phím tắt lượt tự nhiên đầu tiên",
+    "natural.second.pass.hotkey": "Phím tắt lượt tự nhiên thứ hai"
   }
 }
