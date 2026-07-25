@@ -46,7 +46,7 @@ if errorlevel 1 goto :fail
 
 echo [5/6] Staging and committing your changes...
 git add -A
-git commit -m "Rename to Zemi Mecchamouflage; add F5 second-pass paint feature"
+git commit -m "Natural paint: 3-stage pipeline (base coat, color blocks, detail); fix color-batch test fill_end assumption"
 if errorlevel 1 (
     echo.
     echo [INFO] Nothing to commit, or git needs your identity configured.
