@@ -303,7 +303,7 @@ static void ImageDesignPreservesFukuyokaBodyType()
 static void WebImageFillPayloadUsesRgbObject()
 {
     var app = File.ReadAllText(Path.Combine(
-        FindRepositoryRoot(), "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+        FindRepositoryRoot(), "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
 
     Assert(app.Contains("function imageFillColorPayload(color)", StringComparison.Ordinal) &&
            app.Contains("fillColor: imageFillColorPayload(imageEditor.fillColor)", StringComparison.Ordinal) &&
@@ -866,9 +866,9 @@ static void ImageTransparencyFillsRegionsBeforePaintingOpaquePixels()
     var bridge = File.ReadAllText(Path.Combine(
         repository, "src", "native", "bridge", "bridge.cpp"));
     var app = File.ReadAllText(Path.Combine(
-        repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+        repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
     var session = File.ReadAllText(Path.Combine(
-        repository, "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
+        repository, "src", "csharp", "ZemiMecchamouflage.Controller", "HostSession.cs"));
 
     Assert(bridge.Contains("if (mode == MeshFirstRegionMode::Fill)\n                {\n                    append_candidate(MeshFirstRegionMode::Fill);\n                }\n                if (!sample.image_transparent_skip)\n                {\n                    append_candidate(MeshFirstRegionMode::Paint);", StringComparison.Ordinal) &&
            !bridge.Contains("if (mode == MeshFirstRegionMode::Fill && !sample.image_transparent_skip)", StringComparison.Ordinal),
@@ -885,7 +885,7 @@ static void ImageRegionSkipSuppressesOnlyFill()
 {
     var repository = FindRepositoryRoot();
     var bridge = File.ReadAllText(Path.Combine(repository, "src", "native", "bridge", "bridge.cpp"));
-    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
+    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
 
     Assert(bridge.Contains("const bool replay_front_enabled = image_paint_enabled ||", StringComparison.Ordinal) &&
            !bridge.Contains("if (image_paint_enabled && any_image_fill_region)", StringComparison.Ordinal) &&
@@ -998,7 +998,7 @@ static void NativeImagePaintUsesLiveProfileWhenSelectedBodyDiffers()
 static void ImageUnpreviewOmitsPaintPlanDiagnostics()
 {
     var root = FindRepositoryRoot();
-    var session = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
+    var session = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.Controller", "HostSession.cs"));
 
     Assert(session.Contains("kind == PaintKind.Image && !unpreviewOnly && selectedImage is not null", StringComparison.Ordinal) &&
            session.Contains("kind == PaintKind.Image && !unpreviewOnly)\n                LogImagePaintNativeSummary(response);", StringComparison.Ordinal),
@@ -1008,7 +1008,7 @@ static void ImageUnpreviewOmitsPaintPlanDiagnostics()
 static void ImageUnpreviewBypassesImageDesignGuards()
 {
     var root = FindRepositoryRoot();
-    var session = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
+    var session = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.Controller", "HostSession.cs"));
     var bridge = ReadRepositoryText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
 
     Assert(session.Contains("kind == PaintKind.Image && !unpreviewOnly && imageDraftDirty", StringComparison.Ordinal) &&
@@ -1024,7 +1024,7 @@ static void CustomFreecamSurfaceIsAbsent()
     var bridge = File.ReadAllText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
     var productSources = Directory
         .EnumerateFiles(Path.Combine(root, "src", "csharp"), "*.cs", SearchOption.AllDirectories)
-        .Where(path => !path.Contains("MecchaCamouflage.Tests", StringComparison.Ordinal))
+        .Where(path => !path.Contains("ZemiMecchamouflage.Tests", StringComparison.Ordinal))
         .Select(File.ReadAllText)
         .ToArray();
 
@@ -1038,11 +1038,11 @@ static void MiscUsesNativePresentEspRenderer()
 {
     var root = FindRepositoryRoot();
     var bridge = File.ReadAllText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
-    var runtime = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.Controller", "RuntimeBridgeService.cs"));
-    var session = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
-    var mainForm = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
-    var markup = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
-    var app = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+    var runtime = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.Controller", "RuntimeBridgeService.cs"));
+    var session = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.Controller", "HostSession.cs"));
+    var mainForm = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.WebHost", "MainForm.cs"));
+    var markup = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
+    var app = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
 
     Assert(markup.Contains("data-settings-panel=\"misc\"", StringComparison.Ordinal) &&
            markup.Contains("data-settings-actions=\"misc\"", StringComparison.Ordinal) &&
@@ -1068,7 +1068,7 @@ static void MiscUsesNativePresentEspRenderer()
            !mainForm.Contains("EspOverlayForm", StringComparison.Ordinal) &&
            runtime.Contains("ConfigureNativePresentEspAsync", StringComparison.Ordinal) &&
            session.Contains("esp.enabled", StringComparison.Ordinal) &&
-           !File.Exists(Path.Combine(root, "src", "csharp", "MecchaCamouflage.WebHost", "EspOverlayForm.cs")) &&
+           !File.Exists(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.WebHost", "EspOverlayForm.cs")) &&
            bridge.Contains("esp_native_present", StringComparison.Ordinal) &&
            bridge.Contains("d3d12_direct", StringComparison.Ordinal) &&
            !bridge.Contains("misc_apply", StringComparison.Ordinal),
@@ -1408,13 +1408,13 @@ static void NativePresentStatusLoggingIgnoresHealthyCounterChurn()
 static void NativePresentEspHasNoExternalFallback()
 {
     var root = FindRepositoryRoot();
-    var mainForm = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+    var mainForm = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.WebHost", "MainForm.cs"));
     var bridge = ReadRepositoryText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
 
     Assert(!mainForm.Contains("EspOverlayForm", StringComparison.Ordinal) &&
            !mainForm.Contains("EspMemoryReader", StringComparison.Ordinal) &&
-           !File.Exists(Path.Combine(root, "src", "csharp", "MecchaCamouflage.WebHost", "EspOverlayForm.cs")) &&
-           !File.Exists(Path.Combine(root, "src", "csharp", "MecchaCamouflage.WebHost", "EspMemoryReader.cs")) &&
+           !File.Exists(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.WebHost", "EspOverlayForm.cs")) &&
+           !File.Exists(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.WebHost", "EspMemoryReader.cs")) &&
            bridge.Contains("external_overlay\\\":false", StringComparison.Ordinal) &&
            !bridge.Contains("SetEvent(signal);", StringComparison.Ordinal),
         "native Present ESP must fail closed instead of signalling or starting an external overlay frame renderer");
@@ -1424,7 +1424,7 @@ static void NativePresentEspOwnsRendererLifecycle()
 {
     var root = FindRepositoryRoot();
     var bridge = ReadRepositoryText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
-    var runtime = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.Controller", "RuntimeBridgeService.cs"));
+    var runtime = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.Controller", "RuntimeBridgeService.cs"));
 
     Assert(bridge.Contains("esp_execute_command_lists_detour", StringComparison.Ordinal) &&
            bridge.Contains("esp_resize_buffers_detour", StringComparison.Ordinal) &&
@@ -1487,7 +1487,7 @@ static void NativePresentEspOwnsRendererLifecycle()
 static void RuntimeSafelyReplacesObsoleteResidentBridgeGenerations()
 {
     var root = FindRepositoryRoot();
-    var runtime = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.Controller", "RuntimeBridgeService.cs"));
+    var runtime = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.Controller", "RuntimeBridgeService.cs"));
 
     Assert(runtime.Contains("TryAttachResidentCore", StringComparison.Ordinal) &&
            runtime.Contains("BridgeGenerationPolicy.Decide", StringComparison.Ordinal) &&
@@ -1573,7 +1573,7 @@ static void ResearchHotReloadQuiescesAndSerializesBridgeGenerations()
         "research",
         "hot-reload-bridge.ps1"));
 
-    Assert(script.Contains(@"Local\MecchaCamouflage.Inject.$TargetPid", StringComparison.Ordinal) &&
+    Assert(script.Contains(@"Local\ZemiMecchamouflage.Inject.$TargetPid", StringComparison.Ordinal) &&
            script.Contains("active_paint_quiescent", StringComparison.Ordinal) &&
            script.Contains("hook_callbacks_quiescent", StringComparison.Ordinal) &&
            script.Contains("Wait-ResidentCoreAbsent", StringComparison.Ordinal) &&
@@ -1625,7 +1625,7 @@ static void UnresponsiveMatchingBridgeIsNotReinjected()
 {
     var root = FindRepositoryRoot();
     var runtime = ReadRepositoryText(Path.Combine(
-        root, "src", "csharp", "MecchaCamouflage.Controller", "RuntimeBridgeService.cs"));
+        root, "src", "csharp", "ZemiMecchamouflage.Controller", "RuntimeBridgeService.cs"));
     var injectionMethod = runtime.IndexOf(
         "private bool InjectDirectInstanceOnMutexThread(",
         StringComparison.Ordinal);
@@ -1658,7 +1658,7 @@ static void NativePresentReportsBackbufferSetupStep()
         root,
         "src",
         "csharp",
-        "MecchaCamouflage.WebHost",
+        "ZemiMecchamouflage.WebHost",
         "MainForm.cs"));
 
     Assert(bridge.Contains("native D3D12 backbuffer setup failed at ", StringComparison.Ordinal) &&
@@ -2154,7 +2154,7 @@ static void NativePreviewExpiresSnapshotsAfterComponentChange()
 {
     var root = FindRepositoryRoot();
     var bridge = ReadRepositoryText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
-    var session = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
+    var session = ReadRepositoryText(Path.Combine(root, "src", "csharp", "ZemiMecchamouflage.Controller", "HostSession.cs"));
 
     Assert(!bridge.Contains("\"mesh_preview_component_mismatch\"", StringComparison.Ordinal) &&
            !bridge.Contains("\"mesh_unpreview_component_mismatch\"", StringComparison.Ordinal) &&
@@ -2273,7 +2273,7 @@ static void IntrinsicEmissionProbeIsDiagnosticOnlyAndObservable()
         root,
         "src",
         "csharp",
-        "MecchaCamouflage.LiveDiagnostics",
+        "ZemiMecchamouflage.LiveDiagnostics",
         "Program.cs"));
 
     Assert(bridge.Contains("SdkSceneCaptureProfile::IntrinsicEmission", StringComparison.Ordinal) &&
@@ -2309,7 +2309,7 @@ static void AppearanceCaptureHidesOnlyLiveBrushVisual()
         root,
         "src",
         "csharp",
-        "MecchaCamouflage.Controller",
+        "ZemiMecchamouflage.Controller",
         "HostSession.cs"));
 
     Assert(bridge.Contains("sdk_collect_brush_plane_visual_components", StringComparison.Ordinal) &&
@@ -2751,19 +2751,19 @@ static void AutoMaterialSurfaceIsAbsent()
     var root = FindRepositoryRoot();
     var index = File.ReadAllText(Path.Combine(
         root,
-        "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
+        "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
     var app = File.ReadAllText(Path.Combine(
         root,
-        "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+        "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
     var researchRunner = File.ReadAllText(Path.Combine(
         root,
-        "src", "csharp", "MecchaCamouflage.WebHost", "ResearchRunner.cs"));
+        "src", "csharp", "ZemiMecchamouflage.WebHost", "ResearchRunner.cs"));
     var liveDiagnostics = File.ReadAllText(Path.Combine(
         root,
-        "src", "csharp", "MecchaCamouflage.LiveDiagnostics", "Program.cs"));
+        "src", "csharp", "ZemiMecchamouflage.LiveDiagnostics", "Program.cs"));
     var localization = File.ReadAllText(Path.Combine(
         root,
-        "src", "csharp", "MecchaCamouflage.Core", "Localization", "Strings.json"));
+        "src", "csharp", "ZemiMecchamouflage.Core", "Localization", "Strings.json"));
     var bridgeJson = File.ReadAllText(Path.Combine(
         root,
         "src", "native", "bridge", "bridge_json.inc"));
@@ -2786,16 +2786,16 @@ static void SceneLightingSurfaceIsAbsent()
     var root = FindRepositoryRoot();
     var index = ReadRepositoryText(Path.Combine(
         root,
-        "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
+        "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
     var app = ReadRepositoryText(Path.Combine(
         root,
-        "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+        "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
     var localization = ReadRepositoryText(Path.Combine(
         root,
-        "src", "csharp", "MecchaCamouflage.Core", "Localization", "Strings.json"));
+        "src", "csharp", "ZemiMecchamouflage.Core", "Localization", "Strings.json"));
     var liveDiagnostics = ReadRepositoryText(Path.Combine(
         root,
-        "src", "csharp", "MecchaCamouflage.LiveDiagnostics", "Program.cs"));
+        "src", "csharp", "ZemiMecchamouflage.LiveDiagnostics", "Program.cs"));
 
     Assert(typeof(PaintSettings).GetProperty("IncludeShadows") is null &&
            typeof(PaintSnapshot).GetProperty("IncludeShadows") is null &&
@@ -2997,10 +2997,10 @@ static void WebUiKeepsThemeColorOnReadonlyControls()
 static void WebUiImagePaintEditorUsesSavedTransaction()
 {
     var repository = FindRepositoryRoot();
-    var index = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
-    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
-    var styles = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "styles.css"));
-    var mainForm = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+    var index = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
+    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
+    var styles = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "styles.css"));
+    var mainForm = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "MainForm.cs"));
     var bridge = ReadRepositoryText(Path.Combine(repository, "src", "native", "bridge", "bridge.cpp"));
 
     Assert(index.Contains("data-settings-tab=\"paint\" data-i18n=\"settings.paint\">Paint</button>", StringComparison.Ordinal) &&
@@ -3144,8 +3144,8 @@ static void WebUiImagePaintEditorUsesSavedTransaction()
 static void WebUiRequiresExplicitEditWhilePaintRunning()
 {
     var repository = FindRepositoryRoot();
-    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
-    var mainForm = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
+    var mainForm = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "MainForm.cs"));
 
     Assert(app.Contains("function canEditDraft()", StringComparison.Ordinal) &&
            app.Contains("return Boolean(editing && draftSnapshot);", StringComparison.Ordinal) &&
@@ -3186,7 +3186,7 @@ static void WebUiRequiresExplicitEditWhilePaintRunning()
 static void WebUiPreservesImageActionsDuringPaintSnapshots()
 {
     var app = File.ReadAllText(Path.Combine(
-        FindRepositoryRoot(), "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+        FindRepositoryRoot(), "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
 
     Assert(app.Contains("const previousPaintRunning = Boolean(liveSnapshot?.runtime?.paintRunning);", StringComparison.Ordinal) &&
            app.Contains("const paintStillRunning = previousPaintRunning && Boolean(liveSnapshot.runtime?.paintRunning);", StringComparison.Ordinal) &&
@@ -3201,7 +3201,7 @@ static void WebUiPreservesImageActionsDuringPaintSnapshots()
 static void WebUiKeepsMeshGuidesVisibleWithImportedImages()
 {
     var app = File.ReadAllText(Path.Combine(
-        FindRepositoryRoot(), "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+        FindRepositoryRoot(), "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
 
     Assert(app.Contains("if (imageEditor.guideCanvas) {", StringComparison.Ordinal) &&
            app.Contains("context.drawImage(imageEditor.guideCanvas, 0, 0);", StringComparison.Ordinal) &&
@@ -3212,7 +3212,7 @@ static void WebUiKeepsMeshGuidesVisibleWithImportedImages()
 static void WebUiRebuildsImageGuidesWhenLanguageChanges()
 {
     var app = File.ReadAllText(Path.Combine(
-        FindRepositoryRoot(), "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+        FindRepositoryRoot(), "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
 
     Assert(app.Contains("let imageGuideCanvasLocale = \"\";", StringComparison.Ordinal) &&
            app.Contains("imageGuideCanvasCache.clear();", StringComparison.Ordinal) &&
@@ -3223,9 +3223,9 @@ static void WebUiRebuildsImageGuidesWhenLanguageChanges()
 static void WebUiSeparatesSettingAndLogTabs()
 {
     var repository = FindRepositoryRoot();
-    var markup = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
-    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
-    var styles = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "styles.css"));
+    var markup = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
+    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
+    var styles = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "styles.css"));
 
     Assert(markup.Contains("<div class=\"group-title\" data-i18n=\"group.editor\">Editor</div>", StringComparison.Ordinal) &&
            !markup.Contains("<div class=\"group-title\">Images</div>", StringComparison.Ordinal),
@@ -3265,9 +3265,9 @@ static void WebUiSeparatesSettingAndLogTabs()
 static void WebUiScopesEditActionsToActiveSettingsTab()
 {
     var repository = FindRepositoryRoot();
-    var markup = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
-    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
-    var styles = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "styles.css"));
+    var markup = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
+    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
+    var styles = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "styles.css"));
     var catalog = LocalizationCatalog.Load();
 
     Assert(CountOccurrences(markup, "data-settings-actions=") == 4 &&
@@ -3315,9 +3315,9 @@ static void WebUiScopesEditActionsToActiveSettingsTab()
 static void WebUiOffersManualPaintControls()
 {
     var repository = FindRepositoryRoot();
-    var markup = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
-    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
-    var styles = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "styles.css"));
+    var markup = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
+    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
+    var styles = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "styles.css"));
     var controlsIndex = markup.IndexOf("id=\"manual-paint-controls\"", StringComparison.Ordinal);
     var logsIndex = markup.IndexOf("class=\"log-panel\"", StringComparison.Ordinal);
     var commands = new[]
@@ -3386,8 +3386,8 @@ static void RuntimeSnapshotReportsManualPaintState()
 static void PaintFeedbackUsesOneSeverityPath()
 {
     var repository = FindRepositoryRoot();
-    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
-    var mainForm = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
+    var mainForm = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "MainForm.cs"));
 
     Assert(!app.Contains("toast(result?.message || i18n(\"error.operation.failed\"), \"error\");", StringComparison.Ordinal),
         "manual Paint commands must not turn every rejected result into a red toast in the browser");
@@ -3400,9 +3400,9 @@ static void PaintFeedbackUsesOneSeverityPath()
 static void WebUiReportsWebViewZoomFactorInFooter()
 {
     var repository = FindRepositoryRoot();
-    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
-    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
-    var mainForm = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
+    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
+    var mainForm = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "MainForm.cs"));
 
     Assert(markup.Contains("id=\"footer-zoom\">100%</span>", StringComparison.Ordinal) &&
            !markup.Contains("blob/main/LICENSE.txt", StringComparison.Ordinal) &&
@@ -3419,8 +3419,8 @@ static void WebUiReportsWebViewZoomFactorInFooter()
 static void WebUiLocalizesEverySettingsTab()
 {
     var repository = FindRepositoryRoot();
-    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
-    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
+    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
     var catalog = LocalizationCatalog.Load();
 
     Assert(markup.Contains("data-i18n=\"settings.paint\"", StringComparison.Ordinal) &&
@@ -3442,8 +3442,8 @@ static void WebUiLocalizesEverySettingsTab()
 static void WebUiLocalizesEveryEspControl()
 {
     var repository = FindRepositoryRoot();
-    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
-    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
+    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
     var catalog = LocalizationCatalog.Load();
     var keys = new[]
     {
@@ -3473,8 +3473,8 @@ static void WebUiLocalizesEveryEspControl()
 static void WebUiLocalizesImageEditorControlsAndCropDialog()
 {
     var repository = FindRepositoryRoot();
-    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
-    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
+    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
     var catalog = LocalizationCatalog.Load();
     var keys = new[]
     {
@@ -3514,7 +3514,7 @@ static void WebUiLocalizesImageEditorControlsAndCropDialog()
 static void WebUiLocalizesOperationErrors()
 {
     var repository = FindRepositoryRoot();
-    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
     var catalog = LocalizationCatalog.Load();
 
     Assert(app.Contains("toast(i18n(\"error.operation.failed\"), \"error\");", StringComparison.Ordinal),
@@ -3529,9 +3529,9 @@ static void WebUiLocalizesOperationErrors()
 static void NativeStartupAndWebViewRecoveryDialogsAreLocalized()
 {
     var repository = FindRepositoryRoot();
-    var program = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "Program.cs"));
-    var mainForm = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
-    var dialog = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "WebViewFailureDialog.cs"));
+    var program = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "Program.cs"));
+    var mainForm = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "MainForm.cs"));
+    var dialog = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "WebViewFailureDialog.cs"));
     var catalog = LocalizationCatalog.Load();
     var keys = new[]
     {
@@ -3561,7 +3561,7 @@ static void NativeStartupAndWebViewRecoveryDialogsAreLocalized()
 static void NativePresetFileDialogsAreLocalized()
 {
     var repository = FindRepositoryRoot();
-    var mainForm = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+    var mainForm = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "MainForm.cs"));
     var catalog = LocalizationCatalog.Load();
     var keys = new[] { "dialog.preset.load.title", "dialog.preset.save.title", "dialog.preset.filter" };
 
@@ -3582,8 +3582,8 @@ static void NativePresetFileDialogsAreLocalized()
 static void EveryDeclaredWebLocalizationKeyResolvesInEveryLocale()
 {
     var repository = FindRepositoryRoot();
-    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
-    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+    var markup = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
+    var app = File.ReadAllText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
     var catalog = LocalizationCatalog.Load();
     var keys = new HashSet<string>(StringComparer.Ordinal);
 
@@ -3613,8 +3613,8 @@ static void EveryDeclaredWebLocalizationKeyResolvesInEveryLocale()
 static void WebUiUsesPackagedReferenceGuides()
 {
     var repository = FindRepositoryRoot();
-    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
-    var mainForm = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+    var app = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
+    var mainForm = ReadRepositoryText(Path.Combine(repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "MainForm.cs"));
     var bridge = ReadRepositoryText(Path.Combine(repository, "src", "native", "bridge", "bridge.cpp"));
     var contract = ReadRepositoryText(Path.Combine(repository, "src", "native", "include", "runtime_contract.hpp"));
     var refreshScript = ReadRepositoryText(Path.Combine(repository, "scripts", "refresh-image-reference-profile.ps1"));
@@ -3704,11 +3704,11 @@ static void WebUiExposesFukuyokaDirectlyAfterCube()
 {
     var repository = FindRepositoryRoot();
     var index = ReadRepositoryText(Path.Combine(
-        repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
+        repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "index.html"));
     var app = ReadRepositoryText(Path.Combine(
-        repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+        repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "app.js"));
     var styles = ReadRepositoryText(Path.Combine(
-        repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "styles.css"));
+        repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "web", "styles.css"));
     var cube = index.IndexOf("id=\"image-guide-cube\"", StringComparison.Ordinal);
     var fukuyoka = index.IndexOf("id=\"image-guide-fukuyoka\"", StringComparison.Ordinal);
 
@@ -3725,13 +3725,13 @@ static void HostAndCaptureToolPreserveFukuyoka()
 {
     var repository = FindRepositoryRoot();
     var hostSession = ReadRepositoryText(Path.Combine(
-        repository, "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
+        repository, "src", "csharp", "ZemiMecchamouflage.Controller", "HostSession.cs"));
     var program = ReadRepositoryText(Path.Combine(
-        repository, "src", "csharp", "MecchaCamouflage.WebHost", "Program.cs"));
+        repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "Program.cs"));
     var mainForm = ReadRepositoryText(Path.Combine(
-        repository, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+        repository, "src", "csharp", "ZemiMecchamouflage.WebHost", "MainForm.cs"));
     var imageLibrary = ReadRepositoryText(Path.Combine(
-        repository, "src", "csharp", "MecchaCamouflage.Core", "ImageDesignLibrary.cs"));
+        repository, "src", "csharp", "ZemiMecchamouflage.Core", "ImageDesignLibrary.cs"));
 
     Assert(hostSession.Contains("ImagePaintSettings.NormalizeBodyType", StringComparison.Ordinal),
         "guide and reference capture requests must preserve the fukuyoka body identity");
@@ -5395,7 +5395,7 @@ static void InjectorDistinguishesIdentityAndLoadFailures()
     var injector = ReadRepositoryText(Path.Combine(
         root, "src", "native", "injector", "injector.cpp"));
     var runtime = ReadRepositoryText(Path.Combine(
-        root, "src", "csharp", "MecchaCamouflage.Controller", "RuntimeBridgeService.cs"));
+        root, "src", "csharp", "ZemiMecchamouflage.Controller", "RuntimeBridgeService.cs"));
 
     Assert(injector.Contains("\"target_creation_time_query_failed\"", StringComparison.Ordinal) &&
            injector.Contains("\"target_image_path_query_failed\"", StringComparison.Ordinal) &&
@@ -5503,8 +5503,8 @@ static void ReleasePublishRebuildsEmbeddedRuntimeAssets()
     Assert(publishStart >= 0, "release WebHost publish command must remain discoverable");
     var publishBlock = build[
         build.LastIndexOf("Invoke-BuildStep", publishStart, StringComparison.Ordinal)..publishStart];
-    Assert(publishBlock.Contains("bin\\MecchaCamouflage.WebHost", StringComparison.Ordinal) &&
-           publishBlock.Contains("obj\\MecchaCamouflage.WebHost", StringComparison.Ordinal) &&
+    Assert(publishBlock.Contains("bin\\ZemiMecchamouflage.WebHost", StringComparison.Ordinal) &&
+           publishBlock.Contains("obj\\ZemiMecchamouflage.WebHost", StringComparison.Ordinal) &&
            publishBlock.Contains("Remove-Item -LiteralPath $artifactPath -Recurse -Force", StringComparison.Ordinal),
         "release packaging must discard only stale WebHost artifacts before embedding current mesh profiles and native assets");
 }
@@ -5513,7 +5513,7 @@ static void ReleaseVerifiesEmbeddedRuntimeBundleIdentity()
 {
     var root = FindRepositoryRoot();
     var program = ReadRepositoryText(Path.Combine(
-        root, "src", "csharp", "MecchaCamouflage.WebHost", "Program.cs"));
+        root, "src", "csharp", "ZemiMecchamouflage.WebHost", "Program.cs"));
     var verifierPath = Path.Combine(root, "scripts", "verify-runtime-bundle.ps1");
     var workflow = ReadRepositoryText(Path.Combine(root, ".github", "workflows", "release.yml"));
 
@@ -5656,7 +5656,7 @@ static void DesktopStartupEnsuresDefenderExclusionBeforeGui()
 {
     var root = FindRepositoryRoot();
     var program = File.ReadAllText(Path.Combine(
-        root, "src", "csharp", "MecchaCamouflage.WebHost", "Program.cs"));
+        root, "src", "csharp", "ZemiMecchamouflage.WebHost", "Program.cs"));
     var ensureOffset = program.IndexOf(
         "EnsureWindowsDefenderExclusion(paths);",
         StringComparison.Ordinal);
@@ -5675,7 +5675,7 @@ static void DefenderElevationUsesTrustedSystemPowerShell()
         root,
         "src",
         "csharp",
-        "MecchaCamouflage.Controller",
+        "ZemiMecchamouflage.Controller",
         "WindowsDefenderExclusionService.cs"));
 
     Assert(service.Contains(
