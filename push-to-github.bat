@@ -46,24 +46,47 @@ echo [3/6] Fetching latest "%BRANCH%" from GitHub...
 git fetch origin %BRANCH%
 if errorlevel 1 goto :fail
 
-echo [4/6] Lining up local history with origin/%BRANCH% (your edited files are kept as-is)...
+echo [4/6] Checking local history against origin/%BRANCH% ...
+set "NEED_RESET=1"
+git rev-parse --verify -q origin/%BRANCH% >nul 2>nul
+if errorlevel 1 set "NEED_RESET=0"
+if "!NEED_RESET!"=="1" (
+    git merge-base --is-ancestor origin/%BRANCH% HEAD >nul 2>nul
+    if not errorlevel 1 set "NEED_RESET=0"
+)
+
+if "!NEED_RESET!"=="0" (
+    echo Local history already includes origin/%BRANCH% - keeping your local commits as-is.
+    goto :history_done
+)
+
+echo Lining up local history with origin/%BRANCH% ^(your edited files are kept as-is^)...
 set "RESET_TRIES=0"
 :reset_retry
 if exist ".git\index.lock" del /f /q ".git\index.lock" >nul 2>nul
 git reset origin/%BRANCH%
-if not errorlevel 1 goto :reset_done
+if not errorlevel 1 goto :history_done
 set /a RESET_TRIES+=1
 if !RESET_TRIES! lss 3 (
-    echo [INFO] Retrying (another program may have briefly locked a git file)...
+    echo [INFO] Retrying ^(another program may have briefly locked a git file^)...
     timeout /t 2 /nobreak >nul
     goto :reset_retry
 )
 goto :fail
-:reset_done
+
+:history_done
+echo [4b/6] Making sure git submodules ^(CUE4Parse, UnrealMappingsDumper, minhook^) are checked out...
+git submodule sync --recursive >nul 2>nul
+git submodule update --init --recursive
+if errorlevel 1 (
+    echo [WARN] Could not fully update submodules automatically. If a build later
+    echo complains about a missing third_party folder, run this once yourself:
+    echo    git submodule update --init --recursive
+)
 
 echo [5/6] Staging and committing your changes...
 git add -A
-git commit -m "Merge upstream v1.7.2 (ESP overlay, Image Paint, WebP, Fukuyoka, rewritten per-region replay/color pipeline, GPLv3, new submodules); re-adapt natural paint 3-stage (F10/F11) and second pass (F9) onto new pipeline; move Second/Natural hotkeys to F9-F11 to free F5-F8 for Image Paint; rebrand new LiveDiagnostics project and merged files to ZemiMecchamouflage"
+git commit -m "Update push-to-github.bat: preserve local commits ahead of origin instead of flattening them, auto-init git submodules before pushing"
 if errorlevel 1 (
     echo.
     echo [INFO] Nothing to commit, or git needs your identity configured.
