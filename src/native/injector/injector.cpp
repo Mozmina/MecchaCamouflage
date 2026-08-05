@@ -99,7 +99,7 @@ namespace
     auto write_result(bool success,
                       const char* state,
                       DWORD pid,
-                      const BridgeStartBlockV1* block,
+                      const BridgeStartBlockV2* block,
                       std::uint32_t port,
                       DWORD win32_error,
                       DWORD winsock_error,
@@ -107,12 +107,15 @@ namespace
     {
         const std::string instance_id = block ? hex(block->instance_guid, sizeof(block->instance_guid)) : "";
         const std::string bridge_hash = block ? hex(block->sha256, sizeof(block->sha256)) : "";
-        std::cout << "{\"event\":\"result\",\"protocol\":1"
+        const std::string runtime_bundle_id =
+            block ? hex(block->runtime_bundle_sha256, sizeof(block->runtime_bundle_sha256)) : "";
+        std::cout << "{\"event\":\"result\",\"protocol\":" << BridgeBootstrapProtocolV2
                   << ",\"success\":" << (success ? "true" : "false")
                   << ",\"state\":\"" << state << "\""
                   << ",\"pid\":" << pid
                   << ",\"instance_id\":\"" << instance_id << "\""
                   << ",\"bridge_hash\":\"" << bridge_hash << "\""
+                  << ",\"runtime_bundle_id\":\"" << runtime_bundle_id << "\""
                   << ",\"port\":" << port
                   << ",\"win32\":" << win32_error
                   << ",\"winsock\":" << winsock_error
@@ -217,6 +220,12 @@ namespace
         value.HighPart = created.dwHighDateTime;
         creation = value.QuadPart;
         return true;
+    }
+
+    auto process_has_exited(HANDLE process, DWORD& exit_code) -> bool
+    {
+        exit_code = STILL_ACTIVE;
+        return GetExitCodeProcess(process, &exit_code) && exit_code != STILL_ACTIVE;
     }
 
     auto remote_module_base(DWORD pid, const std::wstring& expected_path, DWORD& win32_error) -> std::uintptr_t
@@ -531,36 +540,41 @@ namespace
         return current_wow64 == target_wow64 ? ArchitectureValidation::Compatible : ArchitectureValidation::Mismatch;
     }
 
-    auto valid_start_input(const BridgeStartBlockV1& block, DWORD pid) -> bool
+    auto valid_start_input(const BridgeStartBlockV2& block, DWORD pid) -> bool
     {
-        return block.magic == BridgeStartMagicV1 &&
-               block.size == sizeof(BridgeStartBlockV1) &&
-               block.abi == BridgeStartAbiV1 &&
+        return block.magic == BridgeStartMagicV2 &&
+               block.size == sizeof(BridgeStartBlockV2) &&
+               block.abi == BridgeStartAbiV2 &&
                block.pid == pid &&
                block.requested_port == 0 &&
                block.result_state == BRIDGE_START_UNINITIALIZED &&
                block.bound_port == 0 &&
-               block.protocol == BridgeBootstrapProtocolV1 &&
+               block.protocol == BridgeBootstrapProtocolV2 &&
                block.win32_error == 0 &&
                block.winsock_error == 0 &&
                block.reserved0 == 0 &&
                block.reserved1 == 0 &&
-               !all_zero(block.token, sizeof(block.token));
+               !all_zero(block.token, sizeof(block.token)) &&
+               !all_zero(block.sha256, sizeof(block.sha256)) &&
+               !all_zero(block.runtime_bundle_sha256, sizeof(block.runtime_bundle_sha256));
     }
 
-    auto returned_start_block_matches(const BridgeStartBlockV1& expected, const BridgeStartBlockV1& actual) -> bool
+    auto returned_start_block_matches(const BridgeStartBlockV2& expected, const BridgeStartBlockV2& actual) -> bool
     {
-        return actual.magic == BridgeStartMagicV1 &&
-               actual.size == sizeof(BridgeStartBlockV1) &&
-               actual.abi == BridgeStartAbiV1 &&
+        return actual.magic == BridgeStartMagicV2 &&
+               actual.size == sizeof(BridgeStartBlockV2) &&
+               actual.abi == BridgeStartAbiV2 &&
                actual.pid == expected.pid &&
-               actual.protocol == BridgeBootstrapProtocolV1 &&
+               actual.protocol == BridgeBootstrapProtocolV2 &&
                equal_bytes(actual.instance_guid, expected.instance_guid, sizeof(expected.instance_guid)) &&
                equal_bytes(actual.token, expected.token, sizeof(expected.token)) &&
-               equal_bytes(actual.sha256, expected.sha256, sizeof(expected.sha256));
+               equal_bytes(actual.sha256, expected.sha256, sizeof(expected.sha256)) &&
+               equal_bytes(actual.runtime_bundle_sha256,
+                           expected.runtime_bundle_sha256,
+                           sizeof(expected.runtime_bundle_sha256));
     }
 
-    auto read_start_block(BridgeStartBlockV1& block) -> bool
+    auto read_start_block(BridgeStartBlockV2& block) -> bool
     {
         if (_setmode(_fileno(stdin), _O_BINARY) == -1)
         {
@@ -574,7 +588,7 @@ namespace
                     std::uint64_t expected_creation,
                     const std::wstring& expected_executable,
                     const std::wstring& bridge_path,
-                    const BridgeStartBlockV1& input) -> int
+                    const BridgeStartBlockV2& input) -> int
     {
         DWORD win32_error = 0;
         if (!valid_start_input(input, pid))
@@ -625,12 +639,38 @@ namespace
         }
 
         std::uint64_t actual_creation = 0;
-        std::wstring actual_executable{};
-        if (!query_creation_filetime(process, actual_creation, win32_error) ||
-            !query_process_image_path(process, actual_executable, win32_error))
+        if (!query_creation_filetime(process, actual_creation, win32_error))
         {
+            const DWORD query_error = win32_error;
+            DWORD process_exit = STILL_ACTIVE;
+            const bool exited = process_has_exited(process, process_exit);
             CloseHandle(process);
-            write_result(false, "failed", pid, &input, 0, win32_error, 0, "target_identity_query_failed");
+            write_result(false,
+                         "failed",
+                         pid,
+                         &input,
+                         0,
+                         query_error,
+                         0,
+                         exited ? "target_exited_during_identity_query" : "target_creation_time_query_failed");
+            return 4;
+        }
+
+        std::wstring actual_executable{};
+        if (!query_process_image_path(process, actual_executable, win32_error))
+        {
+            const DWORD query_error = win32_error;
+            DWORD process_exit = STILL_ACTIVE;
+            const bool exited = process_has_exited(process, process_exit);
+            CloseHandle(process);
+            write_result(false,
+                         "failed",
+                         pid,
+                         &input,
+                         0,
+                         query_error,
+                         0,
+                         exited ? "target_exited_during_identity_query" : "target_image_path_query_failed");
             return 4;
         }
         if (actual_creation != expected_creation || !same_path(actual_executable, expected_executable))
@@ -676,8 +716,8 @@ namespace
             return 6;
         }
 
-        DWORD ignored_load_exit = 0;
-        if (wait_remote_thread(load_thread, RemoteLoadTimeoutMs, ignored_load_exit, win32_error) == RemoteWaitResult::Indeterminate)
+        DWORD load_exit = 0;
+        if (wait_remote_thread(load_thread, RemoteLoadTimeoutMs, load_exit, win32_error) == RemoteWaitResult::Indeterminate)
         {
             CloseHandle(load_thread);
             CloseHandle(process);
@@ -687,6 +727,21 @@ namespace
         }
         CloseHandle(load_thread);
         VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
+        if (load_exit == 0)
+        {
+            DWORD process_exit = STILL_ACTIVE;
+            const bool exited = process_has_exited(process, process_exit);
+            CloseHandle(process);
+            write_result(false,
+                         "failed",
+                         pid,
+                         &input,
+                         0,
+                         exited ? ERROR_PROCESS_ABORTED : ERROR_DLL_INIT_FAILED,
+                         0,
+                         exited ? "target_exited_during_loadlibrary" : "remote_loadlibrary_failed");
+            return 7;
+        }
 
         const auto remote_base = remote_module_base(pid, bridge_path, win32_error);
         if (!remote_base)
@@ -695,7 +750,7 @@ namespace
             write_result(false, "failed", pid, &input, 0, win32_error, 0, "exact_bridge_module_not_found");
             return 7;
         }
-        const auto start_rva = local_export_rva(bridge_path, "BridgeStartV1", win32_error);
+        const auto start_rva = local_export_rva(bridge_path, "BridgeStartV2", win32_error);
         if (!start_rva)
         {
             CloseHandle(process);
@@ -735,13 +790,13 @@ namespace
         {
             CloseHandle(start_thread);
             CloseHandle(process);
-            // Do not free remote_block: BridgeStartV1 may still be copying or writing it.
+            // Do not free remote_block: BridgeStartV2 may still be copying or writing it.
             write_result(false, "indeterminate_timeout", pid, &input, 0, win32_error, 0, "remote_start_thread_not_finished");
             return 10;
         }
         CloseHandle(start_thread);
 
-        BridgeStartBlockV1 returned{};
+        BridgeStartBlockV2 returned{};
         SIZE_T read = 0;
         const bool read_ok = ReadProcessMemory(process, remote_block, &returned, sizeof(returned), &read) && read == sizeof(returned);
         if (!read_ok)
@@ -796,11 +851,11 @@ int wmain(int argc, wchar_t** argv)
 {
     if (argc == 2 && std::wstring(argv[1]) == L"--self-test")
     {
-        BridgeStartBlockV1 block{};
-        block.magic = BridgeStartMagicV1;
+        BridgeStartBlockV2 block{};
+        block.magic = BridgeStartMagicV2;
         block.size = sizeof(block);
-        block.abi = BridgeStartAbiV1;
-        block.protocol = BridgeBootstrapProtocolV1;
+        block.abi = BridgeStartAbiV2;
+        block.protocol = BridgeBootstrapProtocolV2;
         write_result(true, "self_test", 0, &block, 0, 0, 0, "direct_injector_abi_ready");
         return 0;
     }
@@ -827,10 +882,10 @@ int wmain(int argc, wchar_t** argv)
         return 64;
     }
 
-    BridgeStartBlockV1 input{};
+    BridgeStartBlockV2 input{};
     if (!read_start_block(input))
     {
-        write_result(false, "failed", pid, nullptr, 0, ERROR_INVALID_DATA, 0, "expected_128_byte_start_block_on_stdin");
+        write_result(false, "failed", pid, nullptr, 0, ERROR_INVALID_DATA, 0, "expected_160_byte_start_block_on_stdin");
         return 64;
     }
     return run_direct(pid, creation, expected_executable, bridge_path, input);

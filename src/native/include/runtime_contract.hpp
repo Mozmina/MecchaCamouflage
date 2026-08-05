@@ -5,26 +5,284 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#if (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))) || defined(__AVX2__)
+#include <immintrin.h>
+#define MECCHA_RUNTIME_CONTRACT_CAN_COMPILE_AVX2 1
+#endif
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#endif
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+#include <future>
 #include <limits>
 #include <random>
 #include <set>
+#include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace runtime_contract
 {
+    constexpr const char* paint_dispatch_exception_kind(
+        std::uint32_t code)
+    {
+        switch (code)
+        {
+        case 0x80000003U:
+            return "breakpoint";
+        case 0xC0000005U:
+            return "access_violation";
+        case 0xC0000006U:
+            return "in_page_error";
+        case 0xC000001DU:
+            return "illegal_instruction";
+        case 0xC000008CU:
+            return "array_bounds_exceeded";
+        case 0xC0000094U:
+            return "integer_divide_by_zero";
+        case 0xC0000095U:
+            return "integer_overflow";
+        case 0xC0000096U:
+            return "privileged_instruction";
+        case 0xC00000FDU:
+            return "stack_overflow";
+        case 0xE06D7363U:
+            return "msvc_cpp_exception";
+        default:
+            return "unknown";
+        }
+    }
+
+    constexpr const char* paint_dispatch_access_operation(
+        bool available,
+        std::uintptr_t operation)
+    {
+        if (!available)
+        {
+            return "not_applicable";
+        }
+        switch (operation)
+        {
+        case 0U:
+            return "read";
+        case 1U:
+            return "write";
+        case 8U:
+            return "execute";
+        default:
+            return "unknown";
+        }
+    }
+
     // Supported Shipping build: FProperty ArrayDim@0x30,
     // ElementSize@0x34, PropertyFlags@0x38.
     constexpr std::size_t FPropertyElementSizeOffset = 0x34;
     // Keep direct dispatch bounded so one scheduler tick cannot monopolize the
     // game thread. This is a CPU safety limit, not a network pacing setting.
-    constexpr int NativeRecordedPaintMaxCallsPerTick = 6;
-    // Permit at most a small, game-owned recorded-paint lead. Waiting for zero
+    // Production favors a conservative burst ceiling while multiplayer limits
+    // are being validated against live servers.
+    constexpr int NativeRecordedPaintMaxCallsPerTick = 4;
+    // Permit only a short game-owned recorded-paint lead. Waiting for zero
     // serializes every stroke; an unbounded lead recreates the visible dotted
-    // frontier on joining clients.
-    constexpr int NativeRecordedPaintQueueTargetStrokes = 4;
+    // frontier on joining clients. Two pending strokes halve the previous
+    // production lead without changing the game's own queue implementation.
+    constexpr int NativeRecordedPaintQueueTargetStrokes = 2;
     constexpr int FastLocalCadenceMs = 1;
     constexpr std::uint64_t LocalDispatchCpuBudgetUs = 4'000;
+    constexpr std::uint64_t LocalDispatchNominalFrameUs = 16'667;
+    constexpr int LocalDispatchMaxAdaptiveDelayMs = 250;
+    constexpr int FallbackMaxOutgoingNetworkBatchesPerSecond = 20;
+    constexpr int FallbackMaxOutgoingStrokesPerBatch = 20;
+    constexpr int ConservativeReplicationCapacityNumerator = 4;
+    constexpr int ConservativeReplicationCapacityDenominator = 5;
+    constexpr int ConservativeReplicationBurstCalls = 3;
+    constexpr int AssumedRemotePaintFps = 60;
+    constexpr int RemoteQueueObservationWindows = 8;
+    constexpr int ConservativeVisualConfirmationFps = 30;
+
+    struct PaintReplicationPacingPlan
+    {
+        int max_outgoing_batches_per_second;
+        int max_outgoing_strokes_per_batch;
+        int conservative_network_strokes_per_second;
+        int conservative_receiver_strokes_per_second;
+        int effective_strokes_per_second;
+        int conservative_strokes_per_window;
+        int calls_per_tick;
+        int network_window_ms;
+        int cadence_ms;
+        int final_confirmation_ms;
+    };
+
+    constexpr int ceil_div_positive(std::int64_t numerator, int denominator)
+    {
+        return denominator > 0 && numerator > 0
+                   ? static_cast<int>((numerator + denominator - 1) / denominator)
+                   : 0;
+    }
+
+    constexpr PaintReplicationPacingPlan paint_replication_pacing_plan(
+        int reported_batches_per_second,
+        int reported_strokes_per_batch,
+        int reported_render_target_writes_per_frame,
+        int max_calls_per_tick,
+        int min_remote_frames_after_local_paint,
+        bool adaptive_remote_interval,
+        int max_adaptive_remote_frame_interval)
+    {
+        const int batches_per_second =
+            reported_batches_per_second > 0 && reported_batches_per_second <= 240
+                ? reported_batches_per_second
+                : FallbackMaxOutgoingNetworkBatchesPerSecond;
+        const int strokes_per_batch =
+            reported_strokes_per_batch > 0 && reported_strokes_per_batch <= 4096
+                ? reported_strokes_per_batch
+                : FallbackMaxOutgoingStrokesPerBatch;
+        const int reported_conservative_strokes =
+            strokes_per_batch * ConservativeReplicationCapacityNumerator /
+            ConservativeReplicationCapacityDenominator;
+        const int conservative_network_strokes_per_window =
+            reported_conservative_strokes > 1 ? reported_conservative_strokes : 1;
+        const int conservative_network_strokes_per_second =
+            conservative_network_strokes_per_window * batches_per_second > 1
+                ? conservative_network_strokes_per_window * batches_per_second
+                : 1;
+        const int minimum_remote_frames =
+            min_remote_frames_after_local_paint > 0
+                ? min_remote_frames_after_local_paint
+                : 1;
+        const int adaptive_remote_frames =
+            max_adaptive_remote_frame_interval > 0
+                ? max_adaptive_remote_frame_interval
+                : 0;
+        const int confirmation_frames =
+            adaptive_remote_interval
+                ? (minimum_remote_frames > adaptive_remote_frames
+                       ? minimum_remote_frames
+                       : adaptive_remote_frames)
+                : minimum_remote_frames;
+        const int render_target_writes_per_frame =
+            reported_render_target_writes_per_frame > 0 &&
+                    reported_render_target_writes_per_frame <= 4096
+                ? reported_render_target_writes_per_frame
+                : 0;
+        const int reported_receiver_strokes_per_second =
+            render_target_writes_per_frame > 0
+                ? static_cast<int>(
+                      static_cast<std::int64_t>(render_target_writes_per_frame) *
+                      AssumedRemotePaintFps /
+                      (confirmation_frames > 0 ? confirmation_frames : 1))
+                : conservative_network_strokes_per_second;
+        const int conservative_receiver_strokes_per_second =
+            render_target_writes_per_frame > 0
+                ? std::max(
+                      1,
+                      reported_receiver_strokes_per_second *
+                          ConservativeReplicationCapacityNumerator /
+                          ConservativeReplicationCapacityDenominator)
+                : conservative_network_strokes_per_second;
+        const int effective_strokes_per_second =
+            conservative_network_strokes_per_second <
+                    conservative_receiver_strokes_per_second
+                ? conservative_network_strokes_per_second
+                : conservative_receiver_strokes_per_second;
+        const int safe_max_calls = max_calls_per_tick > 1 ? max_calls_per_tick : 1;
+        const int burst_calls =
+            safe_max_calls < ConservativeReplicationBurstCalls
+                ? safe_max_calls
+                : ConservativeReplicationBurstCalls;
+        const int calls_per_tick =
+            burst_calls < conservative_network_strokes_per_window
+                ? burst_calls
+                : conservative_network_strokes_per_window;
+        const int reported_network_window_ms =
+            ceil_div_positive(1000, batches_per_second);
+        const int network_window_ms =
+            reported_network_window_ms > 1 ? reported_network_window_ms : 1;
+        const int receiver_strokes_per_window =
+            ceil_div_positive(effective_strokes_per_second, batches_per_second);
+        const int conservative_strokes_per_window =
+            std::min(
+                conservative_network_strokes_per_window,
+                std::max(calls_per_tick, receiver_strokes_per_window));
+        const int reported_cadence_ms =
+            ceil_div_positive(
+                static_cast<std::int64_t>(calls_per_tick) * 1000,
+                effective_strokes_per_second);
+        const int cadence_ms = reported_cadence_ms > 1 ? reported_cadence_ms : 1;
+        const int final_confirmation_ms =
+            network_window_ms * RemoteQueueObservationWindows +
+            ceil_div_positive(
+                static_cast<std::int64_t>(confirmation_frames) * 1000,
+                ConservativeVisualConfirmationFps);
+        return {
+            batches_per_second,
+            strokes_per_batch,
+            conservative_network_strokes_per_second,
+            conservative_receiver_strokes_per_second,
+            effective_strokes_per_second,
+            conservative_strokes_per_window,
+            calls_per_tick,
+            network_window_ms,
+            cadence_ms,
+            final_confirmation_ms,
+        };
+    }
+
+    constexpr bool paint_queue_observer_authoritative(bool available,
+                                                       bool observed_activity)
+    {
+        return available && observed_activity;
+    }
+
+    constexpr bool paint_final_queue_ready(bool observer_available,
+                                           bool observer_observed_activity,
+                                           int visual_pending_strokes,
+                                           bool outgoing_available,
+                                           int outgoing_pending_strokes)
+    {
+        if (outgoing_available && outgoing_pending_strokes > 0)
+        {
+            return false;
+        }
+        return !paint_queue_observer_authoritative(observer_available,
+                                                   observer_observed_activity) ||
+               visual_pending_strokes <= 0;
+    }
+
+    constexpr bool paint_visual_drain_complete(bool observer_available,
+                                               bool observer_observed_activity,
+                                               int visual_pending_strokes,
+                                               bool outgoing_available,
+                                               int outgoing_pending_strokes,
+                                               int final_elapsed_ms,
+                                               int final_confirmation_ms)
+    {
+        return paint_final_queue_ready(observer_available,
+                                       observer_observed_activity,
+                                       visual_pending_strokes,
+                                       outgoing_available,
+                                       outgoing_pending_strokes) &&
+               final_elapsed_ms >=
+               (final_confirmation_ms > 0 ? final_confirmation_ms : 0);
+    }
+
+    constexpr int paint_final_confirmation_remaining_ms(bool final_queue_ready,
+                                                        int ready_elapsed_ms,
+                                                        int final_confirmation_ms,
+                                                        int network_window_ms)
+    {
+        const int required_ms = final_confirmation_ms > 0 ? final_confirmation_ms : 0;
+        if (!final_queue_ready)
+        {
+            return required_ms + (network_window_ms > 0 ? network_window_ms : 1);
+        }
+        const int elapsed_ms = ready_elapsed_ms > 0 ? ready_elapsed_ms : 0;
+        return elapsed_ms < required_ms ? required_ms - elapsed_ms : 0;
+    }
 
     // UE 5.6 packs Metallic, Roughness, and Emissive into one material-properties
     // render target (R/G/B).  Channel 7 updates that target atomically.  Splitting
@@ -116,6 +374,45 @@ namespace runtime_contract
         return max_value(1, requested_delay_ms);
     }
 
+    // PaintAtUVWithBrush is a game-thread-only, non-preemptible call.  A
+    // post-call slice check cannot enforce the CPU budget when one call alone
+    // exceeds it, so convert the overrun into idle time before the next slice.
+    // This keeps average paint occupancy within the existing 4 ms per nominal
+    // 60 Hz frame budget without slowing calls that already fit the network
+    // cadence.
+    constexpr int local_dispatch_adaptive_delay_ms(
+        int requested_delay_ms,
+        std::uint64_t observed_dispatch_us)
+    {
+        const int base_delay = recurring_scheduler_delay_ms(requested_delay_ms);
+        if (observed_dispatch_us == 0 ||
+            LocalDispatchCpuBudgetUs >= LocalDispatchNominalFrameUs)
+        {
+            return base_delay;
+        }
+        constexpr std::uint64_t idle_ratio_numerator =
+            LocalDispatchNominalFrameUs - LocalDispatchCpuBudgetUs;
+        constexpr std::uint64_t delay_denominator =
+            LocalDispatchCpuBudgetUs * 1'000;
+        constexpr std::uint64_t capped_observation_us =
+            (static_cast<std::uint64_t>(
+                 LocalDispatchMaxAdaptiveDelayMs) *
+                 delay_denominator +
+             idle_ratio_numerator - 1) /
+            idle_ratio_numerator;
+        if (observed_dispatch_us >= capped_observation_us)
+        {
+            return max_value(
+                base_delay,
+                LocalDispatchMaxAdaptiveDelayMs);
+        }
+        const auto adaptive_delay_ms = static_cast<int>(
+            (observed_dispatch_us * idle_ratio_numerator +
+             delay_denominator - 1) /
+            delay_denominator);
+        return max_value(base_delay, adaptive_delay_ms);
+    }
+
     struct SpatialScanlineKey
     {
         int row;
@@ -161,6 +458,256 @@ namespace runtime_contract
         Skip,
     };
 
+    enum class ImageAtlasRegion
+    {
+        Front,
+        Side,
+        Back,
+    };
+
+    struct ImageAtlasMappingInput
+    {
+        bool cube{false};
+        ImageAtlasRegion region{ImageAtlasRegion::Front};
+        bool depth_is_y{false};
+        double local_x{0.0};
+        double local_y{0.0};
+        double local_z{0.0};
+        double normal_x{0.0};
+        double normal_y{0.0};
+        double normal_z{0.0};
+        double min_x{0.0};
+        double max_x{1.0};
+        double min_y{0.0};
+        double max_y{1.0};
+        double min_z{0.0};
+        double max_z{1.0};
+    };
+
+    struct ImageAtlasMappingResult
+    {
+        double u{0.125};
+        double v{0.5};
+        bool cube_side{false};
+        bool cube_edge{false};
+    };
+
+    inline ImageAtlasMappingResult map_image_atlas_coordinate(const ImageAtlasMappingInput& input)
+    {
+        const auto normalized = [](double value, double minimum, double maximum) {
+            const double range = maximum - minimum;
+            return std::abs(range) <= 0.000001 ? 0.5 : std::clamp((value - minimum) / range, 0.0, 1.0);
+        };
+        const double horizontal = input.depth_is_y
+                                      ? normalized(input.local_x, input.min_x, input.max_x)
+                                      : normalized(input.local_y, input.min_y, input.max_y);
+        const double depth = input.depth_is_y
+                                 ? normalized(input.local_y, input.min_y, input.max_y)
+                                 : normalized(input.local_x, input.min_x, input.max_x);
+        ImageAtlasMappingResult result{};
+        result.v = normalized(input.local_z, input.min_z, input.max_z);
+        const double normal_x = std::abs(input.normal_x);
+        const double normal_y = std::abs(input.normal_y);
+        const double normal_z = std::abs(input.normal_z);
+        if (input.cube && normal_z > normal_x && normal_z > normal_y)
+        {
+            const double centered_x = input.local_x - (input.min_x + input.max_x) * 0.5;
+            const double centered_y = input.local_y - (input.min_y + input.max_y) * 0.5;
+            result.u = std::clamp(std::atan2(centered_y, centered_x) / (2.0 * 3.14159265358979323846) + 0.5, 0.0, 1.0);
+            result.v = input.normal_z >= 0.0 ? 0.0 : 1.0;
+            result.cube_edge = true;
+            return result;
+        }
+        if (input.region == ImageAtlasRegion::Side)
+        {
+            const double side_coordinate = input.depth_is_y ? input.local_x : input.local_y;
+            const double horizontal_midpoint = input.depth_is_y
+                                                   ? (input.min_x + input.max_x) * 0.5
+                                                   : (input.min_y + input.max_y) * 0.5;
+            result.u = side_coordinate > horizontal_midpoint
+                           ? 0.25 + depth * 0.25
+                           : 0.75 + (1.0 - depth) * 0.25;
+            result.cube_side = input.cube;
+        }
+        else if (input.region == ImageAtlasRegion::Back)
+        {
+            result.u = 0.5 + (1.0 - horizontal) * 0.25;
+        }
+        else
+        {
+            result.u = horizontal * 0.25;
+        }
+        return result;
+    }
+
+    // Cube image designs are not UV-like unwraps. They are four orthographic
+    // views of one canonical, natural-standing reference pose. Keep this tiny
+    // projection contract shared by the bridge and its native validation test;
+    // the UI mirrors the same fixed 1024 x 512 canvas geometry.
+    enum class CubeCanonicalImageFace
+    {
+        Front,
+        Right,
+        Back,
+        Left,
+    };
+
+    struct CubeCanonicalImageProjectionInput
+    {
+        double local_x{0.0};
+        double local_y{0.0};
+        double local_z{0.0};
+        double normal_x{0.0};
+        double normal_y{-1.0};
+        double center_x{0.0};
+        double center_y{0.0};
+        double center_z{0.0};
+        double pixels_per_unit{1.0};
+    };
+
+    struct CubeCanonicalImageProjectionResult
+    {
+        CubeCanonicalImageFace face{CubeCanonicalImageFace::Front};
+        double u{0.125};
+        double v{0.5};
+    };
+
+    inline CubeCanonicalImageFace classify_cube_canonical_image_face(double normal_x, double normal_y)
+    {
+        if (std::abs(normal_x) >= std::abs(normal_y))
+        {
+            return normal_x >= 0.0 ? CubeCanonicalImageFace::Right : CubeCanonicalImageFace::Left;
+        }
+        return normal_y >= 0.0 ? CubeCanonicalImageFace::Back : CubeCanonicalImageFace::Front;
+    }
+
+    inline CubeCanonicalImageProjectionResult map_cube_canonical_image_coordinate(const CubeCanonicalImageProjectionInput& input)
+    {
+        CubeCanonicalImageProjectionResult result{};
+        result.face = classify_cube_canonical_image_face(input.normal_x, input.normal_y);
+        const double pixels_per_unit = std::isfinite(input.pixels_per_unit) && input.pixels_per_unit > 0.000001
+                                           ? input.pixels_per_unit
+                                           : 1.0;
+        double horizontal = input.local_x - input.center_x;
+        int tile = 0;
+        switch (result.face)
+        {
+        case CubeCanonicalImageFace::Front:
+            tile = 0;
+            break;
+        case CubeCanonicalImageFace::Right:
+            tile = 1;
+            horizontal = input.local_y - input.center_y;
+            break;
+        case CubeCanonicalImageFace::Back:
+            tile = 2;
+            horizontal = input.center_x - input.local_x;
+            break;
+        case CubeCanonicalImageFace::Left:
+            tile = 3;
+            horizontal = input.center_y - input.local_y;
+            break;
+        }
+        result.u = (static_cast<double>(tile) * 256.0 + 128.0 + horizontal * pixels_per_unit) / 1024.0;
+        result.v = 0.5 + (input.local_z - input.center_z) * pixels_per_unit / 512.0;
+        return result;
+    }
+
+    // Round uses the same four orthographic canvas tiles as Cube. Unlike the
+    // legacy normalized atlas, every tile shares one pixels-per-unit value:
+    // the narrow side silhouette must not be stretched to the front width.
+    struct RoundCanonicalImageProjectionInput
+    {
+        ImageAtlasRegion region{ImageAtlasRegion::Front};
+        bool depth_is_y{true};
+        double local_x{0.0};
+        double local_y{0.0};
+        double local_z{0.0};
+        double center_x{0.0};
+        double center_y{0.0};
+        double center_z{0.0};
+        double pixels_per_unit{1.0};
+    };
+
+    struct RoundCanonicalImageProjectionResult
+    {
+        int tile{0};
+        double u{0.125};
+        double v{0.5};
+    };
+
+    inline RoundCanonicalImageProjectionResult map_round_canonical_image_coordinate(
+        const RoundCanonicalImageProjectionInput& input)
+    {
+        RoundCanonicalImageProjectionResult result{};
+        const double pixels_per_unit =
+            std::isfinite(input.pixels_per_unit) && input.pixels_per_unit > 0.000001
+                ? input.pixels_per_unit
+                : 1.0;
+        const double front_horizontal = input.depth_is_y
+                                            ? input.local_x - input.center_x
+                                            : input.local_y - input.center_y;
+        double horizontal = front_horizontal;
+        switch (input.region)
+        {
+        case ImageAtlasRegion::Front:
+            result.tile = 0;
+            break;
+        case ImageAtlasRegion::Back:
+            result.tile = 2;
+            horizontal = -front_horizontal;
+            break;
+        case ImageAtlasRegion::Side:
+        {
+            const double side_coordinate = input.depth_is_y
+                                               ? input.local_x - input.center_x
+                                               : input.local_y - input.center_y;
+            const double side_horizontal = input.depth_is_y
+                                               ? input.local_y - input.center_y
+                                               : input.local_x - input.center_x;
+            result.tile = side_coordinate > 0.0 ? 1 : 3;
+            horizontal = result.tile == 1 ? side_horizontal : -side_horizontal;
+            break;
+        }
+        }
+        result.u = (static_cast<double>(result.tile) * 256.0 + 128.0 +
+                    horizontal * pixels_per_unit) / 1024.0;
+        result.v = 0.5 + (input.local_z - input.center_z) * pixels_per_unit / 512.0;
+        return result;
+    }
+
+    struct EnvironmentProjectedCaptureInput
+    {
+        double screen_x{0.5};
+        double screen_y{0.5};
+    };
+
+    struct EnvironmentProjectedCaptureResult
+    {
+        bool ok{false};
+        double capture_u{0.5};
+        double capture_v{0.5};
+    };
+
+    inline EnvironmentProjectedCaptureResult
+    environment_projected_capture_coordinate(
+        const EnvironmentProjectedCaptureInput& input)
+    {
+        EnvironmentProjectedCaptureResult out{};
+        if (!std::isfinite(input.screen_x) ||
+            !std::isfinite(input.screen_y) ||
+            input.screen_x < 0.0 ||
+            input.screen_x > 1.0 ||
+            input.screen_y < 0.0 ||
+            input.screen_y > 1.0)
+        {
+            return out;
+        }
+        out.ok = true;
+        out.capture_u = input.screen_x;
+        out.capture_v = input.screen_y;
+        return out;
+    }
     enum class ReplayPass
     {
         Fill,
@@ -512,6 +1059,9 @@ namespace runtime_contract
         const NaturalOrderOptions& natural_order = NaturalOrderOptions{})
     {
         ReplayPlan plan{};
+        constexpr ReplayRegion region_order[]{ReplayRegion::Back,
+                                               ReplayRegion::Side,
+                                               ReplayRegion::Front};
         const double texture_size_double = static_cast<double>(max_value(1, texture_size));
         const double fill_cell_uv = fill_radius_texels * 0.75 / texture_size_double;
         bool fill_all_regions = false;
@@ -565,72 +1115,76 @@ namespace runtime_contract
                                double row_size_texels,
                                bool include_all_regions = false) {
             std::set<std::tuple<int, int, int, int>> emitted_cells{};
-            std::vector<ReplayEntry> pending{};
             const double row_height = std::max(
                 0.000001,
                 vertical_span * std::max(0.001, row_size_texels) / texture_size_double);
-            for (const auto& candidate : candidates)
+            for (const auto region : region_order)
             {
-                if (!include_all_regions && candidate.mode != required_mode)
+                std::vector<ReplayEntry> pending{};
+                for (const auto& candidate : candidates)
                 {
-                    continue;
-                }
-                if (pass == ReplayPass::Fill)
-                {
-                    ++plan.fill_candidates;
-                }
-                else if (pass == ReplayPass::Paint)
-                {
-                    ++plan.paint_candidates;
-                }
-                if (dedupe_cell_uv > 0.000001)
-                {
-                    const auto cell_coordinate = [&](double value) {
-                        const double finite_value = std::isfinite(value) ? value : 0.0;
-                        return static_cast<int>(std::floor(
-                            std::max(0.0, std::min(1.0, finite_value)) / dedupe_cell_uv));
-                    };
-                    const auto cell = std::make_tuple(
-                        static_cast<int>(candidate.region),
-                        candidate.uv_island,
-                        cell_coordinate(candidate.u),
-                        cell_coordinate(candidate.v));
-                    if (!emitted_cells.insert(cell).second)
+                    if (candidate.region != region ||
+                        (!include_all_regions && candidate.mode != required_mode))
                     {
-                        if (pass == ReplayPass::Fill)
-                        {
-                            ++plan.fill_deduplicated;
-                        }
-                        else if (pass == ReplayPass::Paint)
-                        {
-                            ++plan.paint_deduplicated;
-                        }
                         continue;
                     }
+                    if (pass == ReplayPass::Fill)
+                    {
+                        ++plan.fill_candidates;
+                    }
+                    else if (pass == ReplayPass::Paint)
+                    {
+                        ++plan.paint_candidates;
+                    }
+                    if (dedupe_cell_uv > 0.000001)
+                    {
+                        const auto cell_coordinate = [&](double value) {
+                            const double finite_value = std::isfinite(value) ? value : 0.0;
+                            return static_cast<int>(std::floor(
+                                std::max(0.0, std::min(1.0, finite_value)) / dedupe_cell_uv));
+                        };
+                        const auto cell = std::make_tuple(
+                            static_cast<int>(candidate.region),
+                            candidate.uv_island,
+                            cell_coordinate(candidate.u),
+                            cell_coordinate(candidate.v));
+                        if (!emitted_cells.insert(cell).second)
+                        {
+                            if (pass == ReplayPass::Fill)
+                            {
+                                ++plan.fill_deduplicated;
+                            }
+                            else if (pass == ReplayPass::Paint)
+                            {
+                                ++plan.paint_deduplicated;
+                            }
+                            continue;
+                        }
+                    }
+                    pending.push_back(
+                        {candidate.sample_index,
+                         pass,
+                         candidate.region,
+                         {spatial_scanline_row(vertical_top,
+                                               selected_vertical(candidate),
+                                               row_height),
+                          candidate.horizontal,
+                          candidate.original_ordinal}});
                 }
-                pending.push_back(
-                    {candidate.sample_index,
-                     pass,
-                     candidate.region,
-                     {spatial_scanline_row(vertical_top,
-                                           selected_vertical(candidate),
-                                           row_height),
-                      candidate.horizontal,
-                      candidate.original_ordinal}});
+                if (natural_order.enabled)
+                {
+                    const std::uint32_t pass_seed =
+                        natural_order.seed ^ (pass == ReplayPass::Fill ? 0x9E3779B9u : 0x85EBCA6Bu);
+                    shuffle_natural_order(pending, pass_seed);
+                }
+                else
+                {
+                    std::stable_sort(pending.begin(), pending.end(), [](const auto& left, const auto& right) {
+                        return spatial_scanline_less(left.spatial_key, right.spatial_key);
+                    });
+                }
+                plan.entries.insert(plan.entries.end(), pending.begin(), pending.end());
             }
-            if (natural_order.enabled)
-            {
-                const std::uint32_t pass_seed =
-                    natural_order.seed ^ (pass == ReplayPass::Fill ? 0x9E3779B9u : 0x85EBCA6Bu);
-                shuffle_natural_order(pending, pass_seed);
-            }
-            else
-            {
-                std::stable_sort(pending.begin(), pending.end(), [](const auto& left, const auto& right) {
-                    return spatial_scanline_less(left.spatial_key, right.spatial_key);
-                });
-            }
-            plan.entries.insert(plan.entries.end(), pending.begin(), pending.end());
         };
 
         append_pass(ReplayPass::Fill,
@@ -648,6 +1202,3229 @@ namespace runtime_contract
         return plan;
     }
 
+    // Appearance Match intentionally keeps source HDR information separate
+    // from paint-channel values.  UE's FPaintChannelData accepts only
+    // [0, 1] material controls, but a scene capture can legitimately contain
+    // values above one.  Never use a paint-channel clamp on capture data.
+    enum class AppearancePaintUvRoute
+    {
+        Invalid,
+        RuntimeTriangle,
+        ScreenHit,
+    };
+
+    inline auto appearance_paint_uv_route(bool screen_hit_enabled,
+                                          bool runtime_triangle_uv_valid,
+                                          bool screen_hit_valid,
+                                          double screen_hit_world_delta_cm)
+        -> AppearancePaintUvRoute
+    {
+        if (screen_hit_enabled &&
+            screen_hit_valid &&
+            std::isfinite(screen_hit_world_delta_cm) &&
+            screen_hit_world_delta_cm >= 0.0 &&
+            screen_hit_world_delta_cm <= 1.0)
+        {
+            return AppearancePaintUvRoute::ScreenHit;
+        }
+        return runtime_triangle_uv_valid
+                   ? AppearancePaintUvRoute::RuntimeTriangle
+                   : AppearancePaintUvRoute::Invalid;
+    }
+
+    inline bool appearance_normalized_screen_position_valid(
+        double x,
+        double y)
+    {
+        return std::isfinite(x) &&
+               std::isfinite(y) &&
+               x >= 0.0 &&
+               x <= 1.0 &&
+               y >= 0.0 &&
+               y <= 1.0;
+    }
+
+    struct AppearanceCaptureSampleEligibility
+    {
+        bool region_enabled{false};
+        bool unsafe{false};
+    };
+
+    constexpr bool appearance_capture_sample_included(
+        const AppearanceCaptureSampleEligibility& sample)
+    {
+        return sample.region_enabled && !sample.unsafe;
+    }
+
+    constexpr bool appearance_manual_preview_feedback_required(
+        bool manual_feedback_requested,
+        bool include_scene_lighting,
+        int emission_roi_samples)
+    {
+        return manual_feedback_requested &&
+               (include_scene_lighting ||
+                emission_roi_samples > 0);
+    }
+
+    constexpr bool appearance_projected_material_sample_available(
+        bool capture_sample_available,
+        bool projection_visible,
+        bool shared_face)
+    {
+        // Front and Back are two destinations for the same captured face
+        // material. Visibility chooses which one can be measured on screen,
+        // not whether either destination receives that material.
+        return capture_sample_available &&
+               (shared_face || projection_visible);
+    }
+
+    constexpr bool appearance_use_direct_face_capture(
+        bool capture_sample_available,
+        bool shared_face,
+        bool source_candidate,
+        bool projection_visible)
+    {
+        // Side retains its topology-aware transfer path. Front and Back share
+        // the direct projected sample so camera orientation cannot select a
+        // different material path for either destination.
+        return capture_sample_available &&
+               (shared_face ||
+                source_candidate ||
+                projection_visible);
+    }
+
+    struct AppearanceFeedbackSampleEligibility
+    {
+        bool hdr_available{false};
+        bool camera_stable{false};
+        bool hdr_finite{false};
+        bool unsafe{false};
+        bool projection_visible{false};
+        bool shared_face{false};
+    };
+
+    constexpr bool appearance_feedback_sample_supported(
+        const AppearanceFeedbackSampleEligibility& sample)
+    {
+        // Front and Back intentionally share the measured face response.
+        // Side remains visibility-gated because it uses a separate
+        // topology-aware source transfer.
+        return sample.hdr_available &&
+               sample.camera_stable &&
+               sample.hdr_finite &&
+               !sample.unsafe &&
+               (sample.shared_face ||
+                sample.projection_visible);
+    }
+
+    constexpr bool
+    appearance_candidate_may_zero_emissive(
+        int emission_roi_samples)
+    {
+        return emission_roi_samples <= 0;
+    }
+
+    constexpr int appearance_source_query_probe_budget(
+        int candidate_samples)
+    {
+        // Keep the game-thread query bounded, while covering the full
+        // candidate set observed on the supported 1080p shipping profile.
+        return std::min(8192, std::max(0, candidate_samples));
+    }
+
+    constexpr double AppearanceHdrMaximum = 64.0;
+    constexpr double AppearanceFallbackRoughness = 0.65;
+    constexpr int AppearanceMaxClusters = 8;
+    constexpr int AppearanceSpsaIterations = 3;
+    constexpr double AppearanceFitMedianDeltaEMaximum = 0.05;
+    constexpr double AppearanceFitMinimumImprovement = 0.15;
+    constexpr int AppearanceFitMinimumSamples = 256;
+    constexpr double AppearanceCalibratedEmissiveMinimumMaximum = 0.15;
+    constexpr int AppearanceClusterEmissiveMinimumSamples = 64;
+    constexpr double AppearanceClusterEmissiveMinimumCoverage = 0.10;
+    constexpr double AppearanceClusterEmissiveMinimumSourceSeed = 0.05;
+    constexpr double AppearanceClusterEmissiveMinimumImprovement = 0.0025;
+    constexpr double AppearanceClusterSourceCandidateMinimumCoverage = 0.80;
+    constexpr double AppearanceClusterCandidateMinimumImprovement = 0.0001;
+    constexpr double AppearanceClusterIntrinsicCoreMinimumCoverage = 0.75;
+    constexpr double AppearanceClusterCalibratedMinimumCoverage = 0.90;
+    constexpr double AppearanceClusterNearNeutralMaximumLossIncrease = 0.01;
+
+    struct AppearanceRgb
+    {
+        double r{0.0};
+        double g{0.0};
+        double b{0.0};
+    };
+
+    struct AppearanceHdrSample
+    {
+        AppearanceRgb value{};
+        bool finite{false};
+        bool clipped{false};
+    };
+
+    inline bool appearance_rgb_finite(const AppearanceRgb& value)
+    {
+        return std::isfinite(value.r) && std::isfinite(value.g) && std::isfinite(value.b);
+    }
+
+    inline AppearanceHdrSample appearance_sanitize_hdr(const AppearanceRgb& source)
+    {
+        AppearanceHdrSample out{};
+        out.finite = appearance_rgb_finite(source);
+        if (!out.finite)
+        {
+            return out;
+        }
+        const auto sanitize = [&out](double value) {
+            if (value < 0.0)
+            {
+                return 0.0;
+            }
+            if (value > AppearanceHdrMaximum)
+            {
+                out.clipped = true;
+                return AppearanceHdrMaximum;
+            }
+            return value;
+        };
+        out.value = {sanitize(source.r), sanitize(source.g), sanitize(source.b)};
+        return out;
+    }
+
+    inline AppearanceRgb appearance_clamp_albedo(const AppearanceRgb& source)
+    {
+        return {std::clamp(source.r, 0.0, 1.0),
+                std::clamp(source.g, 0.0, 1.0),
+                std::clamp(source.b, 0.0, 1.0)};
+    }
+
+    inline double appearance_srgb_to_linear(double encoded)
+    {
+        const auto value = std::clamp(encoded, 0.0, 1.0);
+        return value <= 0.04045
+                   ? value / 12.92
+                   : std::pow((value + 0.055) / 1.055, 2.4);
+    }
+
+    inline double appearance_linear_to_srgb(double linear)
+    {
+        const auto value = std::clamp(linear, 0.0, 1.0);
+        return value <= 0.0031308
+                   ? value * 12.92
+                   : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
+    }
+
+    inline AppearanceRgb appearance_reinhard_display(const AppearanceRgb& source)
+    {
+        const auto tone_map = [](double value) {
+            const auto safe = std::max(0.0, value);
+            return safe / (1.0 + safe);
+        };
+        return {tone_map(source.r), tone_map(source.g), tone_map(source.b)};
+    }
+
+    struct AppearanceOkLab
+    {
+        double l{0.0};
+        double a{0.0};
+        double b{0.0};
+    };
+
+    inline AppearanceOkLab appearance_linear_srgb_to_oklab(const AppearanceRgb& source)
+    {
+        const auto value = appearance_clamp_albedo(source);
+        const double l = 0.4122214708 * value.r + 0.5363325363 * value.g + 0.0514459929 * value.b;
+        const double m = 0.2119034982 * value.r + 0.6806995451 * value.g + 0.1073969566 * value.b;
+        const double s = 0.0883024619 * value.r + 0.2817188376 * value.g + 0.6299787005 * value.b;
+        const auto cube_root = [](double channel) {
+            return std::cbrt(std::max(0.0, channel));
+        };
+        const double l_root = cube_root(l);
+        const double m_root = cube_root(m);
+        const double s_root = cube_root(s);
+        return {0.2104542553 * l_root + 0.7936177850 * m_root - 0.0040720468 * s_root,
+                1.9779984951 * l_root - 2.4285922050 * m_root + 0.4505937099 * s_root,
+                0.0259040371 * l_root + 0.7827717662 * m_root - 0.8086757660 * s_root};
+    }
+
+    inline double appearance_oklab_delta_e(const AppearanceRgb& left,
+                                            const AppearanceRgb& right)
+    {
+        const auto a = appearance_linear_srgb_to_oklab(left);
+        const auto b = appearance_linear_srgb_to_oklab(right);
+        const auto dl = a.l - b.l;
+        const auto da = a.a - b.a;
+        const auto db = a.b - b.b;
+        return std::sqrt(dl * dl + da * da + db * db);
+    }
+
+    inline double appearance_rgb_chromaticity_delta(
+        const AppearanceRgb& left,
+        const AppearanceRgb& right)
+    {
+        if (!appearance_rgb_finite(left) ||
+            !appearance_rgb_finite(right))
+        {
+            return std::numeric_limits<double>::infinity();
+        }
+        const auto left_sum =
+            std::max(0.0, left.r) +
+            std::max(0.0, left.g) +
+            std::max(0.0, left.b);
+        const auto right_sum =
+            std::max(0.0, right.r) +
+            std::max(0.0, right.g) +
+            std::max(0.0, right.b);
+        if (left_sum <= 0.001 || right_sum <= 0.001)
+        {
+            return 0.0;
+        }
+        const auto dr =
+            std::max(0.0, left.r) / left_sum -
+            std::max(0.0, right.r) / right_sum;
+        const auto dg =
+            std::max(0.0, left.g) / left_sum -
+            std::max(0.0, right.g) / right_sum;
+        const auto db =
+            std::max(0.0, left.b) / left_sum -
+            std::max(0.0, right.b) / right_sum;
+        return std::sqrt(dr * dr + dg * dg + db * db);
+    }
+
+    inline double appearance_huber_loss(double value, double delta = 0.05)
+    {
+        const auto absolute = std::abs(value);
+        const auto safe_delta = std::max(0.000001, delta);
+        return absolute <= safe_delta
+                   ? 0.5 * absolute * absolute
+                   : safe_delta * (absolute - 0.5 * safe_delta);
+    }
+
+    inline double appearance_luminance(const AppearanceRgb& source)
+    {
+        return 0.2126 * source.r + 0.7152 * source.g + 0.0722 * source.b;
+    }
+
+    struct AppearanceShowFlagSetting
+    {
+        const char* name{nullptr};
+        bool enabled{false};
+    };
+
+    inline const std::array<AppearanceShowFlagSetting, 33>&
+    appearance_intrinsic_emission_show_flags()
+    {
+        static const std::array<AppearanceShowFlagSetting, 33> settings{{
+            {"Lighting", false},
+            {"DeferredLighting", false},
+            {"DirectLighting", false},
+            {"SkyLighting", false},
+            {"DynamicShadows", false},
+            {"ContactShadows", false},
+            {"RayTracedDistanceFieldShadows", false},
+            {"GlobalIllumination", false},
+            {"LumenGlobalIllumination", false},
+            {"ReflectionEnvironment", false},
+            {"ScreenSpaceReflections", false},
+            {"LumenReflections", false},
+            {"AmbientOcclusion", false},
+            {"AmbientCubemap", false},
+            {"Bloom", false},
+            {"PostProcessing", false},
+            {"Tonemapper", false},
+            {"EyeAdaptation", false},
+            {"LocalExposure", false},
+            {"ColorGrading", false},
+            {"Fog", false},
+            {"VolumetricFog", false},
+            {"Atmosphere", false},
+            {"SkyAtmosphere", false},
+            {"Cloud", false},
+            {"VolumetricCloud", false},
+            {"LightShafts", false},
+            {"MotionBlur", false},
+            {"DepthOfField", false},
+            {"LensFlares", false},
+            {"Vignette", false},
+            {"FilmGrain", false},
+            {"UnlitViewmode", false},
+        }};
+        return settings;
+    }
+
+    struct AppearanceCapturePoolKey
+    {
+        int width{0};
+        int height{0};
+        int render_target_format{0};
+        bool isolated_show_flags{false};
+        std::uint64_t visibility_signature{0};
+    };
+
+    constexpr bool appearance_capture_pool_key_matches(
+        const AppearanceCapturePoolKey& left,
+        const AppearanceCapturePoolKey& right)
+    {
+        // CaptureSource is intentionally absent: one render target and
+        // SceneCapture actor can serve BaseColor/Normal/Depth passes when the
+        // format, visibility set and ShowFlags profile are unchanged.
+        return left.width == right.width &&
+               left.height == right.height &&
+               left.render_target_format ==
+                   right.render_target_format &&
+               left.isolated_show_flags ==
+                   right.isolated_show_flags &&
+               left.visibility_signature ==
+                   right.visibility_signature;
+    }
+
+    constexpr bool appearance_projection_diagnostic_sample(
+        std::size_t index,
+        std::size_t sample_count,
+        std::size_t maximum_samples)
+    {
+        if (maximum_samples == 0U ||
+            sample_count == 0U ||
+            index >= sample_count)
+        {
+            return false;
+        }
+        if (sample_count <= maximum_samples)
+        {
+            return true;
+        }
+        const auto stride =
+            (sample_count + maximum_samples - 1U) /
+            maximum_samples;
+        return index % stride == 0U;
+    }
+
+    inline std::vector<std::size_t>
+    appearance_capture_sparse_pixel_indices(
+        int width,
+        int height,
+        const std::vector<std::pair<int, int>>&
+            projected_pixels)
+    {
+        std::vector<std::size_t> indices{};
+        if (width <= 0 || height <= 0)
+        {
+            return indices;
+        }
+        indices.reserve(
+            projected_pixels.size() * 4U);
+        for (const auto& pixel :
+             projected_pixels)
+        {
+            const int x = pixel.first;
+            const int y = pixel.second;
+            if (x < 0 || x >= width ||
+                y < 0 || y >= height)
+            {
+                continue;
+            }
+            const int xs[]{x, width - 1 - x};
+            const int ys[]{y, height - 1 - y};
+            for (const auto sample_y : ys)
+            {
+                for (const auto sample_x : xs)
+                {
+                    indices.push_back(
+                        static_cast<std::size_t>(
+                            sample_y) *
+                            static_cast<std::size_t>(
+                                width) +
+                        static_cast<std::size_t>(
+                            sample_x));
+                }
+            }
+        }
+        std::sort(indices.begin(), indices.end());
+        indices.erase(
+            std::unique(
+                indices.begin(),
+                indices.end()),
+            indices.end());
+        return indices;
+    }
+
+    inline AppearanceRgb appearance_intrinsic_emission_residual(
+        const AppearanceRgb& isolated_hdr,
+        const AppearanceRgb& base_srgb)
+    {
+        if (!appearance_rgb_finite(isolated_hdr) ||
+            !appearance_rgb_finite(base_srgb))
+        {
+            return {};
+        }
+        return {
+            std::max(
+                0.0,
+                isolated_hdr.r -
+                    appearance_srgb_to_linear(base_srgb.r)),
+            std::max(
+                0.0,
+                isolated_hdr.g -
+                    appearance_srgb_to_linear(base_srgb.g)),
+            std::max(
+                0.0,
+                isolated_hdr.b -
+                    appearance_srgb_to_linear(base_srgb.b)),
+        };
+    }
+
+    constexpr double AppearanceEmissionRescuePeakSrgb = 1.0;
+
+    struct AppearanceEmissionColorRescue
+    {
+        AppearanceRgb albedo_srgb{};
+        bool applied{false};
+        double residual_luminance{0.0};
+    };
+
+    inline AppearanceEmissionColorRescue
+    appearance_rescue_emission_color(
+        const AppearanceRgb& base_srgb,
+        const AppearanceRgb& isolated_hdr,
+        double residual_threshold)
+    {
+        AppearanceEmissionColorRescue out{};
+        out.albedo_srgb = appearance_clamp_albedo(base_srgb);
+        if (!appearance_rgb_finite(base_srgb) ||
+            !appearance_rgb_finite(isolated_hdr) ||
+            !std::isfinite(residual_threshold))
+        {
+            return out;
+        }
+
+        const auto residual =
+            appearance_intrinsic_emission_residual(
+                isolated_hdr,
+                base_srgb);
+        out.residual_luminance =
+            appearance_luminance(residual);
+        const auto threshold =
+            std::max(0.0, residual_threshold);
+        if (!std::isfinite(out.residual_luminance) ||
+            out.residual_luminance <= threshold)
+        {
+            return out;
+        }
+
+        // Emission is used only as a colour source. A channel-wise HDR
+        // compression prevents raw emitter ratios from turning warm lights
+        // unnaturally yellow, then a fixed sRGB peak deliberately discards
+        // source intensity so the result remains ordinary bounded Albedo.
+        const AppearanceRgb compressed_linear{
+            residual.r / (1.0 + residual.r),
+            residual.g / (1.0 + residual.g),
+            residual.b / (1.0 + residual.b)};
+        const auto peak =
+            std::max({compressed_linear.r,
+                      compressed_linear.g,
+                      compressed_linear.b});
+        if (!std::isfinite(peak) || peak <= 0.000001)
+        {
+            return out;
+        }
+        const auto target_linear_peak =
+            appearance_srgb_to_linear(
+                AppearanceEmissionRescuePeakSrgb);
+        const auto scale = target_linear_peak / peak;
+        const AppearanceRgb rescued_srgb{
+            appearance_linear_to_srgb(
+                std::clamp(
+                    compressed_linear.r * scale,
+                    0.0,
+                    1.0)),
+            appearance_linear_to_srgb(
+                std::clamp(
+                    compressed_linear.g * scale,
+                    0.0,
+                    1.0)),
+            appearance_linear_to_srgb(
+                std::clamp(
+                    compressed_linear.b * scale,
+                    0.0,
+                    1.0))};
+        auto confidence = std::clamp(
+            (out.residual_luminance - threshold) /
+                std::max(0.01, threshold),
+            0.0,
+            1.0);
+        confidence =
+            confidence * confidence *
+            (3.0 - 2.0 * confidence);
+        out.albedo_srgb = appearance_clamp_albedo(
+            {out.albedo_srgb.r +
+                 (rescued_srgb.r - out.albedo_srgb.r) *
+                     confidence,
+             out.albedo_srgb.g +
+                 (rescued_srgb.g - out.albedo_srgb.g) *
+                     confidence,
+             out.albedo_srgb.b +
+                 (rescued_srgb.b - out.albedo_srgb.b) *
+                     confidence});
+        out.applied = confidence > 0.0;
+        return out;
+    }
+
+    struct AppearanceClosedLoopCorrectionInput
+    {
+        AppearanceRgb albedo_linear{};
+        double emissive{0.0};
+        AppearanceRgb source_hdr{};
+        AppearanceRgb rendered_hdr{};
+        bool intrinsic_emission_roi{false};
+    };
+
+    struct AppearanceClosedLoopCorrection
+    {
+        bool supported{false};
+        AppearanceRgb albedo_linear{};
+        double emissive{0.0};
+        double display_error{0.0};
+    };
+
+    inline AppearanceClosedLoopCorrection
+    appearance_albedo_closed_loop_correction(
+        const AppearanceClosedLoopCorrectionInput& input)
+    {
+        AppearanceClosedLoopCorrection out{};
+        out.albedo_linear =
+            appearance_clamp_albedo(input.albedo_linear);
+        // The Albedo feedback pass must never create, remove, or otherwise
+        // optimise Emissive.  Emissive has a separate measured-response gate;
+        // coupling it to the broad colour-loss improvement is what allowed
+        // false white points to ride along with a valid Albedo correction.
+        out.emissive = std::clamp(input.emissive, 0.0, 1.0);
+        if (!appearance_rgb_finite(input.albedo_linear) ||
+            !appearance_rgb_finite(input.source_hdr) ||
+            !appearance_rgb_finite(input.rendered_hdr) ||
+            !std::isfinite(input.emissive) ||
+            input.source_hdr.r < 0.0 ||
+            input.source_hdr.g < 0.0 ||
+            input.source_hdr.b < 0.0 ||
+            input.rendered_hdr.r < 0.0 ||
+            input.rendered_hdr.g < 0.0 ||
+            input.rendered_hdr.b < 0.0)
+        {
+            return out;
+        }
+
+        const auto source_display =
+            appearance_reinhard_display(input.source_hdr);
+        const auto rendered_display =
+            appearance_reinhard_display(input.rendered_hdr);
+        const std::array<double, 3> albedo{
+            out.albedo_linear.r,
+            out.albedo_linear.g,
+            out.albedo_linear.b};
+        const std::array<double, 3> source{
+            source_display.r,
+            source_display.g,
+            source_display.b};
+        const std::array<double, 3> rendered{
+            rendered_display.r,
+            rendered_display.g,
+            rendered_display.b};
+        std::array<double, 3> corrected = albedo;
+        constexpr double response_floor = 1.0 / 255.0;
+        constexpr double maximum_ratio_per_pass = 2.0;
+        constexpr double albedo_step = 0.75;
+        double display_error = 0.0;
+        for (std::size_t channel = 0;
+             channel < corrected.size();
+             ++channel)
+        {
+            display_error +=
+                std::abs(source[channel] - rendered[channel]);
+            const auto ratio = std::clamp(
+                (source[channel] + response_floor) /
+                    (rendered[channel] + response_floor),
+                1.0 / maximum_ratio_per_pass,
+                maximum_ratio_per_pass);
+            corrected[channel] = std::clamp(
+                std::max(albedo[channel], response_floor) *
+                    std::pow(ratio, albedo_step),
+                0.0,
+                1.0);
+        }
+        out.albedo_linear =
+            {corrected[0], corrected[1], corrected[2]};
+        out.display_error = display_error / 3.0;
+
+        out.supported = true;
+        return out;
+    }
+
+    inline AppearanceClosedLoopCorrection
+    appearance_closed_loop_correction(
+        const AppearanceClosedLoopCorrectionInput& input)
+    {
+        auto out =
+            appearance_albedo_closed_loop_correction(input);
+        out.emissive = input.intrinsic_emission_roi
+                           ? std::clamp(input.emissive, 0.0, 1.0)
+                           : 0.0;
+        if (!out.supported)
+        {
+            return out;
+        }
+        if (input.intrinsic_emission_roi)
+        {
+            const auto source_luminance =
+                std::max(0.0, appearance_luminance(input.source_hdr));
+            const auto rendered_luminance =
+                std::max(0.0, appearance_luminance(input.rendered_hdr));
+            const auto log_luminance_error =
+                std::log1p(source_luminance) -
+                std::log1p(rendered_luminance);
+            constexpr double emissive_step = 0.50;
+            constexpr double maximum_emissive_delta_per_pass = 0.35;
+            const auto emissive_delta = std::clamp(
+                log_luminance_error * emissive_step,
+                -maximum_emissive_delta_per_pass,
+                maximum_emissive_delta_per_pass);
+            out.emissive = std::clamp(
+                out.emissive + emissive_delta,
+                0.0,
+                1.0);
+        }
+        return out;
+    }
+
+    inline AppearanceRgb appearance_emission_chromaticity_albedo(
+        const AppearanceRgb& intrinsic_emission_hdr,
+        const AppearanceRgb& fallback_albedo)
+    {
+        if (!appearance_rgb_finite(intrinsic_emission_hdr))
+        {
+            return appearance_clamp_albedo(fallback_albedo);
+        }
+        const AppearanceRgb positive{
+            std::max(0.0, intrinsic_emission_hdr.r),
+            std::max(0.0, intrinsic_emission_hdr.g),
+            std::max(0.0, intrinsic_emission_hdr.b)};
+        const auto peak =
+            std::max({positive.r, positive.g, positive.b});
+        if (!std::isfinite(peak) || peak <= 0.000001)
+        {
+            return appearance_clamp_albedo(fallback_albedo);
+        }
+        return appearance_clamp_albedo(
+            {positive.r / peak,
+             positive.g / peak,
+             positive.b / peak});
+    }
+
+    struct AppearanceEmissionNoiseModel
+    {
+        bool ok{false};
+        double median{0.0};
+        double mad{0.0};
+        double threshold{0.01};
+        bool separated_signal{false};
+        int baseline_samples{0};
+    };
+
+    inline AppearanceEmissionNoiseModel appearance_emission_noise_model(
+        const std::vector<double>& luminance_samples)
+    {
+        AppearanceEmissionNoiseModel out{};
+        std::vector<double> finite_samples{};
+        finite_samples.reserve(luminance_samples.size());
+        for (const auto sample : luminance_samples)
+        {
+            if (std::isfinite(sample))
+            {
+                finite_samples.push_back(std::max(0.0, sample));
+            }
+        }
+        if (finite_samples.size() < 3)
+        {
+            return out;
+        }
+        const auto median_of = [](std::vector<double> values) {
+            std::sort(values.begin(), values.end());
+            const auto middle = values.size() / 2;
+            if ((values.size() % 2) == 0)
+            {
+                return (values[middle - 1] + values[middle]) * 0.5;
+            }
+            return values[middle];
+        };
+        out.median = median_of(finite_samples);
+        std::vector<double> deviations{};
+        deviations.reserve(finite_samples.size());
+        for (const auto sample : finite_samples)
+        {
+            deviations.push_back(std::abs(sample - out.median));
+        }
+        out.mad = median_of(std::move(deviations));
+        // The model describes an E=0 target baseline.  Its median is the
+        // capture/backend bias, while max(0.01, 8*MAD) is the minimum positive
+        // response required above that bias.  Taking max around the complete
+        // expression made a biased but stable E=0 capture too permissive.
+        out.threshold = out.median + std::max(0.01, 8.0 * out.mad);
+        out.ok = std::isfinite(out.threshold);
+        out.baseline_samples =
+            static_cast<int>(finite_samples.size());
+        return out;
+    }
+
+    inline AppearanceEmissionNoiseModel
+    appearance_source_emission_noise_model(
+        const std::vector<double>& luminance_samples)
+    {
+        auto full =
+            appearance_emission_noise_model(luminance_samples);
+        std::vector<double> ordered{};
+        ordered.reserve(luminance_samples.size());
+        for (const auto sample : luminance_samples)
+        {
+            if (std::isfinite(sample))
+            {
+                ordered.push_back(std::max(0.0, sample));
+            }
+        }
+        if (!full.ok || ordered.size() < 20)
+        {
+            return full;
+        }
+        std::sort(ordered.begin(), ordered.end());
+        const auto minimum_baseline =
+            std::max<std::size_t>(8, ordered.size() / 20);
+        const auto minimum_signal =
+            std::max<std::size_t>(8, ordered.size() / 10);
+        const auto maximum_split =
+            std::min(
+                ordered.size() / 2,
+                ordered.size() - minimum_signal);
+        if (minimum_baseline > maximum_split)
+        {
+            return full;
+        }
+
+        std::size_t best_split = 0;
+        double best_gap = 0.0;
+        for (std::size_t split = minimum_baseline;
+             split <= maximum_split;
+             ++split)
+        {
+            const auto gap =
+                ordered[split] - ordered[split - 1];
+            if (gap > best_gap)
+            {
+                best_gap = gap;
+                best_split = split;
+            }
+        }
+        if (best_split == 0 || best_gap < 0.02)
+        {
+            return full;
+        }
+
+        std::vector<double> baseline(
+            ordered.begin(),
+            ordered.begin() +
+                static_cast<std::ptrdiff_t>(best_split));
+        auto separated =
+            appearance_emission_noise_model(baseline);
+        if (!separated.ok ||
+            best_gap <
+                std::max(0.02, 8.0 * separated.mad) ||
+            ordered[best_split] <=
+                separated.threshold + 0.02)
+        {
+            return full;
+        }
+        separated.separated_signal = true;
+        separated.baseline_samples =
+            static_cast<int>(best_split);
+        return separated;
+    }
+
+    inline AppearanceEmissionNoiseModel
+    appearance_combine_emission_noise_models(
+        const AppearanceEmissionNoiseModel& source,
+        const AppearanceEmissionNoiseModel& target_e0)
+    {
+        AppearanceEmissionNoiseModel out = source;
+        if (!source.ok || !target_e0.ok ||
+            !std::isfinite(source.threshold) ||
+            !std::isfinite(target_e0.threshold))
+        {
+            out.ok = false;
+            return out;
+        }
+        // The source residual decides whether a source pixel is intrinsically
+        // emissive.  Target E=0 measures the paint material/backend floor.
+        // Both constraints must hold; replacing the source floor with the
+        // usually lower target floor turns lighting/base-pass residuals into
+        // broad false-positive emission.
+        out.threshold =
+            std::max(source.threshold, target_e0.threshold);
+        out.ok = std::isfinite(out.threshold);
+        return out;
+    }
+
+    inline bool appearance_emission_sample_detected(
+        double residual_luminance,
+        const AppearanceEmissionNoiseModel& e0_noise)
+    {
+        return e0_noise.ok &&
+               std::isfinite(residual_luminance) &&
+               residual_luminance > e0_noise.threshold;
+    }
+
+    struct AppearanceEmissionGridPoint
+    {
+        int x{0};
+        int y{0};
+    };
+
+    struct AppearanceEmissionSpatialFilter
+    {
+        std::vector<bool> keep{};
+        int region_count{0};
+        int kept_samples{0};
+        int rejected_samples{0};
+    };
+
+    inline AppearanceEmissionSpatialFilter
+    appearance_filter_emission_regions(
+        const std::vector<AppearanceEmissionGridPoint>& points,
+        int minimum_region_samples)
+    {
+        AppearanceEmissionSpatialFilter out{};
+        out.keep.assign(points.size(), false);
+        const auto minimum =
+            std::max(1, minimum_region_samples);
+        std::vector<bool> visited(points.size(), false);
+        std::vector<std::size_t> stack{};
+        std::vector<std::size_t> component{};
+        for (std::size_t first = 0;
+             first < points.size();
+             ++first)
+        {
+            if (visited[first])
+            {
+                continue;
+            }
+            visited[first] = true;
+            stack.clear();
+            component.clear();
+            stack.push_back(first);
+            while (!stack.empty())
+            {
+                const auto current = stack.back();
+                stack.pop_back();
+                component.push_back(current);
+                for (std::size_t candidate = 0;
+                     candidate < points.size();
+                     ++candidate)
+                {
+                    if (visited[candidate])
+                    {
+                        continue;
+                    }
+                    const auto dx = std::abs(
+                        static_cast<std::int64_t>(
+                            points[current].x) -
+                        static_cast<std::int64_t>(
+                            points[candidate].x));
+                    const auto dy = std::abs(
+                        static_cast<std::int64_t>(
+                            points[current].y) -
+                        static_cast<std::int64_t>(
+                            points[candidate].y));
+                    if (dx <= 1 && dy <= 1)
+                    {
+                        visited[candidate] = true;
+                        stack.push_back(candidate);
+                    }
+                }
+            }
+            if (static_cast<int>(component.size()) >=
+                minimum)
+            {
+                ++out.region_count;
+                for (const auto index : component)
+                {
+                    out.keep[index] = true;
+                }
+                out.kept_samples +=
+                    static_cast<int>(component.size());
+            }
+            else
+            {
+                out.rejected_samples +=
+                    static_cast<int>(component.size());
+            }
+        }
+        return out;
+    }
+
+    struct AppearanceEmissionSurfacePoint
+    {
+        AppearanceEmissionGridPoint screen{};
+        double residual_luminance{0.0};
+        std::uint64_t surface_key{0};
+    };
+
+    struct AppearanceEmissionSurfaceFilter
+    {
+        std::vector<bool> keep{};
+        int applied_regions{0};
+        int core_samples{0};
+        int core_surface_count{0};
+        int kept_samples{0};
+        int halo_rejected_samples{0};
+        double maximum_core_threshold{0.0};
+    };
+
+    inline AppearanceEmissionSurfaceFilter
+    appearance_filter_emission_surface_halo(
+        const std::vector<AppearanceEmissionSurfacePoint>& points)
+    {
+        AppearanceEmissionSurfaceFilter out{};
+        out.keep.assign(points.size(), true);
+        out.kept_samples = static_cast<int>(points.size());
+        if (points.size() < 6)
+        {
+            return out;
+        }
+
+        std::vector<bool> visited(points.size(), false);
+        std::vector<std::size_t> stack{};
+        std::vector<std::size_t> component{};
+        for (std::size_t first = 0;
+             first < points.size();
+             ++first)
+        {
+            if (visited[first])
+            {
+                continue;
+            }
+            visited[first] = true;
+            stack.clear();
+            component.clear();
+            stack.push_back(first);
+            while (!stack.empty())
+            {
+                const auto current = stack.back();
+                stack.pop_back();
+                component.push_back(current);
+                for (std::size_t candidate = 0;
+                     candidate < points.size();
+                     ++candidate)
+                {
+                    if (visited[candidate])
+                    {
+                        continue;
+                    }
+                    const auto dx = std::abs(
+                        static_cast<std::int64_t>(
+                            points[current].screen.x) -
+                        static_cast<std::int64_t>(
+                            points[candidate].screen.x));
+                    const auto dy = std::abs(
+                        static_cast<std::int64_t>(
+                            points[current].screen.y) -
+                        static_cast<std::int64_t>(
+                            points[candidate].screen.y));
+                    if (dx <= 1 && dy <= 1)
+                    {
+                        visited[candidate] = true;
+                        stack.push_back(candidate);
+                    }
+                }
+            }
+            if (component.size() < 6)
+            {
+                continue;
+            }
+
+            std::vector<double> luminance{};
+            luminance.reserve(component.size());
+            for (const auto index : component)
+            {
+                if (std::isfinite(
+                        points[index].residual_luminance))
+                {
+                    luminance.push_back(
+                        std::max(
+                            0.0,
+                            points[index]
+                                .residual_luminance));
+                }
+            }
+            if (luminance.size() != component.size())
+            {
+                continue;
+            }
+            const auto core_model =
+                appearance_emission_noise_model(luminance);
+            if (!core_model.ok)
+            {
+                continue;
+            }
+
+            std::vector<std::size_t> core{};
+            std::set<std::uint64_t> core_surfaces{};
+            std::set<std::uint64_t> all_surfaces{};
+            for (const auto index : component)
+            {
+                const auto key = points[index].surface_key;
+                if (key != 0)
+                {
+                    all_surfaces.insert(key);
+                }
+                if (key != 0 &&
+                    points[index].residual_luminance >
+                        core_model.threshold)
+                {
+                    core.push_back(index);
+                    core_surfaces.insert(key);
+                }
+            }
+            // This is only a conservative correction for a small, strong
+            // emitter embedded in a much larger, weaker response. Uniform
+            // emissive surfaces and disconnected weak emitters must survive.
+            if (core.size() < 3 ||
+                core.size() * 4 >
+                    component.size() ||
+                core_surfaces.empty() ||
+                core_surfaces.size() >=
+                    all_surfaces.size())
+            {
+                continue;
+            }
+
+            std::vector<std::size_t> rejected{};
+            rejected.reserve(component.size());
+            double minimum_core =
+                std::numeric_limits<double>::infinity();
+            double maximum_rejected = 0.0;
+            for (const auto index : core)
+            {
+                minimum_core =
+                    std::min(
+                        minimum_core,
+                        points[index]
+                            .residual_luminance);
+            }
+            for (const auto index : component)
+            {
+                const auto key = points[index].surface_key;
+                if (key == 0 ||
+                    core_surfaces.find(key) !=
+                        core_surfaces.end())
+                {
+                    continue;
+                }
+                rejected.push_back(index);
+                maximum_rejected =
+                    std::max(
+                        maximum_rejected,
+                        points[index]
+                            .residual_luminance);
+            }
+            const auto minimum_separation =
+                std::max(0.02, 2.0 * core_model.mad);
+            if (rejected.size() * 2 <
+                    component.size() ||
+                !std::isfinite(minimum_core) ||
+                minimum_core - maximum_rejected <
+                    minimum_separation)
+            {
+                continue;
+            }
+
+            ++out.applied_regions;
+            out.core_samples +=
+                static_cast<int>(core.size());
+            out.core_surface_count +=
+                static_cast<int>(core_surfaces.size());
+            out.maximum_core_threshold =
+                std::max(
+                    out.maximum_core_threshold,
+                    core_model.threshold);
+            for (const auto index : rejected)
+            {
+                out.keep[index] = false;
+            }
+            out.halo_rejected_samples +=
+                static_cast<int>(rejected.size());
+            out.kept_samples -=
+                static_cast<int>(rejected.size());
+        }
+        return out;
+    }
+
+    inline double appearance_emission_projected_value(
+        double projected_emissive,
+        bool intrinsic_emission_roi)
+    {
+        if (!intrinsic_emission_roi ||
+            !std::isfinite(projected_emissive))
+        {
+            return 0.0;
+        }
+        // Intrinsic isolation is the classification authority.  A projection
+        // can legitimately land at zero when target E0 lighting is already
+        // brighter than the source final colour, but dropping packed B then
+        // destroys a confirmed emission ROI. Preserve the smallest 8-bit
+        // representable positive value and let ROI loss acceptance decide
+        // whether the candidate is safe.
+        return std::clamp(
+            std::max(projected_emissive, 1.0 / 255.0),
+            0.0,
+            1.0);
+    }
+
+    struct AppearanceEmissionRoiAcceptance
+    {
+        int emission_roi_samples{0};
+        int emission_roi_nonzero_b_samples{0};
+        int non_emission_samples{0};
+        int non_emission_nonzero_b_samples{0};
+        bool camera_stable{false};
+        bool readback_calibrated{false};
+        bool packed_b_verified{false};
+        double emission_roi_loss_initial{
+            std::numeric_limits<double>::infinity()};
+        double emission_roi_loss_best{
+            std::numeric_limits<double>::infinity()};
+        double non_emission_loss_initial{
+            std::numeric_limits<double>::infinity()};
+        double non_emission_loss_best{
+            std::numeric_limits<double>::infinity()};
+    };
+
+    inline bool appearance_emission_roi_accepted(
+        const AppearanceEmissionRoiAcceptance& value)
+    {
+        const auto recall =
+            value.emission_roi_samples > 0
+                ? static_cast<double>(
+                      value.emission_roi_nonzero_b_samples) /
+                      static_cast<double>(value.emission_roi_samples)
+                : 0.0;
+        const auto false_positive_rate =
+            value.non_emission_samples > 0
+                ? static_cast<double>(
+                      value.non_emission_nonzero_b_samples) /
+                      static_cast<double>(value.non_emission_samples)
+                : 0.0;
+        const auto roi_improvement =
+            std::isfinite(value.emission_roi_loss_initial) &&
+                    std::isfinite(value.emission_roi_loss_best) &&
+                    value.emission_roi_loss_initial > 0.0
+                ? (value.emission_roi_loss_initial -
+                   value.emission_roi_loss_best) /
+                      value.emission_roi_loss_initial
+                : -std::numeric_limits<double>::infinity();
+        const auto non_emission_delta =
+            value.non_emission_loss_best -
+            value.non_emission_loss_initial;
+        const bool non_emission_stable =
+            value.non_emission_samples == 0 ||
+            (std::isfinite(non_emission_delta) &&
+             non_emission_delta <= 0.01);
+        return value.emission_roi_samples > 0 &&
+               value.non_emission_samples >= 0 &&
+               value.camera_stable &&
+               value.readback_calibrated &&
+               value.packed_b_verified &&
+               std::isfinite(recall) &&
+               recall >= 0.90 &&
+               std::isfinite(false_positive_rate) &&
+               false_positive_rate <= 0.01 &&
+               std::isfinite(roi_improvement) &&
+               roi_improvement >= AppearanceFitMinimumImprovement &&
+               non_emission_stable;
+    }
+
+    struct AppearanceEmissiveCalibration
+    {
+        bool supported{false};
+        double emissive{0.0};
+        double response_energy{0.0};
+    };
+
+    inline AppearanceEmissiveCalibration appearance_calibrate_emissive(
+        const AppearanceRgb& source_hdr,
+        const AppearanceRgb& fallback_hdr,
+        const AppearanceRgb& endpoint_hdr)
+    {
+        AppearanceEmissiveCalibration out{};
+        if (!appearance_rgb_finite(source_hdr) ||
+            !appearance_rgb_finite(fallback_hdr) ||
+            !appearance_rgb_finite(endpoint_hdr))
+        {
+            return out;
+        }
+        const auto log_channel = [](double channel) {
+            return std::log1p(std::max(0.0, channel));
+        };
+        const AppearanceRgb source{
+            log_channel(source_hdr.r),
+            log_channel(source_hdr.g),
+            log_channel(source_hdr.b)};
+        const AppearanceRgb fallback{
+            log_channel(fallback_hdr.r),
+            log_channel(fallback_hdr.g),
+            log_channel(fallback_hdr.b)};
+        const AppearanceRgb endpoint{
+            log_channel(endpoint_hdr.r),
+            log_channel(endpoint_hdr.g),
+            log_channel(endpoint_hdr.b)};
+        const AppearanceRgb response{
+            endpoint.r - fallback.r,
+            endpoint.g - fallback.g,
+            endpoint.b - fallback.b};
+        const AppearanceRgb residual{
+            source.r - fallback.r,
+            source.g - fallback.g,
+            source.b - fallback.b};
+        out.response_energy =
+            response.r * response.r +
+            response.g * response.g +
+            response.b * response.b;
+        const auto endpoint_luminance = appearance_luminance(endpoint_hdr);
+        const auto fallback_luminance = appearance_luminance(fallback_hdr);
+        if (!std::isfinite(out.response_energy) ||
+            out.response_energy <= 0.00000001 ||
+            !std::isfinite(endpoint_luminance) ||
+            !std::isfinite(fallback_luminance) ||
+            endpoint_luminance <= fallback_luminance + 0.0001)
+        {
+            return out;
+        }
+        const auto projected =
+            (residual.r * response.r +
+             residual.g * response.g +
+             residual.b * response.b) /
+            out.response_energy;
+        if (!std::isfinite(projected))
+        {
+            return out;
+        }
+        out.supported = true;
+        out.emissive = std::clamp(projected, 0.0, 1.0);
+        return out;
+    }
+
+    struct AppearanceBoundedResponseCalibration
+    {
+        bool supported{false};
+        double parameter{0.0};
+        double response_energy{0.0};
+    };
+
+    inline AppearanceBoundedResponseCalibration
+    appearance_calibrate_bounded_response(
+        const AppearanceRgb& source_hdr,
+        const AppearanceRgb& baseline_hdr,
+        const AppearanceRgb& endpoint_hdr,
+        double baseline_parameter,
+        double endpoint_parameter,
+        double minimum_parameter,
+        double maximum_parameter)
+    {
+        AppearanceBoundedResponseCalibration out{};
+        if (!appearance_rgb_finite(source_hdr) ||
+            !appearance_rgb_finite(baseline_hdr) ||
+            !appearance_rgb_finite(endpoint_hdr) ||
+            !std::isfinite(baseline_parameter) ||
+            !std::isfinite(endpoint_parameter) ||
+            !std::isfinite(minimum_parameter) ||
+            !std::isfinite(maximum_parameter) ||
+            endpoint_parameter == baseline_parameter ||
+            maximum_parameter < minimum_parameter)
+        {
+            return out;
+        }
+        const auto log_channel = [](double channel) {
+            return std::log1p(std::max(0.0, channel));
+        };
+        const AppearanceRgb source{
+            log_channel(source_hdr.r),
+            log_channel(source_hdr.g),
+            log_channel(source_hdr.b)};
+        const AppearanceRgb baseline{
+            log_channel(baseline_hdr.r),
+            log_channel(baseline_hdr.g),
+            log_channel(baseline_hdr.b)};
+        const AppearanceRgb endpoint{
+            log_channel(endpoint_hdr.r),
+            log_channel(endpoint_hdr.g),
+            log_channel(endpoint_hdr.b)};
+        const AppearanceRgb response{
+            endpoint.r - baseline.r,
+            endpoint.g - baseline.g,
+            endpoint.b - baseline.b};
+        const AppearanceRgb residual{
+            source.r - baseline.r,
+            source.g - baseline.g,
+            source.b - baseline.b};
+        out.response_energy =
+            response.r * response.r +
+            response.g * response.g +
+            response.b * response.b;
+        if (!std::isfinite(out.response_energy) ||
+            out.response_energy <= 0.00000001)
+        {
+            return out;
+        }
+        const auto projected =
+            (residual.r * response.r +
+             residual.g * response.g +
+             residual.b * response.b) /
+            out.response_energy;
+        if (!std::isfinite(projected))
+        {
+            return out;
+        }
+        out.supported = true;
+        out.parameter = std::clamp(
+            baseline_parameter +
+                (endpoint_parameter - baseline_parameter) * projected,
+            minimum_parameter,
+            maximum_parameter);
+        return out;
+    }
+
+    constexpr double AppearancePhysicalEmissionReadbackFloor =
+        1.0 / 255.0;
+    constexpr double AppearancePhysicalEmissionMaximumChromaticityDelta =
+        0.10;
+
+    struct AppearancePhysicalEmissionEvidenceInput
+    {
+        AppearanceRgb source_residual_first{};
+        AppearanceRgb source_residual_second{};
+        double source_noise_floor_first{
+            std::numeric_limits<double>::infinity()};
+        double source_noise_floor_second{
+            std::numeric_limits<double>::infinity()};
+        AppearanceRgb source_hdr{};
+        AppearanceRgb baseline_hdr{};
+        AppearanceRgb endpoint_hdr{};
+        double manual_emissive_floor{0.0};
+        // Retained for diagnostics only.  A globally inseparable histogram
+        // must not disable a locally repeatable source residual.
+        bool source_distribution_separated{false};
+        bool camera_stable{false};
+        bool readback_calibrated{false};
+        bool packed_b_verified{false};
+    };
+
+    struct AppearancePhysicalEmissionEvidence
+    {
+        bool source_supported{false};
+        bool source_noise_floor_calibrated{false};
+        bool source_first_above_noise_floor{false};
+        bool source_second_above_noise_floor{false};
+        bool target_response_supported{false};
+        bool accepted{false};
+        double inferred_emissive{0.0};
+        double composed_emissive{0.0};
+        double source_repeatability_error{
+            std::numeric_limits<double>::infinity()};
+        double source_chromaticity_delta{
+            std::numeric_limits<double>::infinity()};
+        double response_energy{0.0};
+        double baseline_loss{
+            std::numeric_limits<double>::infinity()};
+        double candidate_loss{
+            std::numeric_limits<double>::infinity()};
+    };
+
+    inline double appearance_compose_physical_emissive(
+        double manual_emissive_floor,
+        double inferred_emissive)
+    {
+        if (!std::isfinite(manual_emissive_floor) ||
+            !std::isfinite(inferred_emissive))
+        {
+            return 0.0;
+        }
+        return std::max(
+            std::clamp(manual_emissive_floor, 0.0, 1.0),
+            std::clamp(inferred_emissive, 0.0, 1.0));
+    }
+
+    struct AppearancePhysicalEmissionMaterialInput
+    {
+        AppearanceRgb albedo{};
+        AppearanceRgb source_residual_first{};
+        AppearanceRgb source_residual_second{};
+        double manual_emissive_floor{0.0};
+        double inferred_emissive{0.0};
+        bool dual_evidence_accepted{false};
+    };
+
+    struct AppearancePhysicalEmissionMaterial
+    {
+        AppearanceRgb albedo{};
+        double emissive{0.0};
+        bool chromaticity_carrier_applied{false};
+    };
+
+    inline AppearancePhysicalEmissionMaterial
+    appearance_compose_physical_emission_material(
+        const AppearancePhysicalEmissionMaterialInput& input)
+    {
+        AppearancePhysicalEmissionMaterial out{};
+        out.albedo = appearance_clamp_albedo(input.albedo);
+        out.emissive = appearance_compose_physical_emissive(
+            input.manual_emissive_floor,
+            input.inferred_emissive);
+        if (!input.dual_evidence_accepted ||
+            !appearance_rgb_finite(input.source_residual_first) ||
+            !appearance_rgb_finite(input.source_residual_second))
+        {
+            return out;
+        }
+
+        const AppearanceRgb mean_positive_residual{
+            std::max(
+                0.0,
+                (input.source_residual_first.r +
+                 input.source_residual_second.r) *
+                    0.5),
+            std::max(
+                0.0,
+                (input.source_residual_first.g +
+                 input.source_residual_second.g) *
+                    0.5),
+            std::max(
+                0.0,
+                (input.source_residual_first.b +
+                 input.source_residual_second.b) *
+                    0.5)};
+        const auto peak = std::max(
+            {mean_positive_residual.r,
+             mean_positive_residual.g,
+             mean_positive_residual.b});
+        if (!std::isfinite(peak) || peak <= 0.000001)
+        {
+            return out;
+        }
+
+        // The game exposes Emissive as one scalar, so a physically validated
+        // emitter needs its source chromaticity carried by bounded Albedo.
+        // This is deliberately composed only after both source evidence and
+        // target response have passed; callers retain the independent best
+        // Albedo state and restore it if final component validation rejects E.
+        out.albedo = appearance_emission_chromaticity_albedo(
+            mean_positive_residual,
+            out.albedo);
+        out.chromaticity_carrier_applied = true;
+        return out;
+    }
+
+    inline AppearancePhysicalEmissionEvidence
+    appearance_physical_emission_evidence(
+        const AppearancePhysicalEmissionEvidenceInput& input)
+    {
+        AppearancePhysicalEmissionEvidence out{};
+        const auto manual_floor =
+            std::clamp(input.manual_emissive_floor, 0.0, 1.0);
+        out.inferred_emissive = manual_floor;
+        out.composed_emissive = manual_floor;
+        if (!appearance_rgb_finite(input.source_residual_first) ||
+            !appearance_rgb_finite(input.source_residual_second) ||
+            !appearance_rgb_finite(input.source_hdr) ||
+            !appearance_rgb_finite(input.baseline_hdr) ||
+            !appearance_rgb_finite(input.endpoint_hdr) ||
+            !std::isfinite(input.manual_emissive_floor))
+        {
+            return out;
+        }
+
+        const auto positive = [](const AppearanceRgb& value) {
+            return AppearanceRgb{
+                std::max(0.0, value.r),
+                std::max(0.0, value.g),
+                std::max(0.0, value.b)};
+        };
+        const auto first = positive(input.source_residual_first);
+        const auto second = positive(input.source_residual_second);
+        const AppearanceRgb repeatability_delta{
+            std::abs(first.r - second.r),
+            std::abs(first.g - second.g),
+            std::abs(first.b - second.b)};
+        const auto first_luminance = appearance_luminance(first);
+        const auto second_luminance = appearance_luminance(second);
+        const auto minimum_luminance =
+            std::min(first_luminance, second_luminance);
+        out.source_noise_floor_calibrated =
+            std::isfinite(input.source_noise_floor_first) &&
+            input.source_noise_floor_first >= 0.0 &&
+            std::isfinite(input.source_noise_floor_second) &&
+            input.source_noise_floor_second >= 0.0;
+        const auto first_noise_floor =
+            std::max(
+                AppearancePhysicalEmissionReadbackFloor,
+                input.source_noise_floor_first);
+        const auto second_noise_floor =
+            std::max(
+                AppearancePhysicalEmissionReadbackFloor,
+                input.source_noise_floor_second);
+        out.source_first_above_noise_floor =
+            out.source_noise_floor_calibrated &&
+            first_luminance > first_noise_floor;
+        out.source_second_above_noise_floor =
+            out.source_noise_floor_calibrated &&
+            second_luminance > second_noise_floor;
+        out.source_repeatability_error =
+            appearance_luminance(repeatability_delta);
+        out.source_chromaticity_delta =
+            appearance_rgb_chromaticity_delta(first, second);
+        out.source_supported =
+            out.source_first_above_noise_floor &&
+            out.source_second_above_noise_floor &&
+            std::isfinite(minimum_luminance) &&
+            minimum_luminance >
+                out.source_repeatability_error +
+                    AppearancePhysicalEmissionReadbackFloor &&
+            std::isfinite(out.source_chromaticity_delta) &&
+            out.source_chromaticity_delta <=
+                AppearancePhysicalEmissionMaximumChromaticityDelta;
+
+        if (manual_floor >= 1.0 ||
+            !input.camera_stable ||
+            !input.readback_calibrated ||
+            !input.packed_b_verified)
+        {
+            return out;
+        }
+        const auto calibrated =
+            appearance_calibrate_bounded_response(
+                input.source_hdr,
+                input.baseline_hdr,
+                input.endpoint_hdr,
+                manual_floor,
+                1.0,
+                manual_floor,
+                1.0);
+        out.response_energy = calibrated.response_energy;
+        if (!calibrated.supported ||
+            appearance_luminance(input.endpoint_hdr) <=
+                appearance_luminance(input.baseline_hdr) + 0.0001)
+        {
+            return out;
+        }
+
+        const auto log_channel = [](double channel) {
+            return std::log1p(std::max(0.0, channel));
+        };
+        const auto interpolation =
+            (calibrated.parameter - manual_floor) /
+            std::max(0.000001, 1.0 - manual_floor);
+        const std::array<double, 3> source{
+            log_channel(input.source_hdr.r),
+            log_channel(input.source_hdr.g),
+            log_channel(input.source_hdr.b)};
+        const std::array<double, 3> baseline{
+            log_channel(input.baseline_hdr.r),
+            log_channel(input.baseline_hdr.g),
+            log_channel(input.baseline_hdr.b)};
+        const std::array<double, 3> endpoint{
+            log_channel(input.endpoint_hdr.r),
+            log_channel(input.endpoint_hdr.g),
+            log_channel(input.endpoint_hdr.b)};
+        out.baseline_loss = 0.0;
+        out.candidate_loss = 0.0;
+        for (std::size_t channel = 0; channel < source.size(); ++channel)
+        {
+            const auto predicted =
+                baseline[channel] +
+                (endpoint[channel] - baseline[channel]) *
+                    interpolation;
+            out.baseline_loss +=
+                appearance_huber_loss(
+                    source[channel] - baseline[channel]);
+            out.candidate_loss +=
+                appearance_huber_loss(
+                    source[channel] - predicted);
+        }
+        out.baseline_loss /= 3.0;
+        out.candidate_loss /= 3.0;
+        const auto manual_quantized =
+            std::llround(manual_floor * 255.0);
+        const auto inferred_quantized =
+            std::llround(calibrated.parameter * 255.0);
+        out.target_response_supported =
+            inferred_quantized > manual_quantized &&
+            std::isfinite(out.baseline_loss) &&
+            std::isfinite(out.candidate_loss) &&
+            out.candidate_loss + 0.000001 < out.baseline_loss;
+        out.inferred_emissive = calibrated.parameter;
+        out.accepted =
+            out.source_supported &&
+            out.target_response_supported;
+        if (out.accepted)
+        {
+            out.composed_emissive =
+                appearance_compose_physical_emissive(
+                    manual_floor,
+                    out.inferred_emissive);
+        }
+        return out;
+    }
+
+    enum class AppearancePhysicalEmissionComponentRejection
+    {
+        None,
+        DualEvidenceUnavailable,
+        CameraUnstable,
+        ReadbackUncalibrated,
+        PackedBNotVerified,
+        QuantizedEmissiveZero,
+        NonEmissionLossRegressed,
+        RoiImprovementBelowThreshold,
+    };
+
+    struct AppearancePhysicalEmissionComponentValidationInput
+    {
+        int paired_samples{0};
+        double baseline_loss{
+            std::numeric_limits<double>::infinity()};
+        double candidate_loss{
+            std::numeric_limits<double>::infinity()};
+        int non_emission_paired_samples{0};
+        double baseline_non_emission_loss{
+            std::numeric_limits<double>::infinity()};
+        double candidate_non_emission_loss{
+            std::numeric_limits<double>::infinity()};
+        bool dual_evidence_prevalidated{false};
+        bool camera_stable{false};
+        bool readback_calibrated{false};
+        bool packed_b_verified{false};
+        int painted_emissive_nonzero_pixels{0};
+    };
+
+    struct AppearancePhysicalEmissionComponentValidation
+    {
+        bool accepted{false};
+        AppearancePhysicalEmissionComponentRejection rejection{
+            AppearancePhysicalEmissionComponentRejection::
+                DualEvidenceUnavailable};
+        double roi_improvement{
+            -std::numeric_limits<double>::infinity()};
+        double non_emission_loss_delta{
+            std::numeric_limits<double>::infinity()};
+    };
+
+    inline AppearancePhysicalEmissionComponentValidation
+    appearance_validate_physical_emission_component(
+        const AppearancePhysicalEmissionComponentValidationInput& input)
+    {
+        AppearancePhysicalEmissionComponentValidation out{};
+        if (!input.dual_evidence_prevalidated)
+        {
+            return out;
+        }
+        if (!input.camera_stable)
+        {
+            out.rejection =
+                AppearancePhysicalEmissionComponentRejection::
+                    CameraUnstable;
+            return out;
+        }
+        if (!input.readback_calibrated)
+        {
+            out.rejection =
+                AppearancePhysicalEmissionComponentRejection::
+                    ReadbackUncalibrated;
+            return out;
+        }
+        if (!input.packed_b_verified)
+        {
+            out.rejection =
+                AppearancePhysicalEmissionComponentRejection::
+                    PackedBNotVerified;
+            return out;
+        }
+        if (input.painted_emissive_nonzero_pixels <= 0)
+        {
+            out.rejection =
+                AppearancePhysicalEmissionComponentRejection::
+                    QuantizedEmissiveZero;
+            return out;
+        }
+
+        out.non_emission_loss_delta =
+            input.non_emission_paired_samples > 0 &&
+                    std::isfinite(input.baseline_non_emission_loss) &&
+                    std::isfinite(input.candidate_non_emission_loss)
+                ? input.candidate_non_emission_loss -
+                      input.baseline_non_emission_loss
+                : 0.0;
+        if (input.non_emission_paired_samples > 0 &&
+            (!std::isfinite(out.non_emission_loss_delta) ||
+             out.non_emission_loss_delta > 0.01))
+        {
+            out.rejection =
+                AppearancePhysicalEmissionComponentRejection::
+                    NonEmissionLossRegressed;
+            return out;
+        }
+
+        // A one-sample component is valid.  When the fixed calibration
+        // lattice does not land inside an even smaller emitter, the source
+        // residual and E=1 response remain the two physical proofs; the final
+        // capture still has to preserve the surrounding non-emissive field.
+        if (input.paired_samples > 0)
+        {
+            out.roi_improvement =
+                std::isfinite(input.baseline_loss) &&
+                        std::isfinite(input.candidate_loss) &&
+                        input.baseline_loss > 0.0
+                    ? (input.baseline_loss - input.candidate_loss) /
+                          input.baseline_loss
+                    : -std::numeric_limits<double>::infinity();
+            if (!std::isfinite(out.roi_improvement) ||
+                out.roi_improvement <
+                    AppearanceFitMinimumImprovement)
+            {
+                out.rejection =
+                    AppearancePhysicalEmissionComponentRejection::
+                        RoiImprovementBelowThreshold;
+                return out;
+            }
+        }
+
+        out.accepted = true;
+        out.rejection =
+            AppearancePhysicalEmissionComponentRejection::None;
+        return out;
+    }
+
+    enum class AppearanceCorrectionBoundary
+    {
+        Front,
+        Back,
+    };
+
+    enum class AppearanceCorrectionFieldFailure
+    {
+        None,
+        InvalidInput,
+        SideUnanchored,
+    };
+
+    struct AppearanceCorrectionFieldEdge
+    {
+        int first{-1};
+        int second{-1};
+    };
+
+    struct AppearanceCorrectionFieldAnchor
+    {
+        int vertex{-1};
+        AppearanceRgb value{};
+        double weight{0.0};
+        AppearanceCorrectionBoundary boundary{
+            AppearanceCorrectionBoundary::Front};
+    };
+
+    struct AppearanceCorrectionFieldInput
+    {
+        int vertex_count{0};
+        std::vector<AppearanceCorrectionFieldEdge> edges{};
+        std::vector<bool> side_vertices{};
+        std::vector<AppearanceCorrectionFieldAnchor> anchors{};
+    };
+
+    struct AppearanceCorrectionFieldResult
+    {
+        bool ok{false};
+        AppearanceCorrectionFieldFailure failure{
+            AppearanceCorrectionFieldFailure::None};
+        std::vector<AppearanceRgb> values{};
+        std::vector<bool> resolved{};
+        int front_anchor_vertices{0};
+        int back_anchor_vertices{0};
+        int side_components{0};
+        int one_boundary_side_components{0};
+        int unanchored_side_components{0};
+        int iterations{0};
+        std::uint64_t hash{1469598103934665603ULL};
+    };
+
+    inline AppearanceCorrectionFieldResult
+    appearance_solve_correction_field(
+        const AppearanceCorrectionFieldInput& input)
+    {
+        AppearanceCorrectionFieldResult out{};
+        if (input.vertex_count <= 0 ||
+            input.side_vertices.size() !=
+                static_cast<std::size_t>(input.vertex_count))
+        {
+            out.failure =
+                AppearanceCorrectionFieldFailure::InvalidInput;
+            return out;
+        }
+
+        std::vector<std::vector<int>> adjacency(
+            static_cast<std::size_t>(input.vertex_count));
+        for (const auto& edge : input.edges)
+        {
+            if (edge.first < 0 || edge.second < 0 ||
+                edge.first >= input.vertex_count ||
+                edge.second >= input.vertex_count ||
+                edge.first == edge.second)
+            {
+                out.failure =
+                    AppearanceCorrectionFieldFailure::InvalidInput;
+                return out;
+            }
+            adjacency[static_cast<std::size_t>(edge.first)]
+                .push_back(edge.second);
+            adjacency[static_cast<std::size_t>(edge.second)]
+                .push_back(edge.first);
+        }
+        for (auto& neighbours : adjacency)
+        {
+            std::sort(neighbours.begin(), neighbours.end());
+            neighbours.erase(
+                std::unique(neighbours.begin(), neighbours.end()),
+                neighbours.end());
+        }
+
+        struct WeightedValue
+        {
+            double value{0.0};
+            double weight{0.0};
+        };
+        std::vector<std::array<std::vector<WeightedValue>, 3>>
+            contributions(
+                static_cast<std::size_t>(input.vertex_count));
+        std::vector<bool> front_anchor(
+            static_cast<std::size_t>(input.vertex_count),
+            false);
+        std::vector<bool> back_anchor(
+            static_cast<std::size_t>(input.vertex_count),
+            false);
+        for (const auto& anchor : input.anchors)
+        {
+            if (anchor.vertex < 0 ||
+                anchor.vertex >= input.vertex_count ||
+                !appearance_rgb_finite(anchor.value) ||
+                !std::isfinite(anchor.weight) ||
+                anchor.weight <= 0.0)
+            {
+                continue;
+            }
+            auto& target =
+                contributions[
+                    static_cast<std::size_t>(anchor.vertex)];
+            target[0].push_back({anchor.value.r, anchor.weight});
+            target[1].push_back({anchor.value.g, anchor.weight});
+            target[2].push_back({anchor.value.b, anchor.weight});
+            if (anchor.boundary ==
+                AppearanceCorrectionBoundary::Front)
+            {
+                front_anchor[
+                    static_cast<std::size_t>(anchor.vertex)] = true;
+            }
+            else
+            {
+                back_anchor[
+                    static_cast<std::size_t>(anchor.vertex)] = true;
+            }
+        }
+
+        out.values.assign(
+            static_cast<std::size_t>(input.vertex_count),
+            {});
+        out.resolved.assign(
+            static_cast<std::size_t>(input.vertex_count),
+            false);
+        std::vector<bool> anchored(
+            static_cast<std::size_t>(input.vertex_count),
+            false);
+        const auto weighted_median =
+            [](std::vector<WeightedValue> values) {
+                std::sort(
+                    values.begin(),
+                    values.end(),
+                    [](const auto& left, const auto& right) {
+                        if (left.value != right.value)
+                        {
+                            return left.value < right.value;
+                        }
+                        return left.weight < right.weight;
+                    });
+                double total = 0.0;
+                for (const auto& value : values)
+                {
+                    total += value.weight;
+                }
+                const auto middle = total * 0.5;
+                double cumulative = 0.0;
+                for (const auto& value : values)
+                {
+                    cumulative += value.weight;
+                    if (cumulative >= middle)
+                    {
+                        return value.value;
+                    }
+                }
+                return values.empty() ? 0.0 : values.back().value;
+            };
+        for (int vertex = 0; vertex < input.vertex_count; ++vertex)
+        {
+            const auto index = static_cast<std::size_t>(vertex);
+            if (contributions[index][0].empty())
+            {
+                continue;
+            }
+            out.values[index] = {
+                weighted_median(contributions[index][0]),
+                weighted_median(contributions[index][1]),
+                weighted_median(contributions[index][2])};
+            anchored[index] = true;
+            out.resolved[index] = true;
+            out.front_anchor_vertices += front_anchor[index] ? 1 : 0;
+            out.back_anchor_vertices += back_anchor[index] ? 1 : 0;
+        }
+
+        std::vector<int> component_by_vertex(
+            static_cast<std::size_t>(input.vertex_count),
+            -1);
+        std::vector<std::vector<int>> components{};
+        std::vector<int> stack{};
+        for (int first = 0; first < input.vertex_count; ++first)
+        {
+            if (component_by_vertex[
+                    static_cast<std::size_t>(first)] >= 0)
+            {
+                continue;
+            }
+            const auto component_index =
+                static_cast<int>(components.size());
+            components.push_back({});
+            stack.clear();
+            stack.push_back(first);
+            component_by_vertex[
+                static_cast<std::size_t>(first)] = component_index;
+            while (!stack.empty())
+            {
+                const auto vertex = stack.back();
+                stack.pop_back();
+                components.back().push_back(vertex);
+                for (const auto neighbour :
+                     adjacency[static_cast<std::size_t>(vertex)])
+                {
+                    if (component_by_vertex[
+                            static_cast<std::size_t>(neighbour)] >= 0)
+                    {
+                        continue;
+                    }
+                    component_by_vertex[
+                        static_cast<std::size_t>(neighbour)] =
+                        component_index;
+                    stack.push_back(neighbour);
+                }
+            }
+        }
+
+        for (const auto& component : components)
+        {
+            bool has_side = false;
+            bool has_front = false;
+            bool has_back = false;
+            int anchor_count = 0;
+            AppearanceRgb anchor_mean{};
+            for (const auto vertex : component)
+            {
+                const auto index = static_cast<std::size_t>(vertex);
+                has_side = has_side || input.side_vertices[index];
+                has_front = has_front || front_anchor[index];
+                has_back = has_back || back_anchor[index];
+                if (anchored[index])
+                {
+                    anchor_mean.r += out.values[index].r;
+                    anchor_mean.g += out.values[index].g;
+                    anchor_mean.b += out.values[index].b;
+                    ++anchor_count;
+                }
+            }
+            if (has_side)
+            {
+                ++out.side_components;
+            }
+            if (has_side && anchor_count == 0)
+            {
+                ++out.unanchored_side_components;
+                continue;
+            }
+            if (has_side && (has_front != has_back))
+            {
+                ++out.one_boundary_side_components;
+            }
+            if (anchor_count == 0)
+            {
+                continue;
+            }
+            anchor_mean.r /= static_cast<double>(anchor_count);
+            anchor_mean.g /= static_cast<double>(anchor_count);
+            anchor_mean.b /= static_cast<double>(anchor_count);
+            for (const auto vertex : component)
+            {
+                const auto index = static_cast<std::size_t>(vertex);
+                if (!anchored[index])
+                {
+                    out.values[index] = anchor_mean;
+                    out.resolved[index] = true;
+                }
+            }
+        }
+
+        constexpr int maximum_iterations = 512;
+        constexpr double convergence_epsilon = 0.0000001;
+        auto next = out.values;
+        for (int iteration = 0; iteration < maximum_iterations; ++iteration)
+        {
+            double maximum_delta = 0.0;
+            for (int vertex = 0; vertex < input.vertex_count; ++vertex)
+            {
+                const auto index = static_cast<std::size_t>(vertex);
+                if (anchored[index] || !out.resolved[index] ||
+                    adjacency[index].empty())
+                {
+                    next[index] = out.values[index];
+                    continue;
+                }
+                AppearanceRgb average{};
+                int neighbours = 0;
+                for (const auto neighbour : adjacency[index])
+                {
+                    const auto neighbour_index =
+                        static_cast<std::size_t>(neighbour);
+                    if (!out.resolved[neighbour_index])
+                    {
+                        continue;
+                    }
+                    average.r += out.values[neighbour_index].r;
+                    average.g += out.values[neighbour_index].g;
+                    average.b += out.values[neighbour_index].b;
+                    ++neighbours;
+                }
+                if (neighbours <= 0)
+                {
+                    continue;
+                }
+                average.r /= static_cast<double>(neighbours);
+                average.g /= static_cast<double>(neighbours);
+                average.b /= static_cast<double>(neighbours);
+                maximum_delta = std::max(
+                    maximum_delta,
+                    std::max({
+                        std::abs(
+                            average.r - out.values[index].r),
+                        std::abs(
+                            average.g - out.values[index].g),
+                        std::abs(
+                            average.b - out.values[index].b)}));
+                next[index] = average;
+            }
+            out.values.swap(next);
+            out.iterations = iteration + 1;
+            if (maximum_delta <= convergence_epsilon)
+            {
+                break;
+            }
+        }
+
+        const auto hash_mix = [&out](std::uint64_t value) {
+            out.hash ^= value;
+            out.hash *= 1099511628211ULL;
+        };
+        hash_mix(static_cast<std::uint64_t>(input.vertex_count));
+        for (std::size_t index = 0; index < out.values.size(); ++index)
+        {
+            hash_mix(out.resolved[index] ? 1ULL : 0ULL);
+            if (!out.resolved[index])
+            {
+                continue;
+            }
+            const std::array<double, 3> channels{
+                out.values[index].r,
+                out.values[index].g,
+                out.values[index].b};
+            for (const auto channel : channels)
+            {
+                const auto quantized = static_cast<std::uint64_t>(
+                    static_cast<std::int64_t>(
+                        std::llround(channel * 1000000.0)));
+                hash_mix(quantized);
+            }
+        }
+        out.ok = out.unanchored_side_components == 0;
+        out.failure = out.ok
+                          ? AppearanceCorrectionFieldFailure::None
+                          : AppearanceCorrectionFieldFailure::SideUnanchored;
+        return out;
+    }
+
+    inline AppearanceBoundedResponseCalibration
+    appearance_calibrate_albedo_blend(
+        const AppearanceRgb& source_hdr,
+        const AppearanceRgb& display_albedo_capture_hdr,
+        const AppearanceRgb& base_albedo_capture_hdr)
+    {
+        return appearance_calibrate_bounded_response(
+            source_hdr,
+            display_albedo_capture_hdr,
+            base_albedo_capture_hdr,
+            1.0,
+            0.0,
+            0.0,
+            1.0);
+    }
+
+    struct AppearanceAlbedoRgbCalibration
+    {
+        bool supported{false};
+        int responsive_channels{0};
+        AppearanceRgb albedo{};
+        std::array<bool, 3> channel_supported{{false, false, false}};
+    };
+
+    inline AppearanceAlbedoRgbCalibration
+    appearance_calibrate_albedo_chromaticity(
+        const AppearanceRgb& base_albedo,
+        const AppearanceRgb& source_hdr,
+        const AppearanceRgb& base_albedo_capture_hdr)
+    {
+        AppearanceAlbedoRgbCalibration out{};
+        out.albedo = appearance_clamp_albedo(base_albedo);
+        if (!appearance_rgb_finite(base_albedo) ||
+            !appearance_rgb_finite(source_hdr) ||
+            !appearance_rgb_finite(base_albedo_capture_hdr))
+        {
+            return out;
+        }
+
+        const auto source_sum =
+            source_hdr.r + source_hdr.g + source_hdr.b;
+        const auto target_sum =
+            base_albedo_capture_hdr.r +
+            base_albedo_capture_hdr.g +
+            base_albedo_capture_hdr.b;
+        const auto base_luminance =
+            appearance_luminance(base_albedo);
+        if (!std::isfinite(source_sum) ||
+            !std::isfinite(target_sum) ||
+            source_sum <= 0.001 ||
+            target_sum <= 0.001 ||
+            base_luminance <= 0.00001)
+        {
+            return out;
+        }
+
+        const auto calibrate_channel = [](
+                                           double base,
+                                           double source_chroma,
+                                           double target_chroma,
+                                           double& calibrated) {
+            if (!std::isfinite(source_chroma) ||
+                !std::isfinite(target_chroma) ||
+                target_chroma <= 0.005)
+            {
+                return false;
+            }
+            calibrated =
+                base * source_chroma / target_chroma;
+            return std::isfinite(calibrated);
+        };
+
+        out.channel_supported[0] = calibrate_channel(
+            base_albedo.r,
+            source_hdr.r / source_sum,
+            base_albedo_capture_hdr.r / target_sum,
+            out.albedo.r);
+        out.channel_supported[1] = calibrate_channel(
+            base_albedo.g,
+            source_hdr.g / source_sum,
+            base_albedo_capture_hdr.g / target_sum,
+            out.albedo.g);
+        out.channel_supported[2] = calibrate_channel(
+            base_albedo.b,
+            source_hdr.b / source_sum,
+            base_albedo_capture_hdr.b / target_sum,
+            out.albedo.b);
+        out.responsive_channels =
+            static_cast<int>(out.channel_supported[0]) +
+            static_cast<int>(out.channel_supported[1]) +
+            static_cast<int>(out.channel_supported[2]);
+        out.supported = out.responsive_channels >= 2;
+        const auto calibrated_luminance =
+            appearance_luminance(out.albedo);
+        if (!out.supported ||
+            !std::isfinite(calibrated_luminance) ||
+            calibrated_luminance <= 0.00001)
+        {
+            out.albedo = appearance_clamp_albedo(base_albedo);
+            out.supported = false;
+            return out;
+        }
+        const auto preserve_luminance =
+            base_luminance / calibrated_luminance;
+        out.albedo = appearance_clamp_albedo(
+            {out.albedo.r * preserve_luminance,
+             out.albedo.g * preserve_luminance,
+             out.albedo.b * preserve_luminance});
+        return out;
+    }
+
+    struct AppearanceAlbedoCandidateAcceptance
+    {
+        int paired_samples{0};
+        bool camera_stable{false};
+        bool readback_calibrated{false};
+        double baseline_loss{
+            std::numeric_limits<double>::infinity()};
+        double candidate_loss{
+            std::numeric_limits<double>::infinity()};
+        double baseline_median_delta_e{
+            std::numeric_limits<double>::infinity()};
+        double candidate_median_delta_e{
+            std::numeric_limits<double>::infinity()};
+    };
+
+    inline bool appearance_albedo_candidate_accepted(
+        const AppearanceAlbedoCandidateAcceptance& value)
+    {
+        return value.paired_samples >=
+                   AppearanceFitMinimumSamples &&
+               value.camera_stable &&
+               value.readback_calibrated &&
+               std::isfinite(value.baseline_loss) &&
+               std::isfinite(value.candidate_loss) &&
+               std::isfinite(
+                   value.baseline_median_delta_e) &&
+               std::isfinite(
+                   value.candidate_median_delta_e) &&
+               value.baseline_loss > 0.0 &&
+               value.candidate_loss <
+                   value.baseline_loss &&
+               value.candidate_median_delta_e <=
+                   value.baseline_median_delta_e;
+    }
+
+    struct AppearanceAlbedoChromaticityGain
+    {
+        bool supported{false};
+        int responsive_channels{0};
+        AppearanceRgb gain{1.0, 1.0, 1.0};
+    };
+
+    inline AppearanceAlbedoChromaticityGain
+    appearance_robust_albedo_chromaticity_gain(
+        const std::array<std::vector<double>, 3>&
+            log_gain_estimates)
+    {
+        AppearanceAlbedoChromaticityGain out{};
+        std::array<double, 3> gains{{1.0, 1.0, 1.0}};
+        for (std::size_t channel = 0;
+             channel < log_gain_estimates.size();
+             ++channel)
+        {
+            std::vector<double> finite{};
+            finite.reserve(
+                log_gain_estimates[channel].size());
+            for (const auto estimate :
+                 log_gain_estimates[channel])
+            {
+                if (std::isfinite(estimate))
+                {
+                    finite.push_back(estimate);
+                }
+            }
+            if (finite.size() <
+                static_cast<std::size_t>(
+                    AppearanceClusterEmissiveMinimumSamples))
+            {
+                continue;
+            }
+            const auto middle =
+                finite.begin() +
+                static_cast<std::ptrdiff_t>(
+                    finite.size() / 2U);
+            std::nth_element(
+                finite.begin(),
+                middle,
+                finite.end());
+            const auto gain = std::exp(*middle);
+            if (!std::isfinite(gain) || gain <= 0.0)
+            {
+                continue;
+            }
+            gains[channel] = gain;
+            ++out.responsive_channels;
+        }
+        out.supported = out.responsive_channels >= 2;
+        if (out.supported)
+        {
+            out.gain = {gains[0], gains[1], gains[2]};
+        }
+        return out;
+    }
+
+    inline AppearanceRgb
+    appearance_apply_albedo_chromaticity_gain(
+        const AppearanceRgb& base_albedo,
+        const AppearanceRgb& gain)
+    {
+        const auto base =
+            appearance_clamp_albedo(base_albedo);
+        if (!appearance_rgb_finite(base) ||
+            !appearance_rgb_finite(gain) ||
+            gain.r <= 0.0 ||
+            gain.g <= 0.0 ||
+            gain.b <= 0.0)
+        {
+            return base;
+        }
+        AppearanceRgb adjusted{
+            base.r * gain.r,
+            base.g * gain.g,
+            base.b * gain.b};
+        const auto base_luminance =
+            appearance_luminance(base);
+        const auto adjusted_luminance =
+            appearance_luminance(adjusted);
+        if (!std::isfinite(base_luminance) ||
+            !std::isfinite(adjusted_luminance) ||
+            adjusted_luminance <= 0.00001)
+        {
+            return base;
+        }
+        const auto preserve_luminance =
+            base_luminance / adjusted_luminance;
+        return appearance_clamp_albedo(
+            {adjusted.r * preserve_luminance,
+             adjusted.g * preserve_luminance,
+             adjusted.b * preserve_luminance});
+    }
+
+    struct AppearanceClusterEmissiveEvidence
+    {
+        int paired_samples{0};
+        int responsive_samples{0};
+        double source_seed{0.0};
+        double fallback_loss{std::numeric_limits<double>::infinity()};
+        double endpoint_loss{std::numeric_limits<double>::infinity()};
+    };
+
+    inline bool appearance_cluster_emissive_supported(
+        const AppearanceClusterEmissiveEvidence& value)
+    {
+        if (value.paired_samples < AppearanceClusterEmissiveMinimumSamples ||
+            value.responsive_samples < AppearanceClusterEmissiveMinimumSamples ||
+            !std::isfinite(value.source_seed) ||
+            !std::isfinite(value.fallback_loss) ||
+            !std::isfinite(value.endpoint_loss) ||
+            value.fallback_loss <= 0.0)
+        {
+            return false;
+        }
+        const auto coverage =
+            static_cast<double>(value.responsive_samples) /
+            static_cast<double>(value.paired_samples);
+        // E=1 is a response endpoint, not an expected solution. A valid
+        // emissive material can easily overshoot the requested appearance at
+        // that endpoint and therefore have a worse loss than E=0. Positive
+        // per-sample response is established before this helper is called;
+        // final calibrated candidates still have to pass the strict global
+        // loss/DeltaE acceptance gate.
+        return coverage >= AppearanceClusterEmissiveMinimumCoverage &&
+               value.source_seed >= AppearanceClusterEmissiveMinimumSourceSeed;
+    }
+
+    struct AppearanceCalibratedClusterEmissiveEvidence
+    {
+        int paired_samples{0};
+        int responsive_samples{0};
+        double calibrated_emissive{0.0};
+        double fallback_loss{std::numeric_limits<double>::infinity()};
+        double calibrated_loss{std::numeric_limits<double>::infinity()};
+        int intrinsic_core_samples{0};
+    };
+
+    inline bool appearance_emission_material_active(
+        bool intrinsic_emission_roi,
+        double emissive)
+    {
+        return intrinsic_emission_roi &&
+               std::isfinite(emissive) &&
+               std::llround(
+                   std::clamp(emissive, 0.0, 1.0) *
+                   255.0) > 0;
+    }
+
+    inline bool appearance_calibrated_cluster_emissive_supported(
+        const AppearanceCalibratedClusterEmissiveEvidence& value)
+    {
+        if (value.paired_samples <
+                AppearanceClusterEmissiveMinimumSamples ||
+            value.responsive_samples <
+                AppearanceClusterEmissiveMinimumSamples ||
+            !appearance_emission_material_active(
+                true,
+                value.calibrated_emissive) ||
+            !std::isfinite(value.fallback_loss) ||
+            !std::isfinite(value.calibrated_loss) ||
+            value.fallback_loss <= 0.0)
+        {
+            return false;
+        }
+        const auto coverage =
+            static_cast<double>(value.responsive_samples) /
+            static_cast<double>(value.paired_samples);
+        const auto improvement =
+            (value.fallback_loss - value.calibrated_loss) /
+            value.fallback_loss;
+        if (coverage >=
+                AppearanceClusterEmissiveMinimumCoverage &&
+            improvement >=
+                AppearanceClusterCandidateMinimumImprovement)
+        {
+            return true;
+        }
+        const auto intrinsic_core_coverage =
+            static_cast<double>(
+                std::max(0, value.intrinsic_core_samples)) /
+            static_cast<double>(value.paired_samples);
+        // A compact source emitter can already match E=0 from Albedo alone,
+        // making calibrated E nearly loss-neutral. Preserve its physical
+        // emissive channel only when the isolated capture and target E
+        // response independently cover most of the cluster. This does not
+        // relax the gate for sparse light spill or reflection samples.
+        return coverage >=
+                   AppearanceClusterCalibratedMinimumCoverage &&
+               intrinsic_core_coverage >=
+                   AppearanceClusterIntrinsicCoreMinimumCoverage &&
+               improvement >=
+                   -AppearanceClusterNearNeutralMaximumLossIncrease;
+    }
+
+    enum class AppearanceClusterCandidate
+    {
+        Fallback,
+        Endpoint,
+        SourceSeed,
+    };
+
+    struct AppearanceClusterCandidateEvidence
+    {
+        int paired_samples{0};
+        int source_candidate_samples{0};
+        double source_seed{0.0};
+        double fallback_loss{std::numeric_limits<double>::infinity()};
+        double endpoint_loss{std::numeric_limits<double>::infinity()};
+        double source_seed_loss{std::numeric_limits<double>::infinity()};
+    };
+
+    inline AppearanceClusterCandidate appearance_select_cluster_candidate(
+        const AppearanceClusterCandidateEvidence& value)
+    {
+        if (value.paired_samples < AppearanceClusterEmissiveMinimumSamples ||
+            value.source_candidate_samples < AppearanceClusterEmissiveMinimumSamples ||
+            !std::isfinite(value.source_seed) ||
+            !std::isfinite(value.fallback_loss) ||
+            !std::isfinite(value.endpoint_loss) ||
+            !std::isfinite(value.source_seed_loss) ||
+            value.fallback_loss <= 0.0 ||
+            value.source_seed < AppearanceClusterEmissiveMinimumSourceSeed)
+        {
+            return AppearanceClusterCandidate::Fallback;
+        }
+        const auto coverage =
+            static_cast<double>(value.source_candidate_samples) /
+            static_cast<double>(value.paired_samples);
+        if (coverage < AppearanceClusterSourceCandidateMinimumCoverage)
+        {
+            return AppearanceClusterCandidate::Fallback;
+        }
+        const auto endpoint_improvement =
+            (value.fallback_loss - value.endpoint_loss) /
+            value.fallback_loss;
+        const auto seed_improvement =
+            (value.fallback_loss - value.source_seed_loss) /
+            value.fallback_loss;
+        if (endpoint_improvement < AppearanceClusterCandidateMinimumImprovement &&
+            seed_improvement < AppearanceClusterCandidateMinimumImprovement)
+        {
+            return AppearanceClusterCandidate::Fallback;
+        }
+        return endpoint_improvement > seed_improvement
+                   ? AppearanceClusterCandidate::Endpoint
+                   : AppearanceClusterCandidate::SourceSeed;
+    }
+
+    struct AppearanceCalibratedEmissiveAcceptance
+    {
+        int paired_samples{0};
+        int responsive_samples{0};
+        int active_clusters{0};
+        bool camera_stable{false};
+        bool readback_calibrated{false};
+        double fallback_loss{std::numeric_limits<double>::infinity()};
+        double calibrated_loss{std::numeric_limits<double>::infinity()};
+        double fallback_median_delta_e{std::numeric_limits<double>::infinity()};
+        double calibrated_median_delta_e{std::numeric_limits<double>::infinity()};
+        double emissive_max{0.0};
+    };
+
+    inline bool appearance_calibrated_emissive_accepted(
+        const AppearanceCalibratedEmissiveAcceptance& value)
+    {
+        const auto improvement =
+            std::isfinite(value.fallback_loss) &&
+                    std::isfinite(value.calibrated_loss) &&
+                    value.fallback_loss > 0.0
+                ? (value.fallback_loss - value.calibrated_loss) /
+                      value.fallback_loss
+                : -std::numeric_limits<double>::infinity();
+        return value.paired_samples >= AppearanceFitMinimumSamples &&
+               value.responsive_samples >= AppearanceClusterEmissiveMinimumSamples &&
+               value.active_clusters > 0 &&
+               value.camera_stable &&
+               value.readback_calibrated &&
+               std::isfinite(value.fallback_loss) &&
+               std::isfinite(value.calibrated_loss) &&
+               std::isfinite(value.fallback_median_delta_e) &&
+               std::isfinite(value.calibrated_median_delta_e) &&
+               value.fallback_loss > 0.0 &&
+               improvement >= AppearanceFitMinimumImprovement &&
+               value.calibrated_median_delta_e <=
+                   AppearanceFitMedianDeltaEMaximum &&
+               value.emissive_max >= AppearanceCalibratedEmissiveMinimumMaximum;
+    }
+
+    using AppearanceClusterLocalAcceptance =
+        AppearanceCalibratedEmissiveAcceptance;
+
+    inline bool appearance_cluster_local_candidate_accepted(
+        const AppearanceClusterLocalAcceptance& value)
+    {
+        return appearance_calibrated_emissive_accepted(value);
+    }
+
+    inline double appearance_max_channel_delta(const AppearanceRgb& left,
+                                               const AppearanceRgb& right)
+    {
+        return std::max({std::abs(left.r - right.r),
+                         std::abs(left.g - right.g),
+                         std::abs(left.b - right.b)});
+    }
+
+    inline AppearanceRgb appearance_decode_r10g10b10a2(
+        std::uint32_t packed)
+    {
+        return {
+            static_cast<double>(packed & 0x3ffu) / 1023.0,
+            static_cast<double>((packed >> 10u) & 0x3ffu) / 1023.0,
+            static_cast<double>((packed >> 20u) & 0x3ffu) / 1023.0};
+    }
+
+    inline AppearanceRgb appearance_decode_rgba8(
+        std::uint32_t packed,
+        bool bgra)
+    {
+        const auto c0 = static_cast<double>(packed & 0xffu) / 255.0;
+        const auto c1 =
+            static_cast<double>((packed >> 8u) & 0xffu) / 255.0;
+        const auto c2 =
+            static_cast<double>((packed >> 16u) & 0xffu) / 255.0;
+        return bgra ? AppearanceRgb{c2, c1, c0}
+                    : AppearanceRgb{c0, c1, c2};
+    }
+
+    inline AppearanceRgb appearance_blend_albedo(const AppearanceRgb& base_linear,
+                                                  const AppearanceRgb& display_linear,
+                                                  double blend)
+    {
+        // Appearance Match may interpolate between the material BaseColor and
+        // the observed display colour.  It must not extrapolate past that
+        // observation: doing so made non-emissive surfaces visibly change
+        // hue/value merely because the target lighting response differed.
+        const auto safe_blend = std::clamp(blend, 0.0, 1.0);
+        return appearance_clamp_albedo({base_linear.r + (display_linear.r - base_linear.r) * safe_blend,
+                                        base_linear.g + (display_linear.g - base_linear.g) * safe_blend,
+                                        base_linear.b + (display_linear.b - base_linear.b) * safe_blend});
+    }
+
+    inline AppearanceRgb appearance_source_albedo_target(
+        const AppearanceRgb& base_linear,
+        const AppearanceRgb& display_linear,
+        const AppearanceRgb& emission_linear,
+        bool emission_roi,
+        bool include_shadows)
+    {
+        if (emission_roi && appearance_rgb_finite(emission_linear))
+        {
+            return appearance_clamp_albedo(emission_linear);
+        }
+        if (include_shadows && appearance_rgb_finite(display_linear))
+        {
+            return appearance_clamp_albedo(display_linear);
+        }
+        return appearance_clamp_albedo(base_linear);
+    }
+
+    inline AppearanceRgb appearance_source_display_or_base(
+        const AppearanceRgb& base_linear,
+        const AppearanceRgb& captured_display_linear,
+        bool captured_display_available)
+    {
+        if (captured_display_available &&
+            appearance_rgb_finite(captured_display_linear))
+        {
+            return appearance_clamp_albedo(
+                captured_display_linear);
+        }
+        return appearance_clamp_albedo(base_linear);
+    }
+
+    inline AppearanceRgb appearance_parameterized_albedo(
+        const AppearanceRgb& base_linear,
+        const AppearanceRgb& target_linear,
+        double parameter,
+        bool emission_roi)
+    {
+        if (!emission_roi)
+        {
+            return appearance_blend_albedo(
+                base_linear,
+                target_linear,
+                parameter);
+        }
+        if (!appearance_rgb_finite(target_linear))
+        {
+            return appearance_clamp_albedo(base_linear);
+        }
+        // Emissive colour is carried by Albedo in RuntimePaintable.  Mixing
+        // isolated emission chromaticity back toward a neutral BaseColor can
+        // turn a coloured source light white.  Keep the RGB ratio fixed and
+        // expose only a bounded intensity scale to feedback fitting.
+        const auto scale =
+            std::isfinite(parameter)
+                ? std::clamp(parameter, 0.0, 1.0)
+                : 0.0;
+        return appearance_clamp_albedo(
+            {target_linear.r * scale,
+             target_linear.g * scale,
+             target_linear.b * scale});
+    }
+
+    inline double appearance_initial_albedo_blend(const AppearanceRgb& base_linear,
+                                                  const AppearanceRgb& display_linear)
+    {
+        // A 0.20 linear-channel residual has enough visual significance to
+        // prefer the observed final colour over the source material colour.
+        return std::clamp(appearance_max_channel_delta(base_linear, display_linear) / 0.20, 0.0, 1.0);
+    }
+
+    inline double appearance_initial_emissive(const AppearanceRgb& base_linear,
+                                              const AppearanceRgb& final_hdr)
+    {
+        const auto base = std::max(0.0, appearance_luminance(base_linear));
+        const auto final = std::max(0.0, appearance_luminance(final_hdr));
+        const auto stops = std::log2(1.0 + final) - std::log2(1.0 + base);
+        return std::clamp((stops - 0.15) / 2.0, 0.0, 1.0);
+    }
+
+    struct AppearanceMaterial
+    {
+        double albedo_blend{0.0};
+        double metallic{0.0};
+        double roughness{AppearanceFallbackRoughness};
+        double emissive{0.0};
+    };
+
+    struct AppearanceFallback
+    {
+        AppearanceRgb albedo{};
+        AppearanceMaterial material{};
+    };
+
+    inline AppearanceFallback appearance_make_fallback(const AppearanceRgb& display_linear)
+    {
+        AppearanceFallback out{};
+        out.albedo = appearance_clamp_albedo(display_linear);
+        out.material = {1.0, 0.0, AppearanceFallbackRoughness, 0.0};
+        return out;
+    }
+
+    inline AppearanceFallback appearance_make_safe_fallback(
+        const AppearanceRgb& base_linear,
+        const AppearanceRgb& display_linear,
+        bool base_available)
+    {
+        // A display-referred colour already contains the source scene's
+        // lighting. Feeding it back as Albedo applies the target lighting a
+        // second time and can rotate dark neutrals toward the light colour.
+        // Prefer the intrinsic BaseColor whenever that capture is usable.
+        const auto use_base =
+            base_available &&
+            appearance_rgb_finite(base_linear);
+        auto out = appearance_make_fallback(
+            use_base ? base_linear : display_linear);
+        out.material.albedo_blend =
+            use_base ? 0.0 : 1.0;
+        return out;
+    }
+
+    inline AppearanceFallback appearance_make_safe_final_fallback(
+        const AppearanceRgb& base_linear,
+        const AppearanceRgb& display_linear,
+        bool base_available,
+        bool intrinsic_emission_roi)
+    {
+        // A rejected intrinsic-emission fit must retain the display-colour
+        // baseline that was actually evaluated. Falling back to a dark
+        // emitter BaseColor here produces an unobserved black result. Keep
+        // Emissive disabled, while preserving the emitter's observed colour
+        // in Albedo. Non-emission samples retain the lighting-safe BaseColor
+        // fallback.
+        return intrinsic_emission_roi
+                   ? appearance_make_fallback(display_linear)
+                   : appearance_make_safe_fallback(
+                         base_linear,
+                         display_linear,
+                         base_available);
+    }
+
+    inline std::uint8_t appearance_quantize_unit(double value)
+    {
+        return static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 1.0) * 255.0));
+    }
+
+    inline AppearanceRgb appearance_manual_fixed_material_albedo(
+        const AppearanceRgb& display_linear,
+        const AppearanceRgb& current_albedo,
+        bool intrinsic_emission_roi,
+        double fixed_emissive)
+    {
+        // With Manual Emissive disabled, isolated source emission is only an
+        // input classification signal. Using its chromaticity as Albedo makes
+        // bright sources yellow, while the zero-blend response endpoint turns
+        // them black. Keep those texels at the observed display colour for
+        // every temporary feedback candidate.
+        if (intrinsic_emission_roi &&
+            std::isfinite(fixed_emissive) &&
+            appearance_quantize_unit(fixed_emissive) == 0 &&
+            appearance_rgb_finite(display_linear))
+        {
+            return appearance_clamp_albedo(display_linear);
+        }
+        return appearance_clamp_albedo(current_albedo);
+    }
+
+    inline std::uint64_t appearance_material_key(const AppearanceMaterial& material,
+                                                 bool fallback)
+    {
+        std::uint64_t hash = 1469598103934665603ull;
+        const auto mix = [&hash](std::uint8_t value) {
+            hash ^= static_cast<std::uint64_t>(value);
+            hash *= 1099511628211ull;
+        };
+        mix(appearance_quantize_unit(material.metallic));
+        mix(appearance_quantize_unit(material.roughness));
+        mix(appearance_quantize_unit(material.emissive));
+        mix(fallback ? 1u : 0u);
+        return hash;
+    }
+
+    enum class AppearanceReadbackTransform
+    {
+        Identity,
+        SwapRedBlue,
+    };
+
+    struct AppearanceReadbackCalibration
+    {
+        bool ok{false};
+        AppearanceReadbackTransform transform{AppearanceReadbackTransform::Identity};
+        double median_error{std::numeric_limits<double>::infinity()};
+        double runner_up_median{std::numeric_limits<double>::infinity()};
+    };
+
+    inline AppearanceReadbackCalibration appearance_calibrate_linear_readback(
+        const std::vector<AppearanceRgb>& expected,
+        const std::vector<AppearanceRgb>& raw,
+        double maximum_median_error = 0.04)
+    {
+        AppearanceReadbackCalibration out{};
+        const auto count = std::min(expected.size(), raw.size());
+        if (count < 16)
+        {
+            return out;
+        }
+        const auto median_for = [&](AppearanceReadbackTransform transform) {
+            std::vector<double> errors{};
+            errors.reserve(count);
+            for (std::size_t index = 0; index < count; ++index)
+            {
+                auto candidate = raw[index];
+                if (transform == AppearanceReadbackTransform::SwapRedBlue)
+                {
+                    std::swap(candidate.r, candidate.b);
+                }
+                errors.push_back(appearance_max_channel_delta(expected[index], candidate));
+            }
+            const auto middle = errors.begin() + static_cast<std::ptrdiff_t>(errors.size() / 2);
+            std::nth_element(errors.begin(), middle, errors.end());
+            return *middle;
+        };
+        const auto identity = median_for(AppearanceReadbackTransform::Identity);
+        const auto swapped = median_for(AppearanceReadbackTransform::SwapRedBlue);
+        out.transform = swapped < identity ? AppearanceReadbackTransform::SwapRedBlue
+                                           : AppearanceReadbackTransform::Identity;
+        out.median_error = std::min(identity, swapped);
+        out.runner_up_median = std::max(identity, swapped);
+        const auto separated = out.runner_up_median >= out.median_error * 1.10 ||
+                               out.runner_up_median - out.median_error >= 0.005;
+        out.ok = std::isfinite(out.median_error) && out.median_error <= maximum_median_error && separated;
+        return out;
+    }
+
+    struct AppearanceSpsaPair
+    {
+        std::vector<double> plus{};
+        std::vector<double> minus{};
+        std::vector<double> direction{};
+    };
+
+    inline double appearance_parameter_bound(std::size_t parameter_index)
+    {
+        (void)parameter_index;
+        return 1.0;
+    }
+
+    inline std::vector<double>
+    appearance_fixed_material_parameters(
+        const std::vector<double>& source,
+        double metallic,
+        double roughness,
+        double emissive)
+    {
+        if (source.size() % 4U != 0U)
+        {
+            return {};
+        }
+        auto out = source;
+        const auto fixed_metallic =
+            std::clamp(metallic, 0.0, 1.0);
+        const auto fixed_roughness =
+            std::clamp(roughness, 0.0, 1.0);
+        const auto fixed_emissive =
+            std::clamp(emissive, 0.0, 1.0);
+        for (std::size_t offset = 0;
+             offset < out.size();
+             offset += 4U)
+        {
+            out[offset + 0U] =
+                std::clamp(
+                    out[offset + 0U],
+                    0.0,
+                    appearance_parameter_bound(offset));
+            out[offset + 1U] = fixed_metallic;
+            out[offset + 2U] = fixed_roughness;
+            out[offset + 3U] = fixed_emissive;
+        }
+        return out;
+    }
+
+    inline std::uint64_t appearance_spsa_hash(std::uint64_t value)
+    {
+        value += 0x9e3779b97f4a7c15ull;
+        value = (value ^ (value >> 30u)) * 0xbf58476d1ce4e5b9ull;
+        value = (value ^ (value >> 27u)) * 0x94d049bb133111ebull;
+        return value ^ (value >> 31u);
+    }
+
+    inline AppearanceSpsaPair appearance_spsa_pair(const std::vector<double>& parameters,
+                                                    int iteration,
+                                                    std::uint64_t seed)
+    {
+        AppearanceSpsaPair out{};
+        out.plus.resize(parameters.size());
+        out.minus.resize(parameters.size());
+        out.direction.resize(parameters.size());
+        const double decay = std::pow(static_cast<double>(std::max(1, iteration + 1)), 0.101);
+        constexpr std::array<double, 4> perturbation{{0.12, 0.12, 0.15, 0.15}};
+        for (std::size_t index = 0; index < parameters.size(); ++index)
+        {
+            const auto random = appearance_spsa_hash(seed ^
+                                                      (static_cast<std::uint64_t>(iteration + 1) << 32u) ^
+                                                      static_cast<std::uint64_t>(index + 1));
+            const double direction = (random & 1ull) == 0 ? -1.0 : 1.0;
+            const double delta = perturbation[index % perturbation.size()] / decay;
+            out.direction[index] = direction;
+            out.plus[index] = std::clamp(parameters[index] + direction * delta,
+                                         0.0,
+                                         appearance_parameter_bound(index));
+            out.minus[index] = std::clamp(parameters[index] - direction * delta,
+                                          0.0,
+                                          appearance_parameter_bound(index));
+        }
+        return out;
+    }
+
+    inline std::vector<double> appearance_spsa_update(const std::vector<double>& parameters,
+                                                       const AppearanceSpsaPair& pair,
+                                                       double loss_plus,
+                                                       double loss_minus,
+                                                       int iteration)
+    {
+        if (parameters.size() != pair.plus.size() ||
+            parameters.size() != pair.minus.size() ||
+            parameters.size() != pair.direction.size() ||
+            !std::isfinite(loss_plus) || !std::isfinite(loss_minus))
+        {
+            return parameters;
+        }
+        std::vector<double> out(parameters);
+        const double gain_decay = std::pow(static_cast<double>(std::max(1, iteration + 1)), 0.602);
+        constexpr std::array<double, 4> gains{{0.18, 0.15, 0.18, 0.20}};
+        constexpr std::array<double, 4> perturbation{{0.12, 0.12, 0.15, 0.15}};
+        for (std::size_t index = 0; index < parameters.size(); ++index)
+        {
+            const double delta = perturbation[index % perturbation.size()] /
+                                 std::pow(static_cast<double>(std::max(1, iteration + 1)), 0.101);
+            if (delta <= 0.0 || !std::isfinite(delta) || pair.direction[index] == 0.0)
+            {
+                continue;
+            }
+            const double gradient = ((loss_plus - loss_minus) / (2.0 * delta)) * pair.direction[index];
+            const double gain = gains[index % gains.size()] / gain_decay;
+            out[index] = std::clamp(parameters[index] - gain * gradient,
+                                    0.0,
+                                    appearance_parameter_bound(index));
+        }
+        return out;
+    }
+
+    inline std::vector<double> appearance_spsa_update_by_cluster(
+        const std::vector<double>& parameters,
+        const AppearanceSpsaPair& pair,
+        const std::vector<double>& loss_plus_by_cluster,
+        const std::vector<double>& loss_minus_by_cluster,
+        int iteration)
+    {
+        if (parameters.size() != pair.plus.size() ||
+            parameters.size() != pair.minus.size() ||
+            parameters.size() != pair.direction.size() ||
+            parameters.size() % 4U != 0U ||
+            loss_plus_by_cluster.size() < parameters.size() / 4U ||
+            loss_minus_by_cluster.size() < parameters.size() / 4U)
+        {
+            return parameters;
+        }
+        std::vector<double> out(parameters);
+        const double gain_decay =
+            std::pow(static_cast<double>(std::max(1, iteration + 1)), 0.602);
+        constexpr std::array<double, 4> gains{{0.18, 0.15, 0.18, 0.20}};
+        constexpr std::array<double, 4> perturbation{{0.12, 0.12, 0.15, 0.15}};
+        for (std::size_t index = 0; index < parameters.size(); ++index)
+        {
+            const auto cluster = index / 4U;
+            const double loss_plus = loss_plus_by_cluster[cluster];
+            const double loss_minus = loss_minus_by_cluster[cluster];
+            const double delta =
+                perturbation[index % perturbation.size()] /
+                std::pow(
+                    static_cast<double>(std::max(1, iteration + 1)),
+                    0.101);
+            if (!std::isfinite(loss_plus) ||
+                !std::isfinite(loss_minus) ||
+                delta <= 0.0 ||
+                !std::isfinite(delta) ||
+                pair.direction[index] == 0.0)
+            {
+                continue;
+            }
+            const double gradient =
+                ((loss_plus - loss_minus) / (2.0 * delta)) *
+                pair.direction[index];
+            const double gain = gains[index % gains.size()] / gain_decay;
+            out[index] = std::clamp(
+                parameters[index] - gain * gradient,
+                0.0,
+                appearance_parameter_bound(index));
+        }
+        return out;
+    }
+
+    // SPSA evaluations are cancellable at a wall-clock deadline.  Record a
+    // valid plus/minus candidate immediately so an expired later evaluation
+    // cannot discard the best material tuple already observed.
+    struct AppearanceBestCandidate
+    {
+        bool available{false};
+        std::vector<double> parameters{};
+        double loss{std::numeric_limits<double>::infinity()};
+        // A candidate is more than its four cluster parameters.  Albedo
+        // feedback and unsupported-sample fallback alter the actual preview
+        // texture, so they must be replayed with the winning tuple.
+        bool use_feedback_albedo{false};
+        bool use_base_fallback{false};
+    };
+
+    inline bool appearance_keep_best_candidate(AppearanceBestCandidate& best,
+                                                const std::vector<double>& parameters,
+                                                double loss,
+                                                bool use_feedback_albedo = false,
+                                                bool use_base_fallback = false)
+    {
+        if (!std::isfinite(loss) || parameters.empty() ||
+            (best.available && loss >= best.loss))
+        {
+            return false;
+        }
+        best.available = true;
+        best.parameters = parameters;
+        best.loss = loss;
+        best.use_feedback_albedo = use_feedback_albedo;
+        best.use_base_fallback = use_base_fallback;
+        return true;
+    }
+
+    struct AppearanceFitAcceptance
+    {
+        int paired_samples{0};
+        bool camera_stable{false};
+        bool readback_calibrated{false};
+        double fallback_loss{std::numeric_limits<double>::infinity()};
+        double best_loss{std::numeric_limits<double>::infinity()};
+        double median_delta_e{std::numeric_limits<double>::infinity()};
+    };
+
+    inline bool appearance_fit_accepted(const AppearanceFitAcceptance& value)
+    {
+        if (value.paired_samples < AppearanceFitMinimumSamples ||
+            !value.camera_stable ||
+            !value.readback_calibrated ||
+            !std::isfinite(value.fallback_loss) ||
+            !std::isfinite(value.best_loss) ||
+            !std::isfinite(value.median_delta_e) ||
+            value.fallback_loss <= 0.0)
+        {
+            return false;
+        }
+        const double improvement = (value.fallback_loss - value.best_loss) / value.fallback_loss;
+        return improvement >= AppearanceFitMinimumImprovement &&
+               value.median_delta_e <= AppearanceFitMedianDeltaEMaximum;
+    }
+
+    struct AppearanceNonEmissionCandidateAcceptance
+    {
+        int paired_samples{0};
+        int emissive_nonzero_samples{0};
+        bool camera_stable{false};
+        bool readback_calibrated{false};
+        bool packed_b_verified{false};
+        double fallback_loss{std::numeric_limits<double>::infinity()};
+        double candidate_loss{std::numeric_limits<double>::infinity()};
+        double candidate_median_delta_e{
+            std::numeric_limits<double>::infinity()};
+        int emission_roi_samples{0};
+        double emission_roi_loss_initial{
+            std::numeric_limits<double>::infinity()};
+        double emission_roi_loss_candidate{
+            std::numeric_limits<double>::infinity()};
+        double reference_max_chromaticity_delta{
+            std::numeric_limits<double>::infinity()};
+        double candidate_max_chromaticity_delta{
+            std::numeric_limits<double>::infinity()};
+    };
+
+    inline bool appearance_non_emission_candidate_accepted(
+        const AppearanceNonEmissionCandidateAcceptance& value)
+    {
+        const bool emission_roi_stable =
+            value.emission_roi_samples <= 0 ||
+            (std::isfinite(value.emission_roi_loss_initial) &&
+             std::isfinite(value.emission_roi_loss_candidate) &&
+             value.emission_roi_loss_candidate -
+                     value.emission_roi_loss_initial <=
+                 0.01);
+        const bool chromaticity_tail_stable =
+            std::isfinite(
+                value.reference_max_chromaticity_delta) &&
+            std::isfinite(
+                value.candidate_max_chromaticity_delta) &&
+            value.candidate_max_chromaticity_delta <=
+                value.reference_max_chromaticity_delta +
+                    1.0 / 255.0;
+        return value.emissive_nonzero_samples == 0 &&
+               value.packed_b_verified &&
+               emission_roi_stable &&
+               chromaticity_tail_stable &&
+               appearance_fit_accepted(
+                   {value.paired_samples,
+                    value.camera_stable,
+                    value.readback_calibrated,
+                    value.fallback_loss,
+                    value.candidate_loss,
+                    value.candidate_median_delta_e});
+    }
+
+    struct AppearancePreviewRefinementObservation
+    {
+        int emission_roi_samples{0};
+        int preview_count{0};
+        int minimum_preview_count{0};
+        bool observations_valid{false};
+        double fallback_emission_roi_loss{0.0};
+        double best_emission_roi_loss{0.0};
+    };
+
+    inline bool appearance_preview_refinement_worthwhile(
+        const AppearancePreviewRefinementObservation& value)
+    {
+        if (value.preview_count <
+            value.minimum_preview_count)
+        {
+            return true;
+        }
+        if (value.emission_roi_samples <= 0)
+        {
+            // Non-emission fits use their existing global acceptance and may
+            // still benefit from AMR refinement.
+            return true;
+        }
+        if (!value.observations_valid ||
+            !std::isfinite(
+                value.fallback_emission_roi_loss) ||
+            !std::isfinite(
+                value.best_emission_roi_loss))
+        {
+            // Do not turn missing diagnostics into an optimisation shortcut.
+            return true;
+        }
+        // Once the E=1 endpoint, bounded E projection and both Albedo
+        // endpoints have all failed to beat E=0 inside the isolated ROI,
+        // spending the remaining preview pair on AMR perturbations cannot
+        // justify accepting emission. Keep the best observed candidate.
+        return value.best_emission_roi_loss <
+               value.fallback_emission_roi_loss;
+    }
+
     // Compression is intentionally plan-local: a widened direct stroke may
     // cover only samples that share its region, UV island, and final material
     // payload.  Fill entries are never compressed.
@@ -663,12 +4440,17 @@ namespace runtime_contract
         bool paint_eligible;
         bool safe;
         std::uint64_t material_key;
+        bool replay_relevant{true};
     };
 
     struct AdaptiveReplayEntry
     {
         ReplayEntry replay;
         double radius_multiplier{1.0};
+        bool has_color_override{false};
+        double r{0.0};
+        double g{0.0};
+        double b{0.0};
     };
 
     struct AdaptivePaintPlan
@@ -676,7 +4458,52 @@ namespace runtime_contract
         std::vector<AdaptiveReplayEntry> entries{};
         std::size_t compressed_paint_entries{0};
         std::size_t expanded_paint_entries{0};
+        int adaptive_plan_worker_count{0};
+        bool adaptive_plan_parallel{false};
+        bool adaptive_plan_avx2_available{false};
+        bool adaptive_plan_avx2_used{false};
+        int coverage_grid_size{0};
+        std::size_t representative_paint_entries{0};
+        double representative_error_sum{0.0};
+        double representative_error_max{0.0};
     };
+
+    inline bool adaptive_plan_avx2_available()
+    {
+#if defined(MECCHA_RUNTIME_CONTRACT_CAN_COMPILE_AVX2)
+        static const bool available = []() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+            int registers[4]{};
+            __cpuid(registers, 0);
+            if (registers[0] < 7)
+            {
+                return false;
+            }
+            __cpuidex(registers, 1, 0);
+            constexpr int osxsave_bit = 1 << 27;
+            constexpr int avx_bit = 1 << 28;
+            if ((registers[2] & (osxsave_bit | avx_bit)) != (osxsave_bit | avx_bit))
+            {
+                return false;
+            }
+            if ((_xgetbv(0) & 0x6) != 0x6)
+            {
+                return false;
+            }
+            __cpuidex(registers, 7, 0);
+            constexpr int avx2_bit = 1 << 5;
+            return (registers[1] & avx2_bit) != 0;
+#elif defined(__GNUC__) || defined(__clang__)
+            return __builtin_cpu_supports("avx2");
+#else
+            return false;
+#endif
+        }();
+        return available;
+#else
+        return false;
+#endif
+    }
 
     inline AdaptivePaintPlan build_adaptive_paint_plan(
         const std::vector<ReplayEntry>& replay_entries,
@@ -687,6 +4514,7 @@ namespace runtime_contract
     {
         AdaptivePaintPlan plan{};
         plan.entries.reserve(replay_entries.size());
+        plan.adaptive_plan_avx2_available = adaptive_plan_avx2_available();
         if (replay_entries.empty())
         {
             return plan;
@@ -699,13 +4527,34 @@ namespace runtime_contract
             }
             return plan;
         }
+        const bool has_paint_entry = std::any_of(
+            replay_entries.begin(),
+            replay_entries.end(),
+            [](const ReplayEntry& entry) {
+                return entry.pass == ReplayPass::Paint;
+            });
+        const auto relevant_sample_count =
+            static_cast<std::size_t>(std::count_if(
+                samples.begin(),
+                samples.end(),
+                [](const AdaptivePaintSample& sample) {
+                    return sample.replay_relevant;
+                }));
+        if (!has_paint_entry || relevant_sample_count == 0)
+        {
+            for (const auto& entry : replay_entries)
+            {
+                plan.entries.push_back({entry, 1.0});
+            }
+            return plan;
+        }
 
         int grid_size = 128;
-        if (samples.size() > 200000)
+        if (relevant_sample_count > 200000)
         {
             grid_size = 256;
         }
-        if (samples.size() > 500000)
+        if (relevant_sample_count > 500000)
         {
             grid_size = 512;
         }
@@ -718,25 +4567,152 @@ namespace runtime_contract
         for (std::size_t index = 0; index < samples.size(); ++index)
         {
             const auto& sample = samples[index];
+            if (!sample.replay_relevant)
+            {
+                continue;
+            }
             grid[static_cast<std::size_t>(cell_coordinate(sample.v) * grid_size +
                                           cell_coordinate(sample.u))]
                 .push_back(index);
         }
 
-        const double threshold = std::clamp(tolerance_percent, 0.0, 10.0) / 100.0 * std::sqrt(3.0);
+        // Samples are generated on the same global lattice as the selected
+        // brush. Empty or conflicting lattice cells are hard expansion
+        // boundaries; this prevents an isolated sample or a UV hole from
+        // authorising an otherwise unbounded 8x stroke.
+        constexpr int max_coverage_grid_size = 2048;
+        const double inverse_coverage_step = 1.0 / base_radius_uv;
+        const bool coverage_grid_available =
+            std::isfinite(inverse_coverage_step) &&
+            inverse_coverage_step >= 1.0 &&
+            inverse_coverage_step <=
+                static_cast<double>(max_coverage_grid_size);
+        const int coverage_grid_size = coverage_grid_available
+                                           ? std::max(
+                                                 1,
+                                                 static_cast<int>(
+                                                     std::ceil(
+                                                         inverse_coverage_step -
+                                                         0.000000001)))
+                                           : 0;
+        plan.coverage_grid_size = coverage_grid_size;
+        struct CoverageCellSummary
+        {
+            bool payload_uniform{true};
+            bool paint_eligible{false};
+            bool safe{false};
+            ReplayRegion region{ReplayRegion::Front};
+            int uv_island{-1};
+            std::uint64_t material_key{0};
+            double min_r{0.0};
+            double min_g{0.0};
+            double min_b{0.0};
+            double max_r{0.0};
+            double max_g{0.0};
+            double max_b{0.0};
+        };
+        std::vector<std::int32_t> coverage_cell_indices(
+            static_cast<std::size_t>(coverage_grid_size) *
+                static_cast<std::size_t>(coverage_grid_size),
+            -1);
+        std::vector<CoverageCellSummary> coverage_cell_summaries{};
+        coverage_cell_summaries.reserve(
+            std::min(
+                samples.size(),
+                coverage_cell_indices.size()));
+        const auto coverage_cell_coordinate = [&](double value) {
+            return std::clamp(
+                static_cast<int>(
+                    std::floor(
+                        std::clamp(value, 0.0, 1.0) /
+                        base_radius_uv)),
+                0,
+                std::max(0, coverage_grid_size - 1));
+        };
+        if (coverage_grid_available)
+        {
+            for (const auto& sample : samples)
+            {
+                if (!sample.replay_relevant)
+                {
+                    continue;
+                }
+                auto& summary_index =
+                    coverage_cell_indices[static_cast<std::size_t>(
+                    coverage_cell_coordinate(sample.v) *
+                        coverage_grid_size +
+                    coverage_cell_coordinate(sample.u))];
+                if (summary_index < 0)
+                {
+                    summary_index = static_cast<std::int32_t>(
+                        coverage_cell_summaries.size());
+                    coverage_cell_summaries.push_back(
+                        {sample.paint_eligible && sample.safe,
+                         sample.paint_eligible,
+                         sample.safe,
+                         sample.region,
+                         sample.uv_island,
+                         sample.material_key,
+                         sample.r,
+                         sample.g,
+                         sample.b,
+                         sample.r,
+                         sample.g,
+                         sample.b});
+                    continue;
+                }
+                auto& summary = coverage_cell_summaries[
+                    static_cast<std::size_t>(summary_index)];
+                summary.payload_uniform =
+                    summary.payload_uniform &&
+                    sample.paint_eligible && sample.safe &&
+                    summary.paint_eligible == sample.paint_eligible &&
+                    summary.safe == sample.safe &&
+                    summary.region == sample.region &&
+                    summary.uv_island == sample.uv_island &&
+                    summary.material_key == sample.material_key;
+                summary.min_r = std::min(summary.min_r, sample.r);
+                summary.min_g = std::min(summary.min_g, sample.g);
+                summary.min_b = std::min(summary.min_b, sample.b);
+                summary.max_r = std::max(summary.max_r, sample.r);
+                summary.max_g = std::max(summary.max_g, sample.g);
+                summary.max_b = std::max(summary.max_b, sample.b);
+            }
+        }
+
+        const double threshold = std::clamp(tolerance_percent, 0.0, 10.0) / 100.0;
         const double threshold_squared = threshold * threshold;
         const auto same_payload = [](const AdaptivePaintSample& center,
                                      const AdaptivePaintSample& other) {
-            return center.paint_eligible && center.safe && other.paint_eligible && other.safe &&
+            return center.replay_relevant && other.replay_relevant &&
+                   center.paint_eligible && center.safe && other.paint_eligible && other.safe &&
                    center.region == other.region && center.uv_island == other.uv_island &&
                    center.material_key == other.material_key;
         };
-        const auto color_distance_squared = [](const AdaptivePaintSample& left,
-                                               const AdaptivePaintSample& right) {
+        const bool use_avx2 = plan.adaptive_plan_avx2_available;
+        plan.adaptive_plan_avx2_used = use_avx2;
+        const auto color_distance_squared = [use_avx2](const AdaptivePaintSample& left,
+                                                       const AdaptivePaintSample& right) {
+#if defined(MECCHA_RUNTIME_CONTRACT_CAN_COMPILE_AVX2)
+            if (use_avx2)
+            {
+                const __m256d vleft = _mm256_setr_pd(left.r, left.g, left.b, 0.0);
+                const __m256d vright = _mm256_setr_pd(right.r, right.g, right.b, 0.0);
+                const __m256d vdiff = _mm256_sub_pd(vleft, vright);
+                const __m256d vdiff2 = _mm256_mul_pd(vdiff, vdiff);
+                alignas(32) double result[4]{};
+                _mm256_storeu_pd(result, vdiff2);
+                return std::max(
+                    result[0],
+                    std::max(result[1], result[2]));
+            }
+#endif
             const double dr = left.r - right.r;
             const double dg = left.g - right.g;
             const double db = left.b - right.b;
-            return dr * dr + dg * dg + db * db;
+            return std::max(
+                dr * dr,
+                std::max(dg * dg, db * db));
         };
         const auto visit_nearby = [&](const AdaptivePaintSample& center,
                                       double radius_uv,
@@ -754,6 +4730,10 @@ namespace runtime_contract
                     for (const auto other_index : grid[static_cast<std::size_t>(cell_v * grid_size + cell_u)])
                     {
                         const auto& other = samples[other_index];
+                        if (!other.replay_relevant)
+                        {
+                            continue;
+                        }
                         const double du = other.u - center.u;
                         const double dv = other.v - center.v;
                         if (du * du + dv * dv <= radius_squared)
@@ -764,56 +4744,312 @@ namespace runtime_contract
                 }
             }
         };
+        const auto coverage_distances =
+            [&](const AdaptivePaintSample& center,
+                double radius_uv) {
+                double nearest_blocker =
+                    std::numeric_limits<double>::infinity();
+                double nearest_support =
+                    std::numeric_limits<double>::infinity();
+                if (!coverage_grid_available)
+                {
+                    return std::make_pair(0.0, nearest_support);
+                }
+                const double safe_radius = std::max(0.0, radius_uv);
+                const double radius_squared = safe_radius * safe_radius;
+                const int center_cell_u =
+                    coverage_cell_coordinate(center.u);
+                const int center_cell_v =
+                    coverage_cell_coordinate(center.v);
+                const int min_u =
+                    coverage_cell_coordinate(center.u - safe_radius);
+                const int max_u =
+                    coverage_cell_coordinate(center.u + safe_radius);
+                const int min_v =
+                    coverage_cell_coordinate(center.v - safe_radius);
+                const int max_v =
+                    coverage_cell_coordinate(center.v + safe_radius);
+                for (int cell_v = min_v; cell_v <= max_v; ++cell_v)
+                {
+                    const double cell_center_v = std::min(
+                        1.0,
+                        (static_cast<double>(cell_v) + 0.5) *
+                            base_radius_uv);
+                    for (int cell_u = min_u; cell_u <= max_u; ++cell_u)
+                    {
+                        const double cell_center_u = std::min(
+                            1.0,
+                            (static_cast<double>(cell_u) + 0.5) *
+                                base_radius_uv);
+                        const double du = cell_center_u - center.u;
+                        const double dv = cell_center_v - center.v;
+                        const double distance_squared =
+                            du * du + dv * dv;
+                        if (distance_squared > radius_squared)
+                        {
+                            continue;
+                        }
+                        const auto summary_index =
+                            coverage_cell_indices[static_cast<std::size_t>(
+                                cell_v * coverage_grid_size + cell_u)];
+                        bool compatible = summary_index >= 0;
+                        if (compatible)
+                        {
+                            const auto& summary =
+                                coverage_cell_summaries[
+                                    static_cast<std::size_t>(
+                                        summary_index)];
+                            const double color_error_squared = std::max(
+                                std::max(
+                                    (center.r - summary.min_r) *
+                                        (center.r - summary.min_r),
+                                    (center.r - summary.max_r) *
+                                        (center.r - summary.max_r)),
+                                std::max(
+                                    std::max(
+                                        (center.g - summary.min_g) *
+                                            (center.g - summary.min_g),
+                                        (center.g - summary.max_g) *
+                                            (center.g - summary.max_g)),
+                                    std::max(
+                                        (center.b - summary.min_b) *
+                                            (center.b - summary.min_b),
+                                        (center.b - summary.max_b) *
+                                            (center.b - summary.max_b))));
+                            compatible =
+                                summary.payload_uniform &&
+                                summary.paint_eligible &&
+                                summary.safe &&
+                                summary.region == center.region &&
+                                summary.uv_island == center.uv_island &&
+                                summary.material_key ==
+                                    center.material_key &&
+                                color_error_squared <=
+                                    threshold_squared;
+                        }
+                        if (!compatible)
+                        {
+                            nearest_blocker = std::min(
+                                nearest_blocker,
+                                distance_squared);
+                        }
+                        else if (cell_u != center_cell_u ||
+                                 cell_v != center_cell_v)
+                        {
+                            nearest_support = std::min(
+                                nearest_support,
+                                distance_squared);
+                        }
+                    }
+                }
+                return std::make_pair(
+                    nearest_blocker,
+                    nearest_support);
+            };
 
         std::vector<bool> covered(samples.size(), false);
         std::vector<AdaptiveReplayEntry> paint_entries{};
         paint_entries.reserve(replay_entries.size());
-        constexpr std::array<double, 4> multipliers{4.0, 3.0, 2.0, 1.5};
-        for (const auto& entry : replay_entries)
+        constexpr std::array<double, 6> multipliers{8.0, 6.0, 4.0, 3.0, 2.0, 1.5};
+        const std::size_t num_replay_entries = replay_entries.size();
+        std::vector<double> candidate_multipliers(num_replay_entries, 1.0);
+        const double validation_epsilon = std::max(
+            0.000000000001,
+            base_radius_uv * 0.000001);
+        const auto largest_safe_multiplier = [&](const ReplayEntry& entry) {
+            if (entry.pass != ReplayPass::Paint ||
+                entry.sample_index >= samples.size())
+            {
+                return 1.0;
+            }
+            const auto& center = samples[entry.sample_index];
+            if (!center.replay_relevant ||
+                !center.paint_eligible ||
+                !center.safe)
+            {
+                return 1.0;
+            }
+
+            const double max_validation_radius =
+                multipliers.front() * base_radius_uv +
+                validation_epsilon;
+            const auto distances = coverage_distances(
+                center,
+                max_validation_radius);
+            const double nearest_blocker = distances.first;
+            const double nearest_support = distances.second;
+
+            for (const auto candidate_multiplier : multipliers)
+            {
+                const double validation_radius =
+                    candidate_multiplier * base_radius_uv +
+                    validation_epsilon;
+                const double validation_radius_squared =
+                    validation_radius * validation_radius;
+                const double coverage_radius = std::max(
+                    0.0,
+                    candidate_multiplier * base_radius_uv -
+                        std::max(0.0, edge_margin_uv));
+                if (nearest_blocker <= validation_radius_squared ||
+                    nearest_support >
+                        coverage_radius * coverage_radius)
+                {
+                    continue;
+                }
+                return candidate_multiplier;
+            }
+            return 1.0;
+        };
+
+        const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
+        if (num_replay_entries > 128 && hw_threads > 1)
         {
+            const std::size_t num_threads = std::min<std::size_t>(hw_threads, 16);
+            plan.adaptive_plan_worker_count = static_cast<int>(num_threads);
+            plan.adaptive_plan_parallel = num_threads > 1;
+            const std::size_t chunk_size = (num_replay_entries + num_threads - 1) / num_threads;
+            std::vector<std::future<void>> futures;
+            futures.reserve(num_threads);
+
+            for (std::size_t thread_idx = 0; thread_idx < num_threads; ++thread_idx)
+            {
+                const std::size_t start_idx = thread_idx * chunk_size;
+                const std::size_t end_idx = std::min(start_idx + chunk_size, num_replay_entries);
+                if (start_idx >= end_idx) continue;
+
+                futures.push_back(std::async(std::launch::async, [&, start_idx, end_idx]() {
+                    for (std::size_t i = start_idx; i < end_idx; ++i)
+                    {
+                        const auto& entry = replay_entries[i];
+                        if (entry.pass != ReplayPass::Paint || entry.sample_index >= samples.size())
+                        {
+                            continue;
+                        }
+
+                        candidate_multipliers[i] =
+                            largest_safe_multiplier(entry);
+                    }
+                }));
+            }
+            for (auto& f : futures)
+            {
+                f.get();
+            }
+        }
+        else
+        {
+            plan.adaptive_plan_worker_count = 1;
+            for (std::size_t i = 0; i < num_replay_entries; ++i)
+            {
+                const auto& entry = replay_entries[i];
+                if (entry.pass != ReplayPass::Paint || entry.sample_index >= samples.size())
+                {
+                    continue;
+                }
+
+                candidate_multipliers[i] =
+                    largest_safe_multiplier(entry);
+            }
+        }
+
+        const auto region_order = [](ReplayRegion region) {
+            switch (region)
+            {
+            case ReplayRegion::Back:
+                return 0;
+            case ReplayRegion::Side:
+                return 1;
+            case ReplayRegion::Front:
+                return 2;
+            }
+            return 3;
+        };
+        std::array<std::vector<std::size_t>, 3>
+            paint_indices_by_region{};
+        for (std::size_t i = 0; i < num_replay_entries; ++i)
+        {
+            const auto& entry = replay_entries[i];
             if (entry.pass != ReplayPass::Paint || entry.sample_index >= samples.size())
             {
                 plan.entries.push_back({entry, 1.0});
                 continue;
             }
-            if (covered[entry.sample_index])
+            const int region_index = region_order(entry.region);
+            if (region_index >= 0 && region_index < 3)
             {
-                ++plan.compressed_paint_entries;
-                continue;
+                paint_indices_by_region[
+                    static_cast<std::size_t>(region_index)]
+                    .push_back(i);
             }
-
+        }
+        const auto coverage_radius_for = [&](std::size_t replay_index) {
+            return std::max(
+                0.0,
+                candidate_multipliers[replay_index] * base_radius_uv -
+                    std::max(0.0, edge_margin_uv));
+        };
+        const auto emit_candidate = [&](std::size_t replay_index) {
+            const auto& entry = replay_entries[replay_index];
+            const double multiplier =
+                candidate_multipliers[replay_index];
             const auto& center = samples[entry.sample_index];
-            double multiplier = 1.0;
-            if (center.paint_eligible && center.safe)
-            {
-                for (const auto candidate_multiplier : multipliers)
+            const double coverage_radius =
+                coverage_radius_for(replay_index);
+            double min_r = center.r;
+            double min_g = center.g;
+            double min_b = center.b;
+            double max_r = center.r;
+            double max_g = center.g;
+            double max_b = center.b;
+            visit_nearby(center, coverage_radius, [&](std::size_t,
+                                                       const AdaptivePaintSample& other) {
+                if (!same_payload(center, other) ||
+                    color_distance_squared(center, other) > threshold_squared)
                 {
-                    const double check_radius = std::max(
-                        0.0, candidate_multiplier * base_radius_uv - std::max(0.0, edge_margin_uv));
-                    bool valid = true;
-                    visit_nearby(center, check_radius, [&](std::size_t, const AdaptivePaintSample& other) {
-                        if (!same_payload(center, other) ||
-                            color_distance_squared(center, other) > threshold_squared)
-                        {
-                            valid = false;
-                        }
-                    });
-                    if (valid)
-                    {
-                        multiplier = candidate_multiplier;
-                        break;
-                    }
+                    return;
                 }
-            }
-
-            paint_entries.push_back({entry, multiplier});
+                min_r = std::min(min_r, other.r);
+                min_g = std::min(min_g, other.g);
+                min_b = std::min(min_b, other.b);
+                max_r = std::max(max_r, other.r);
+                max_g = std::max(max_g, other.g);
+                max_b = std::max(max_b, other.b);
+            });
+            const double representative_r =
+                (min_r + max_r) * 0.5;
+            const double representative_g =
+                (min_g + max_g) * 0.5;
+            const double representative_b =
+                (min_b + max_b) * 0.5;
+            const double representative_error = std::max(
+                std::max(
+                    std::abs(representative_r - min_r),
+                    std::abs(representative_r - max_r)),
+                std::max(
+                    std::max(
+                        std::abs(representative_g - min_g),
+                        std::abs(representative_g - max_g)),
+                    std::max(
+                        std::abs(representative_b - min_b),
+                        std::abs(representative_b - max_b))));
+            ++plan.representative_paint_entries;
+            plan.representative_error_sum +=
+                representative_error;
+            plan.representative_error_max = std::max(
+                plan.representative_error_max,
+                representative_error);
+            paint_entries.push_back(
+                {entry,
+                 multiplier,
+                 true,
+                 representative_r,
+                 representative_g,
+                 representative_b});
             if (multiplier > 1.0)
             {
                 ++plan.expanded_paint_entries;
             }
             covered[entry.sample_index] = true;
-            const double coverage_radius = std::max(
-                0.0, multiplier * base_radius_uv - std::max(0.0, edge_margin_uv));
             visit_nearby(center, coverage_radius, [&](std::size_t other_index,
                                                        const AdaptivePaintSample& other) {
                 if (same_payload(center, other) &&
@@ -822,12 +5058,150 @@ namespace runtime_contract
                     covered[other_index] = true;
                 }
             });
+        };
+        // A circle covers a square lattice without gaps when the lattice
+        // stride is at most radius * sqrt(2). Prefer one symmetric phase of
+        // that lattice before considering the remaining centers. Flat fields
+        // therefore approach the geometric stroke minimum without the high
+        // planning cost of a dynamic set-cover heap.
+        const auto preferred_coverage_phase =
+            [&](std::size_t replay_index) {
+                if (!coverage_grid_available)
+                {
+                    return true;
+                }
+                const double radius_in_cells =
+                    coverage_radius_for(replay_index) /
+                    base_radius_uv;
+                const int stride = std::max(
+                    1,
+                    static_cast<int>(
+                        std::floor(
+                            radius_in_cells *
+                            1.4142135623730951)));
+                if (stride <= 1)
+                {
+                    return true;
+                }
+                const int phase =
+                    ((coverage_grid_size - 1) % stride) / 2;
+                const auto& sample = samples[
+                    replay_entries[replay_index].sample_index];
+                return coverage_cell_coordinate(sample.u) % stride ==
+                           phase &&
+                       coverage_cell_coordinate(sample.v) % stride ==
+                           phase;
+            };
+        std::vector<std::uint8_t> preferred_phase_by_entry(
+            num_replay_entries,
+            0U);
+        for (const auto& region_indices : paint_indices_by_region)
+        {
+            for (const auto replay_index : region_indices)
+            {
+                preferred_phase_by_entry[replay_index] =
+                    preferred_coverage_phase(replay_index) ? 1U : 0U;
+            }
         }
-        std::stable_sort(paint_entries.begin(), paint_entries.end(), [](const auto& left, const auto& right) {
+        for (auto& region_indices : paint_indices_by_region)
+        {
+            std::stable_sort(
+                region_indices.begin(),
+                region_indices.end(),
+                [&](std::size_t left_index,
+                    std::size_t right_index) {
+                    if (candidate_multipliers[left_index] !=
+                        candidate_multipliers[right_index])
+                    {
+                        return candidate_multipliers[left_index] >
+                               candidate_multipliers[right_index];
+                    }
+                    const bool left_preferred =
+                        preferred_phase_by_entry[left_index] != 0U;
+                    const bool right_preferred =
+                        preferred_phase_by_entry[right_index] != 0U;
+                    if (left_preferred != right_preferred)
+                    {
+                        return left_preferred;
+                    }
+                    const auto& left = replay_entries[left_index];
+                    const auto& right = replay_entries[right_index];
+                    if (spatial_scanline_less(
+                            left.spatial_key,
+                            right.spatial_key))
+                    {
+                        return true;
+                    }
+                    if (spatial_scanline_less(
+                            right.spatial_key,
+                            left.spatial_key))
+                    {
+                        return false;
+                    }
+                    return left.sample_index < right.sample_index;
+                });
+            for (const auto replay_index : region_indices)
+            {
+                const auto& entry = replay_entries[replay_index];
+                if (covered[entry.sample_index])
+                {
+                    ++plan.compressed_paint_entries;
+                    continue;
+                }
+                emit_candidate(replay_index);
+            }
+        }
+        std::stable_sort(paint_entries.begin(), paint_entries.end(), [&](const auto& left, const auto& right) {
+            const int left_region = region_order(left.replay.region);
+            const int right_region = region_order(right.replay.region);
+            if (left_region != right_region)
+            {
+                return left_region < right_region;
+            }
             return left.radius_multiplier > right.radius_multiplier;
         });
         plan.entries.insert(plan.entries.end(), paint_entries.begin(), paint_entries.end());
         return plan;
+    }
+
+    // A mesh can reuse UV islands.  When the game preserves triangle order,
+    // every runtime triangle can still be verified against its profile index
+    // without guessing which duplicate island owns the geometry.
+    template <typename Triangle, typename MatchRuntimeTriangle, typename ReorderRuntimeTriangle>
+    inline bool order_runtime_triangles_by_direct_profile_index(
+        const std::vector<Triangle>& runtime,
+        int expected_triangle_count,
+        MatchRuntimeTriangle match_runtime_triangle,
+        ReorderRuntimeTriangle reorder_runtime_triangle,
+        std::vector<Triangle>& ordered,
+        double& average_error)
+    {
+        ordered.clear();
+        average_error = 0.0;
+        if (expected_triangle_count <= 0 ||
+            static_cast<int>(runtime.size()) != expected_triangle_count)
+        {
+            return false;
+        }
+
+        ordered.reserve(static_cast<std::size_t>(expected_triangle_count));
+        double error_sum = 0.0;
+        for (int profile_triangle = 0;
+             profile_triangle < expected_triangle_count;
+             ++profile_triangle)
+        {
+            const auto& runtime_triangle = runtime[static_cast<std::size_t>(profile_triangle)];
+            const auto match = match_runtime_triangle(profile_triangle, runtime_triangle);
+            if (!match.ok || !std::isfinite(match.error))
+            {
+                ordered.clear();
+                return false;
+            }
+            ordered.push_back(reorder_runtime_triangle(runtime_triangle, match));
+            error_sum += match.error;
+        }
+        average_error = error_sum / static_cast<double>(expected_triangle_count);
+        return true;
     }
 
     constexpr bool event_watch_generation_active(bool enabled,
@@ -835,6 +5209,377 @@ namespace runtime_contract
                                                  std::uint64_t captured_generation)
     {
         return enabled && current_generation == captured_generation;
+    }
+
+    constexpr std::uint64_t EspHudCaptureStallMs = 1'000;
+    constexpr std::uint64_t EspHudRebindMinIntervalMs = 2'000;
+
+    enum class EspCaptureStatus
+    {
+        Disabled,
+        Waiting,
+        Active,
+        Busy,
+        Stalled,
+    };
+
+    constexpr EspCaptureStatus esp_capture_status(bool enabled,
+                                                  bool has_capture,
+                                                  std::uint64_t capture_age_ms,
+                                                  bool paint_busy)
+    {
+        if (!enabled)
+        {
+            return EspCaptureStatus::Disabled;
+        }
+        if (!has_capture)
+        {
+            return EspCaptureStatus::Waiting;
+        }
+        if (capture_age_ms < EspHudCaptureStallMs)
+        {
+            return EspCaptureStatus::Active;
+        }
+        return paint_busy
+                   ? EspCaptureStatus::Busy
+                   : EspCaptureStatus::Stalled;
+    }
+
+    // A reflected UFunction is shared by every instance which dispatches that
+    // callback. Lobby -> match travel replaces the HUD UObject, so its address
+    // is intentionally not part of the durable callback identity.
+    constexpr bool esp_hud_callback_matches(std::uintptr_t expected_function,
+                                            std::uintptr_t actual_function)
+    {
+        return expected_function != 0 && expected_function == actual_function;
+    }
+
+    constexpr bool esp_hud_rebind_due(bool enabled,
+                                      std::uint64_t present_callbacks,
+                                      std::uint64_t last_capture_ms,
+                                      std::uint64_t now_ms,
+                                      std::uint64_t last_request_ms)
+    {
+        return enabled &&
+               present_callbacks > 0 &&
+               now_ms >= last_capture_ms &&
+               now_ms - last_capture_ms >= EspHudCaptureStallMs &&
+               now_ms >= last_request_ms &&
+               now_ms - last_request_ms >= EspHudRebindMinIntervalMs;
+    }
+
+    constexpr auto select_active_world(std::uintptr_t viewport_world,
+                                       bool viewport_world_valid,
+                                       std::uintptr_t fallback_world,
+                                       bool fallback_world_valid) -> std::uintptr_t
+    {
+        return viewport_world_valid
+                   ? viewport_world
+                   : fallback_world_valid ? fallback_world : 0;
+    }
+
+    constexpr auto esp_select_snapshot_world(std::uintptr_t viewport_world,
+                                             bool viewport_world_valid,
+                                             std::uintptr_t cached_world,
+                                             bool cached_world_valid) -> std::uintptr_t
+    {
+        return select_active_world(viewport_world,
+                                   viewport_world_valid,
+                                   cached_world,
+                                   cached_world_valid);
+    }
+
+    enum class PreviewSnapshotDisposition : int
+    {
+        Create = 0,
+        Reuse = 1,
+        Replace = 2,
+    };
+
+    constexpr auto preview_snapshot_disposition(bool snapshot_available,
+                                                std::uintptr_t snapshot_component,
+                                                std::uintptr_t current_component)
+        -> PreviewSnapshotDisposition
+    {
+        if (!snapshot_available)
+        {
+            return PreviewSnapshotDisposition::Create;
+        }
+        return snapshot_component == current_component
+                   ? PreviewSnapshotDisposition::Reuse
+                   : PreviewSnapshotDisposition::Replace;
+    }
+
+    enum class EspRole : int
+    {
+        Unknown = 0,
+        Hider = 1,
+        Hunter = 2,
+        Spectator = 3,
+    };
+
+    enum class EspScope : int
+    {
+        All = 0,
+        Hider = 1,
+        Hunter = 2,
+    };
+
+    enum class EspTargetPawnSource : int
+    {
+        PlayerArray = 0,
+        RoleRoster = 1,
+    };
+
+    constexpr auto esp_select_target_pawn_source(
+        EspRole roster_role,
+        EspRole player_array_pawn_role,
+        EspRole role_roster_pawn_role,
+        bool same_player_state) -> EspTargetPawnSource
+    {
+        const bool active_roster_role =
+            roster_role == EspRole::Hider ||
+            roster_role == EspRole::Hunter;
+        const bool current_is_not_avatar =
+            player_array_pawn_role == EspRole::Unknown ||
+            player_array_pawn_role == EspRole::Spectator;
+        return same_player_state &&
+                       active_roster_role &&
+                       current_is_not_avatar &&
+                       role_roster_pawn_role == roster_role
+                   ? EspTargetPawnSource::RoleRoster
+                   : EspTargetPawnSource::PlayerArray;
+    }
+
+    constexpr bool esp_should_refresh_avatar_directory(
+        bool unresolved_active_avatar,
+        bool world_changed,
+        std::uint64_t now_ms,
+        std::uint64_t last_refresh_ms,
+        std::uint64_t refresh_interval_ms)
+    {
+        if (!unresolved_active_avatar)
+        {
+            return false;
+        }
+        return world_changed ||
+               last_refresh_ms == 0 ||
+               now_ms < last_refresh_ms ||
+               now_ms - last_refresh_ms >= refresh_interval_ms;
+    }
+
+    constexpr bool esp_cached_avatar_binding_is_usable(
+        bool verified_when_cached,
+        bool same_world,
+        bool player_still_present,
+        bool candidate_live,
+        EspRole expected_role,
+        EspRole candidate_role)
+    {
+        return verified_when_cached &&
+               same_world &&
+               player_still_present &&
+               candidate_live &&
+               (expected_role == EspRole::Hider ||
+                expected_role == EspRole::Hunter) &&
+               candidate_role == expected_role;
+    }
+
+    constexpr auto esp_current_pawn_role(
+        EspRole roster_role,
+        EspRole current_pawn_role) -> EspRole
+    {
+        return current_pawn_role == EspRole::Unknown
+                   ? roster_role
+                   : current_pawn_role;
+    }
+
+    constexpr auto esp_resolve_target_role(
+        EspRole roster_role,
+        EspRole current_pawn_role) -> EspRole
+    {
+        return esp_current_pawn_role(
+            roster_role,
+            current_pawn_role);
+    }
+
+    constexpr bool esp_role_scope_matches(EspScope scope, EspRole role)
+    {
+        return role != EspRole::Spectator &&
+               (scope == EspScope::All ||
+               (scope == EspScope::Hider && role == EspRole::Hider) ||
+               (scope == EspScope::Hunter && role == EspRole::Hunter));
+    }
+
+    struct EspPawnGeometryCapabilities
+    {
+        bool spectator{false};
+        bool root_capsule{false};
+        bool skeletal_mesh{false};
+    };
+
+    constexpr auto esp_pawn_geometry_capabilities(
+        bool spectator,
+        bool root_is_capsule,
+        bool skeletal_mesh)
+        -> EspPawnGeometryCapabilities
+    {
+        return {
+            spectator,
+            !spectator && root_is_capsule,
+            !spectator && skeletal_mesh};
+    }
+
+    constexpr auto esp_role_color(EspRole role,
+                                  std::uint32_t hider_color,
+                                  std::uint32_t hunter_color) -> std::uint32_t
+    {
+        return role == EspRole::Hider
+                   ? hider_color
+                   : role == EspRole::Hunter ? hunter_color : 0xFFFFFFu;
+    }
+
+    constexpr bool esp_native_renderer_configuration_is_reusable(
+        bool requested_enabled,
+        bool same_configuration,
+        bool renderer_enabled,
+        bool renderer_unavailable)
+    {
+        return requested_enabled &&
+               same_configuration &&
+               renderer_enabled &&
+               !renderer_unavailable;
+    }
+
+    struct EspScreenBounds
+    {
+        double left{0.0};
+        double top{0.0};
+        double right{0.0};
+        double bottom{0.0};
+    };
+
+    constexpr auto esp_expand_screen_bounds(EspScreenBounds bounds,
+                                            double horizontal_ratio,
+                                            double vertical_ratio) -> EspScreenBounds
+    {
+        if (bounds.right <= bounds.left || bounds.bottom <= bounds.top)
+        {
+            return bounds;
+        }
+        const auto horizontal =
+            horizontal_ratio > 0.0 ? (bounds.right - bounds.left) * horizontal_ratio : 0.0;
+        const auto vertical =
+            vertical_ratio > 0.0 ? (bounds.bottom - bounds.top) * vertical_ratio : 0.0;
+        return {
+            bounds.left - horizontal,
+            bounds.top - vertical,
+            bounds.right + horizontal,
+            bounds.bottom + vertical};
+    }
+
+    constexpr bool esp_pose_array_header_usable(std::uintptr_t data,
+                                                int count,
+                                                int capacity,
+                                                int required_bones)
+    {
+        return data != 0 &&
+               required_bones > 0 &&
+               count >= required_bones &&
+               capacity >= count &&
+               capacity <= 512;
+    }
+
+    template <std::size_t Size>
+    constexpr auto esp_unique_queue_identity(
+        const std::array<std::uintptr_t, Size>& identities)
+        -> std::uintptr_t
+    {
+        std::uintptr_t selected{};
+        for (const auto identity : identities)
+        {
+            if (identity == 0 || identity == selected)
+            {
+                continue;
+            }
+            if (selected != 0)
+            {
+                return 0;
+            }
+            selected = identity;
+        }
+        return selected;
+    }
+
+    constexpr auto esp_ascii_glyph_rows(wchar_t character)
+        -> std::array<std::uint8_t, 7>
+    {
+        const wchar_t value =
+            character >= L'a' && character <= L'z'
+                ? static_cast<wchar_t>(character - L'a' + L'A')
+                : character;
+        switch (value)
+        {
+        case L'A': return {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11};
+        case L'B': return {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E};
+        case L'C': return {0x0F, 0x10, 0x10, 0x10, 0x10, 0x10, 0x0F};
+        case L'D': return {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E};
+        case L'E': return {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F};
+        case L'F': return {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10};
+        case L'G': return {0x0F, 0x10, 0x10, 0x17, 0x11, 0x11, 0x0F};
+        case L'H': return {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11};
+        case L'I': return {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F};
+        case L'J': return {0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C};
+        case L'K': return {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11};
+        case L'L': return {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F};
+        case L'M': return {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11};
+        case L'N': return {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11};
+        case L'O': return {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E};
+        case L'P': return {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10};
+        case L'Q': return {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D};
+        case L'R': return {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11};
+        case L'S': return {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E};
+        case L'T': return {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04};
+        case L'U': return {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E};
+        case L'V': return {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04};
+        case L'W': return {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A};
+        case L'X': return {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11};
+        case L'Y': return {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04};
+        case L'Z': return {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F};
+        case L'0': return {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E};
+        case L'1': return {0x04, 0x0C, 0x14, 0x04, 0x04, 0x04, 0x1F};
+        case L'2': return {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F};
+        case L'3': return {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E};
+        case L'4': return {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02};
+        case L'5': return {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E};
+        case L'6': return {0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E};
+        case L'7': return {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08};
+        case L'8': return {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E};
+        case L'9': return {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E};
+        case L' ': return {};
+        case L'-': return {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00};
+        case L'_': return {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F};
+        case L'.': return {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C};
+        case L':': return {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00};
+        case L'/': return {0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10};
+        case L'[': return {0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E};
+        case L']': return {0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E};
+        case L'?': return {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04};
+        default: return esp_ascii_glyph_rows(L'?');
+        }
+    }
+
+    constexpr double esp_projection_scale_from_sample(double center,
+                                                      double raw_screen,
+                                                      double engine_screen)
+    {
+        const auto raw_delta = raw_screen - center;
+        if (raw_delta > -1.0 && raw_delta < 1.0)
+        {
+            return -1.0;
+        }
+        const auto scale = (engine_screen - center) / raw_delta;
+        return scale >= 0.5 && scale <= 2.5 ? scale : -1.0;
     }
 
 }

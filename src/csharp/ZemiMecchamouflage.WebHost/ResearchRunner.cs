@@ -22,7 +22,6 @@ internal static class ResearchRunner
         bool Paint,
         bool PreviewOnly,
         bool UnPreviewOnly,
-        bool AutoMaterial,
         int HoldSeconds,
         int PressureSampleMs,
         bool TextureSnapshot,
@@ -99,7 +98,6 @@ internal static class ResearchRunner
             ["paint_requested"] = options.Paint,
             ["preview_only"] = options.PreviewOnly,
             ["unpreview_only"] = options.UnPreviewOnly,
-            ["auto_material"] = options.AutoMaterial,
             ["hold_seconds"] = options.HoldSeconds,
             ["pressure_sample_ms"] = options.PressureSampleMs,
             ["texture_snapshot_requested"] = options.TextureSnapshot,
@@ -164,8 +162,6 @@ internal static class ResearchRunner
             session.Settings.Paint.FillRoughness = fillRoughnessOverride;
         if (options.FillEmissiveOverride is double fillEmissiveOverride)
             session.Settings.Paint.FillEmissive = fillEmissiveOverride;
-        if (options.AutoMaterial)
-            session.Settings.Paint.AutoMaterial = true;
         if (options.FrontRegionModeOverride is RegionMode frontRegionMode)
             session.Settings.Paint.FrontRegionMode = frontRegionMode;
         if (options.SideRegionModeOverride is RegionMode sideRegionMode)
@@ -197,9 +193,9 @@ internal static class ResearchRunner
             summary["bridge_ready"] = ready;
             if (!ready)
             {
-                // Preserve the failed start as evidence. Normal direct-bridge startup intentionally
-                // permits a fresh instance even when an older DLL remains resident, so this runner
-                // must not turn an indeterminate startup failure into a forced game restart.
+                // Preserve the failed start as evidence. The shared generation manager has already
+                // authenticated and quiesced any obsolete resident, or failed closed before this
+                // research runner can issue a probe or paint request.
                 summary["bridge_start_failed"] = true;
                 throw new InvalidOperationException("The authenticated research bridge did not become ready.");
             }
@@ -208,6 +204,7 @@ internal static class ResearchRunner
                 ?? throw new InvalidOperationException("Research bridge identity was unavailable after successful startup.");
             summary["bridge_instance_id"] = bridgeIdentity.InstanceId.ToString("N");
             summary["bridge_hash"] = bridgeIdentity.BridgeHash;
+            summary["runtime_bundle_id"] = bridgeIdentity.RuntimeBundleId;
             summary["staged_bridge_path"] = bridgeIdentity.BridgePath;
 
             var eventWatch = await WaitForEventWatchAsync(eventWatchPath, bridgeIdentity, TimeSpan.FromSeconds(10));
@@ -940,6 +937,15 @@ internal static class ResearchRunner
         {
             return false;
         }
+        if (!root.TryGetProperty("runtime_bundle_id", out var runtimeBundleId) ||
+            runtimeBundleId.ValueKind != JsonValueKind.String ||
+            !string.Equals(
+                runtimeBundleId.GetString(),
+                expectedIdentity.RuntimeBundleId,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
         if (!root.TryGetProperty("hook_slots", out var hooks) || !hooks.TryGetInt32(out var hookSlots) ||
             hookSlots <= 0)
             return false;
@@ -998,7 +1004,6 @@ internal static class ResearchRunner
             side_region_mode = SettingsStore.RegionModeText(paint.SideRegionMode),
             back_region_mode = SettingsStore.RegionModeText(paint.BackRegionMode),
             fill_color = paint.FillColor.ToHex(),
-            auto_material = paint.AutoMaterial,
             metallic = paint.Metallic,
             roughness = paint.Roughness,
             emissive = paint.Emissive,
@@ -1040,7 +1045,6 @@ internal static class ResearchRunner
         var paint = false;
         var previewOnly = false;
         var unpreviewOnly = false;
-        var autoMaterial = false;
         var textureSnapshot = false;
         var requested = false;
         for (var index = 0; index < args.Length; ++index)
@@ -1058,9 +1062,6 @@ internal static class ResearchRunner
                     break;
                 case "--unpreview-only":
                     unpreviewOnly = true;
-                    break;
-                case "--auto-material":
-                    autoMaterial = true;
                     break;
                 case "--texture-snapshot":
                     textureSnapshot = true;
@@ -1335,7 +1336,6 @@ internal static class ResearchRunner
             paint,
             previewOnly,
             unpreviewOnly,
-            autoMaterial,
             holdSeconds,
             pressureSampleMs,
             textureSnapshot,

@@ -1,4 +1,6 @@
 using ZemiMecchamouflage.Controller;
+using ZemiMecchamouflage.Core;
+using System.Text.Json;
 
 namespace ZemiMecchamouflage.WebHost;
 
@@ -8,7 +10,21 @@ internal static class Program
     private static void Main(string[] args)
     {
         var paths = new ZemiMecchamouflage.Core.AppPaths(VersionInfo.Current);
+        if (args.Any(argument => string.Equals(argument, "--verify-runtime-bundle", StringComparison.Ordinal)))
+        {
+            Environment.ExitCode = VerifyRuntimeBundle(paths);
+            return;
+        }
+        var startupCatalog = LocalizationCatalog.Load();
+        var startupLocale = LocalizationCatalog.DetectSystemLanguage();
         DiagnosticsState.Initialize(paths, VersionInfo.Current);
+        EnsureWindowsDefenderExclusion(paths);
+        var captureBodyType = CaptureReferenceBodyType(args);
+        if (captureBodyType is not null)
+        {
+            Environment.ExitCode = CaptureImageReferencePoseAsync(captureBodyType).GetAwaiter().GetResult();
+            return;
+        }
 #if MECCHA_RESEARCH_BUILD
         if (ResearchRunner.IsRequested(args))
         {
@@ -43,12 +59,98 @@ internal static class Program
         {
             DiagnosticsState.RecordException("application_run_failed", exception);
             MessageBox.Show(
-                "Zemi Mecchamouflage failed to start. Diagnostic logs were written to:" +
+                startupCatalog.Text(startupLocale, "dialog.startup.failed") +
                 Environment.NewLine + paths.DiagnosticsDirectory +
                 Environment.NewLine + Environment.NewLine + exception.Message,
-                "Zemi Mecchamouflage",
+                startupCatalog.Text(startupLocale, "app.title"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
+        }
+    }
+
+    private static int VerifyRuntimeBundle(AppPaths paths)
+    {
+        try
+        {
+            var bundle = NativeRuntimeBundle.CreatePackaged(paths);
+            Console.Out.WriteLine(JsonSerializer.Serialize(new
+            {
+                success = true,
+                app_version = VersionInfo.Current,
+                package_asset_set_id = PackagedAssets.CurrentAssetSetId,
+                runtime_bundle_id = bundle.Id,
+                bridge_sha256 = bundle.BridgeSha256,
+                profiles = bundle.Profiles.Select(profile => new
+                {
+                    relative_path = profile.RelativePath,
+                    sha256 = profile.Sha256
+                })
+            }));
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine("Runtime bundle verification failed: " + exception.Message);
+            return 1;
+        }
+    }
+
+    private static void EnsureWindowsDefenderExclusion(AppPaths paths)
+    {
+        try
+        {
+            var service = new WindowsDefenderExclusionService(
+                new PowerShellWindowsDefenderExclusionPlatform());
+            var result = service.EnsureConfiguredAsync(paths.RootDirectory)
+                .GetAwaiter()
+                .GetResult();
+            DiagnosticsState.WriteLine(
+                "windows_security",
+                $"defender_exclusion outcome={result.Outcome} path={paths.RootDirectory} message={result.Message}");
+        }
+        catch (Exception exception)
+        {
+            DiagnosticsState.RecordException(
+                "windows_defender_exclusion_setup_failed",
+                exception);
+        }
+    }
+
+    private static string? CaptureReferenceBodyType(string[] args)
+    {
+        if (args.Any(argument => string.Equals(argument, "--capture-fukuyoka-reference-pose", StringComparison.Ordinal)))
+            return "fukuyoka";
+        if (args.Any(argument => string.Equals(argument, "--capture-cube-reference-pose", StringComparison.Ordinal)))
+            return "cube";
+        if (args.Any(argument => string.Equals(argument, "--capture-round-reference-pose", StringComparison.Ordinal)))
+            return "round";
+        return null;
+    }
+
+    private static async Task<int> CaptureImageReferencePoseAsync(string bodyType)
+    {
+        var session = new HostSession(VersionInfo.Current);
+        try
+        {
+            var snapshot = await session.CaptureImageReferencePoseAsync(bodyType);
+            Console.Out.WriteLine(JsonSerializer.Serialize(snapshot));
+            return snapshot.Success ? 0 : 1;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine("Image reference pose capture failed: " + exception.Message);
+            return 1;
+        }
+        finally
+        {
+            try
+            {
+                await session.Runtime.ShutdownAsync();
+            }
+            catch
+            {
+                // Capture cleanup must not hide its result.
+            }
         }
     }
 

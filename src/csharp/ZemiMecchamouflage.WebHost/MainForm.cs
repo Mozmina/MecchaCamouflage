@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Diagnostics;
 using Microsoft.Web.WebView2.Core;
@@ -19,9 +20,32 @@ public sealed class MainForm : Form
     private const int HotkeyPreview = 2;
     private const int HotkeyUnPreview = 3;
     private const int HotkeyStop = 4;
-    private const int HotkeySecondPass = 5;
-    private const int HotkeyNaturalFirstPass = 6;
-    private const int HotkeyNaturalSecondPass = 7;
+    private const int HotkeyImageStart = 5;
+    private const int HotkeyImagePreview = 6;
+    private const int HotkeyImageUnPreview = 7;
+    private const int HotkeyImageStop = 8;
+    private const int HotkeySecondPass = 9;
+    private const int HotkeyNaturalFirstPass = 10;
+    private const int HotkeyNaturalSecondPass = 11;
+
+    private enum PaintAction
+    {
+        Start,
+        Stop,
+        Preview,
+        Unpreview,
+        ImageStart,
+        ImageStop,
+        ImagePreview,
+        ImageUnpreview
+    }
+
+    // Keep WebView messages comfortably below the sizes where Windows message
+    // transport or JSON allocation becomes unreliable. Image assets are never
+    // included in a regular settings snapshot.
+    private const int ImageTransferChunkCharacters = 128 * 1024;
+    private const int MaximumImageTransferCharacters = 40 * 1024 * 1024;
+    private static readonly TimeSpan ImageTransferLifetime = TimeSpan.FromMinutes(5);
     private const int WmInput = 0x00FF;
     private const uint RidInput = 0x10000003;
     private const uint RimTypeKeyboard = 1;
@@ -55,11 +79,69 @@ public sealed class MainForm : Form
     private bool webViewRecoveryInProgress;
     private bool bridgeShutdownInProgress;
     private bool bridgeShutdownCompleted;
+    private readonly LatestAsyncRequestQueue<NativeEspConfigurationRequest> nativeEspConfigurationQueue;
+    private EspSettings? nativeEspPreview;
+    private long nativeEspPreviewGeneration;
+    private DateTimeOffset nextNativeEspStatusPoll = DateTimeOffset.MinValue;
+    private string nativeEspStatusSignature = "";
+    private readonly bool nativeEspVerboseStatus = BuildFeatures.NativeEspVerboseStatusEnabled;
+    private readonly Dictionary<string, StagedImageDesignTransfer> stagedImageDesigns = new(StringComparer.Ordinal);
+    // Presets are loaded through a native dialog and held only long enough for
+    // the WebView to request their assets in bounded chunks. They are drafts:
+    // loading never changes the active game state.
+    private readonly Dictionary<string, LoadedImagePresetTransfer> loadedImagePresets = new(StringComparer.Ordinal);
+
+    private string UiText(string key) => session.Localization.Text(session.Settings.Language, key);
+
+    private sealed class StagedImageDesignTransfer
+    {
+        public DateTimeOffset LastUpdated { get; set; } = DateTimeOffset.UtcNow;
+        public Dictionary<string, StagedImageAsset> Assets { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed class StagedImageAsset
+    {
+        public int NextChunkIndex { get; set; }
+        public StringBuilder Data { get; } = new();
+    }
+
+    private sealed class LoadedImagePresetTransfer
+    {
+        public DateTimeOffset LastUpdated { get; set; } = DateTimeOffset.UtcNow;
+        public required ImagePaintSettings Design { get; init; }
+    }
+
+    private sealed record NativeEspConfigurationRequest(
+        string Key,
+        Guid? InstanceId,
+        EspSettings Settings);
+
+    private sealed class NativeEspConfigurationRequestComparer :
+        IEqualityComparer<NativeEspConfigurationRequest>
+    {
+        public static NativeEspConfigurationRequestComparer Instance { get; } = new();
+
+        public bool Equals(
+            NativeEspConfigurationRequest? left,
+            NativeEspConfigurationRequest? right) =>
+            ReferenceEquals(left, right) ||
+            left is not null &&
+            right is not null &&
+            string.Equals(left.Key, right.Key, StringComparison.Ordinal);
+
+        public int GetHashCode(NativeEspConfigurationRequest value) =>
+            StringComparer.Ordinal.GetHashCode(value.Key);
+    }
 
     public MainForm(HostSession session)
     {
         this.session = session;
-        Text = "Zemi Mecchamouflage";
+        nativeEspConfigurationQueue = new LatestAsyncRequestQueue<NativeEspConfigurationRequest>(
+            ApplyNativePresentEspConfigurationAsync,
+            ex => session.Log.Warn(
+                "ESP: native Present configuration queue failed: " + ex.Message),
+            NativeEspConfigurationRequestComparer.Instance);
+        Text = UiText("app.title");
         Icon = LoadWindowIcon();
         MinimumSize = new Size(960, 640);
         Width = (int)Math.Round(session.Settings.PanelWidth);
@@ -72,7 +154,7 @@ public sealed class MainForm : Form
         }
         TopMost = session.Settings.AlwaysOnTop;
         Opacity = session.Settings.Opacity;
-        BackColor = Color.FromArgb(32, 32, 32);
+        BackColor = Color.Black;
         webView = CreateWebViewControl();
         Controls.Add(webView);
 
@@ -93,9 +175,14 @@ public sealed class MainForm : Form
         Move += (_, _) => PersistWindowSnapshot();
         statusTimer.Tick += async (_, _) =>
         {
-            statusTimer.Interval = session.PaintRunning ? 500 : 2000;
+            // A D3D12 Present core must observe CreateSwapChain* before the
+            // game creates its renderer. While disconnected, poll quickly so
+            // a GUI that is already open attaches during process startup;
+            // once attached retain the existing low-overhead cadence.
+            statusTimer.Interval = !session.Runtime.IsConnected ? 250 : session.PaintRunning ? 500 : 2000;
             if (webReady)
                 StartBridgeWarmup();
+            PollNativePresentEspStatus();
             await PushSnapshotAsync();
         };
         session.Log.Changed += (_, _) => PushSnapshotFromAnyThread();
@@ -188,6 +275,11 @@ public sealed class MainForm : Form
         core.DOMContentLoaded += (sender, args) => HandleDomContentLoaded(generation, sender, args);
         core.NewWindowRequested += (_, args) => HandleNewWindowRequested(args);
         core.ProcessFailed += HandleWebViewProcessFailed;
+        view.ZoomFactorChanged += (sender, _) =>
+        {
+            if (ReferenceEquals(sender, webView) && webReady && !webViewRecoveryInProgress)
+                PostWebViewZoomFactor();
+        };
         core.SetVirtualHostNameToFolderMapping(
             WebUiHostName,
             runtime.WebRoot,
@@ -208,7 +300,15 @@ public sealed class MainForm : Form
         if (!Directory.Exists(webRoot))
             throw new DirectoryNotFoundException("MC-WV-105 Packaged web assets are missing: " + webRoot);
 
-        foreach (var fileName in new[] { "index.html", "app.js", "styles.css" })
+        foreach (var fileName in new[]
+                 {
+                     "index.html",
+                     "app.js",
+                     "styles.css",
+                     Path.Combine("mesh-profiles", "paintman.image-profile-v2.json"),
+                     Path.Combine("mesh-profiles", "paintman_cube.image-profile-v2.json"),
+                     Path.Combine("mesh-profiles", "paintman_hukuyoka.image-profile-v2.json")
+                 })
         {
             var path = Path.Combine(webRoot, fileName);
             if (!File.Exists(path))
@@ -239,7 +339,7 @@ public sealed class MainForm : Form
             if (!args.IsSuccess)
             {
                 await RecoverWebViewAsync(
-                    "The Zemi Mecchamouflage interface could not load.",
+                    "dialog.webview.failed.navigation",
                     new InvalidOperationException($"MC-WV-203 WebView2 navigation failed: {args.WebErrorStatus}"));
                 return;
             }
@@ -289,9 +389,8 @@ public sealed class MainForm : Form
             DiagnosticsState.SetLastCode("MC-WV-101", "Evergreen WebView2 Runtime is not installed");
             var install = MessageBox.Show(
                 this,
-                "Microsoft Edge WebView2 Runtime is required to start Zemi Mecchamouflage.\n\n" +
-                "Install it now? This small Microsoft bootstrapper needs an internet connection.",
-                "Zemi Mecchamouflage",
+                UiText("dialog.webview.runtime.required"),
+                UiText("app.title"),
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Information);
             if (install != DialogResult.Yes)
@@ -419,9 +518,231 @@ public sealed class MainForm : Form
             try
             {
                 await session.WarmupBridgeAsync();
+                QueueNativePresentEspConfiguration(nativeEspPreview ?? session.Settings.Esp);
             }
             catch (OperationCanceledException)
             {
+            }
+        });
+    }
+
+    private static EspSettings CopyEspSettings(EspSettings settings) => new()
+    {
+        Enabled = settings.Enabled,
+        TargetScope = settings.TargetScope,
+        Boxes = settings.Boxes,
+        Skeletons = settings.Skeletons,
+        Names = settings.Names,
+        Distance = settings.Distance,
+        Snaplines = settings.Snaplines,
+        HiderColor = settings.HiderColor,
+        HunterColor = settings.HunterColor
+    };
+
+    private static string NativeEspSignature(EspSettings settings) => string.Join('|',
+        settings.Enabled,
+        settings.TargetScope,
+        settings.Boxes,
+        settings.Skeletons,
+        settings.Names,
+        settings.Distance,
+        settings.Snaplines,
+        settings.HiderColor.ToHex(),
+        settings.HunterColor.ToHex());
+
+    /// <summary>
+    /// The desktop host owns only configuration. It deliberately has no ESP
+    /// window, Present event consumer, or process-memory frame reader.
+    /// </summary>
+    private void QueueNativePresentEspConfiguration(EspSettings settings)
+    {
+        var copy = CopyEspSettings(settings);
+        var signature = NativeEspSignature(copy);
+        var instanceId = session.Runtime.ActiveBridgeInstanceId;
+        var key = $"{instanceId?.ToString("N") ?? "disconnected"}|{signature}";
+        nativeEspConfigurationQueue.Enqueue(
+            new NativeEspConfigurationRequest(key, instanceId, copy));
+    }
+
+    private async Task<bool> ApplyNativePresentEspConfigurationAsync(
+        NativeEspConfigurationRequest request)
+    {
+        if (request.InstanceId is null ||
+            request.InstanceId != session.Runtime.ActiveBridgeInstanceId)
+        {
+            return false;
+        }
+        try
+        {
+            var reply = await session.ConfigureNativePresentEspAsync(request.Settings);
+            if (request.InstanceId != session.Runtime.ActiveBridgeInstanceId)
+                return false;
+            if (reply.Success)
+            {
+                session.Log.Info("ESP: native Present renderer " + reply.Message + ".");
+                return true;
+            }
+            if (reply.Message.Contains("resident Present detour", StringComparison.OrdinalIgnoreCase))
+            {
+                // An unknown renderer hook may belong to Steam or capture
+                // software as well as a prior bridge. Avoid an automatic
+                // unsafe vtable replacement retry while this bridge remains.
+                session.Log.Warn("ESP: native Present renderer unavailable | " + reply.Stage + " | " + reply.Message);
+                return true;
+            }
+            session.Log.Warn("ESP: native Present renderer unavailable | " + reply.Stage + " | " + reply.Message);
+            return false;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or TimeoutException)
+        {
+            session.Log.Warn("ESP: native Present renderer is waiting for the bridge: " + ex.Message);
+            return false;
+        }
+    }
+
+    private void PollNativePresentEspStatus()
+    {
+        if (!session.Runtime.IsConnected || DateTimeOffset.UtcNow < nextNativeEspStatusPoll)
+            return;
+        nextNativeEspStatusPoll = DateTimeOffset.UtcNow.AddSeconds(2);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var reply = await session.GetNativePresentEspStatusAsync();
+                if (string.IsNullOrWhiteSpace(reply.Raw))
+                    return;
+                using var document = JsonDocument.Parse(reply.Raw);
+                var metadata = document.RootElement.TryGetProperty("metadata", out var value) ? value : default;
+                if (metadata.ValueKind != JsonValueKind.Object)
+                    return;
+                var status = metadata.TryGetProperty("status", out var statusValue) ? statusValue.GetString() ?? "unknown" : "unknown";
+                var reason = document.RootElement.TryGetProperty("message", out var messageValue) ? messageValue.GetString() ?? "" : "";
+                var format = metadata.TryGetProperty("swapchain_format", out var formatValue) ? formatValue.GetString() ?? "" : "";
+                var configuredScope = metadata.TryGetProperty("configured_scope", out var configuredScopeValue) ? configuredScopeValue.GetString() ?? "unknown" : "unknown";
+                var sequence = metadata.TryGetProperty("snapshot_sequence", out var sequenceValue) ? sequenceValue.GetUInt64() : 0;
+                var frames = metadata.TryGetProperty("rendered_frames", out var framesValue) ? framesValue.GetUInt64() : 0;
+                var captureStatus = metadata.TryGetProperty("capture_status", out var captureStatusValue) ? captureStatusValue.GetString() ?? "unknown" : "unknown";
+                var captureAge = metadata.TryGetProperty("capture_age_ms", out var captureAgeValue) ? captureAgeValue.GetUInt64() : 0;
+                var initializationAge = metadata.TryGetProperty("initialization_age_ms", out var initializationAgeValue) ? initializationAgeValue.GetUInt64() : 0;
+                var initializationStage = metadata.TryGetProperty("initialization_stage", out var initializationStageValue) ? initializationStageValue.GetString() ?? "unknown" : "unknown";
+                var presentHookReady = metadata.TryGetProperty("present_hook_ready", out var presentHookReadyValue) && presentHookReadyValue.GetBoolean();
+                var executeHookReady = metadata.TryGetProperty("execute_hook_ready", out var executeHookReadyValue) && executeHookReadyValue.GetBoolean();
+                var resizeHookReady = metadata.TryGetProperty("resize_hook_ready", out var resizeHookReadyValue) && resizeHookReadyValue.GetBoolean();
+                var factoryHooksReady = metadata.TryGetProperty("factory_hooks_ready", out var factoryHooksReadyValue) && factoryHooksReadyValue.GetBoolean();
+                var gameSwapchainSeen = metadata.TryGetProperty("game_swapchain_seen", out var gameSwapchainSeenValue) && gameSwapchainSeenValue.GetBoolean();
+                var presentCalls = metadata.TryGetProperty("present_calls", out var presentCallsValue) ? presentCallsValue.GetUInt64() : 0;
+                var executeCalls = metadata.TryGetProperty("execute_calls", out var executeCallsValue) ? executeCallsValue.GetUInt64() : 0;
+                var swapchainQueueRecords = metadata.TryGetProperty("swapchain_queue_records", out var swapchainQueueRecordsValue) ? swapchainQueueRecordsValue.GetUInt32() : 0;
+                var recentDirectQueueRecords = metadata.TryGetProperty("recent_direct_queue_records", out var recentDirectQueueRecordsValue) ? recentDirectQueueRecordsValue.GetUInt32() : 0;
+                var rebinds = metadata.TryGetProperty("hud_rebinds", out var rebindsValue) ? rebindsValue.GetUInt64() : 0;
+                var hiderRoster = metadata.TryGetProperty("hider_roster_count", out var hiderRosterValue) ? hiderRosterValue.GetUInt32() : 0;
+                var hunterRoster = metadata.TryGetProperty("hunter_roster_count", out var hunterRosterValue) ? hunterRosterValue.GetUInt32() : 0;
+                var rosterSource = metadata.TryGetProperty("roster_source", out var rosterSourceValue) ? rosterSourceValue.GetString() ?? "unknown" : "unknown";
+                var roster = metadata.TryGetProperty("roster_count", out var rosterValue) ? rosterValue.GetUInt32() : 0;
+                var pawns = metadata.TryGetProperty("valid_pawns", out var pawnsValue) ? pawnsValue.GetUInt32() : 0;
+                var filteredLocal = metadata.TryGetProperty("filtered_local", out var filteredLocalValue) ? filteredLocalValue.GetUInt32() : 0;
+                var filteredSpectators = metadata.TryGetProperty("filtered_spectators", out var filteredSpectatorsValue) ? filteredSpectatorsValue.GetUInt32() : 0;
+                var filteredScope = metadata.TryGetProperty("filtered_scope", out var filteredScopeValue) ? filteredScopeValue.GetUInt32() : 0;
+                var missingCapsuleContracts = metadata.TryGetProperty("missing_capsule_contracts", out var missingCapsuleContractsValue) ? missingCapsuleContractsValue.GetUInt32() : 0;
+                var missingMeshContracts = metadata.TryGetProperty("missing_mesh_contracts", out var missingMeshContractsValue) ? missingMeshContractsValue.GetUInt32() : 0;
+                var missingPoseContracts = metadata.TryGetProperty("missing_pose_contracts", out var missingPoseContractsValue) ? missingPoseContractsValue.GetUInt32() : 0;
+                var targetsWithoutSpatialGeometry = metadata.TryGetProperty("targets_without_spatial_geometry", out var targetsWithoutSpatialGeometryValue) ? targetsWithoutSpatialGeometryValue.GetUInt32() : 0;
+                var targetFaults = metadata.TryGetProperty("target_faults", out var targetFaultsValue) ? targetFaultsValue.GetUInt32() : 0;
+                var capsuleComponents = metadata.TryGetProperty("capsule_components", out var capsuleComponentsValue) ? capsuleComponentsValue.GetUInt32() : 0;
+                var capsuleTransforms = metadata.TryGetProperty("capsule_transforms", out var capsuleTransformsValue) ? capsuleTransformsValue.GetUInt32() : 0;
+                var capsuleSizes = metadata.TryGetProperty("capsule_sizes", out var capsuleSizesValue) ? capsuleSizesValue.GetUInt32() : 0;
+                var capsuleProjected = metadata.TryGetProperty("capsule_projected", out var capsuleProjectedValue) ? capsuleProjectedValue.GetUInt32() : 0;
+                var meshComponents = metadata.TryGetProperty("mesh_components", out var meshComponentsValue) ? meshComponentsValue.GetUInt32() : 0;
+                var meshTransforms = metadata.TryGetProperty("mesh_transforms", out var meshTransformsValue) ? meshTransformsValue.GetUInt32() : 0;
+                var skeletonContracts = metadata.TryGetProperty("skeleton_contracts", out var skeletonContractsValue) ? skeletonContractsValue.GetUInt64() : 0;
+                var poseProfiles = metadata.TryGetProperty("pose_profile_matches", out var poseProfilesValue) ? poseProfilesValue.GetUInt32() : 0;
+                var poseComponent = metadata.TryGetProperty("pose_component_space", out var poseComponentValue) ? poseComponentValue.GetUInt32() : 0;
+                var poseBones = metadata.TryGetProperty("pose_bones", out var poseBonesValue) ? poseBonesValue.GetUInt32() : 0;
+                var poseEdges = metadata.TryGetProperty("pose_edges", out var poseEdgesValue) ? poseEdgesValue.GetUInt32() : 0;
+                var poses = metadata.TryGetProperty("poses", out var posesValue) ? posesValue.GetUInt32() : 0;
+                var players = metadata.TryGetProperty("players", out var playersValue) ? playersValue.GetUInt32() : 0;
+                var lines = metadata.TryGetProperty("lines", out var linesValue) ? linesValue.GetUInt32() : 0;
+                var texts = metadata.TryGetProperty("texts", out var textsValue) ? textsValue.GetUInt32() : 0;
+                var vertices = metadata.TryGetProperty("vertices", out var verticesValue) ? verticesValue.GetUInt64() : 0;
+                var glyphQuads = metadata.TryGetProperty("glyph_quads", out var glyphQuadsValue) ? glyphQuadsValue.GetUInt64() : 0;
+                var projectionScaleX = metadata.TryGetProperty("projection_scale_x", out var projectionScaleXValue) ? projectionScaleXValue.GetDouble() : 1.0;
+                var projectionScaleY = metadata.TryGetProperty("projection_scale_y", out var projectionScaleYValue) ? projectionScaleYValue.GetDouble() : 1.0;
+                var projectionCalibrations = metadata.TryGetProperty("projection_calibrations", out var projectionCalibrationsValue) ? projectionCalibrationsValue.GetUInt64() : 0;
+                var submitted = metadata.TryGetProperty("submitted_frames", out var submittedValue) ? submittedValue.GetUInt64() : 0;
+                var completed = metadata.TryGetProperty("completed_fences", out var completedValue) ? completedValue.GetUInt64() : 0;
+                var sample = new NativePresentStatusLogSample
+                {
+                    Status = status,
+                    Reason = reason,
+                    Format = format,
+                    ConfiguredScope = configuredScope,
+                    CaptureStatus = captureStatus,
+                    CaptureAgeMs = captureAge,
+                    HudRebinds = rebinds,
+                    HiderRosterCount = hiderRoster,
+                    HunterRosterCount = hunterRoster,
+                    RosterSource = rosterSource,
+                    RosterCount = roster,
+                    ValidPawns = pawns,
+                    FilteredLocal = filteredLocal,
+                    FilteredSpectators = filteredSpectators,
+                    FilteredScope = filteredScope,
+                    MissingCapsuleContracts = missingCapsuleContracts,
+                    MissingMeshContracts = missingMeshContracts,
+                    MissingPoseContracts = missingPoseContracts,
+                    TargetsWithoutSpatialGeometry = targetsWithoutSpatialGeometry,
+                    TargetFaults = targetFaults,
+                    CapsuleComponents = capsuleComponents,
+                    CapsuleTransforms = capsuleTransforms,
+                    CapsuleSizes = capsuleSizes,
+                    CapsuleProjected = capsuleProjected,
+                    MeshComponents = meshComponents,
+                    MeshTransforms = meshTransforms,
+                    SkeletonContracts = skeletonContracts,
+                    PoseProfileMatches = poseProfiles,
+                    PoseComponentSpace = poseComponent,
+                    PoseBones = poseBones,
+                    PoseEdges = poseEdges,
+                    Poses = poses,
+                    Players = players,
+                    Lines = lines,
+                    Texts = texts,
+                    Vertices = vertices,
+                    GlyphQuads = glyphQuads,
+                    ProjectionScaleX = projectionScaleX,
+                    ProjectionScaleY = projectionScaleY,
+                    ProjectionCalibrations = projectionCalibrations,
+                    SnapshotSequence = sequence,
+                    InitializationAgeMs = initializationAge,
+                    InitializationStage = initializationStage,
+                    PresentHookReady = presentHookReady,
+                    ExecuteHookReady = executeHookReady,
+                    ResizeHookReady = resizeHookReady,
+                    FactoryHooksReady = factoryHooksReady,
+                    GameSwapchainSeen = gameSwapchainSeen,
+                    PresentCalls = presentCalls,
+                    ExecuteCalls = executeCalls,
+                    SwapchainQueueRecords = swapchainQueueRecords,
+                    RecentDirectQueueRecords = recentDirectQueueRecords,
+                    SubmittedFrames = submitted,
+                    CompletedFences = completed,
+                    RenderedFrames = frames
+                };
+                var signature = NativePresentStatusLogPolicy.Signature(sample, nativeEspVerboseStatus);
+                if (string.Equals(signature, nativeEspStatusSignature, StringComparison.Ordinal))
+                    return;
+                nativeEspStatusSignature = signature;
+                var logMessage =
+                    NativePresentStatusLogPolicy.Format(sample, nativeEspVerboseStatus);
+                if (NativePresentStatusLogPolicy.ShouldWarn(sample))
+                    session.Log.Warn(logMessage);
+                else
+                    session.Log.Info(logMessage);
+            }
+            catch (Exception ex) when (ex is JsonException or InvalidOperationException or IOException)
+            {
+                // The next poll will recover from a bridge generation change.
             }
         });
     }
@@ -450,7 +771,7 @@ public sealed class MainForm : Form
                 return;
             uiReadyTimeoutCancellation = null;
             await RecoverWebViewAsync(
-                "The Zemi Mecchamouflage interface did not finish initializing.",
+                "dialog.webview.failed.ready.timeout",
                 new TimeoutException("MC-WV-204 Timed out waiting for the web interface uiReady signal."));
         }
         catch (OperationCanceledException)
@@ -473,8 +794,16 @@ public sealed class MainForm : Form
         DiagnosticsState.WriteLine("webview2", $"ui_ready generation={generation}");
         if (webViewStartup.MarkUiReady(generation))
             QueueWindowSettingsStabilization(generation);
+        PostWebViewZoomFactor();
         StartBridgeWarmup();
         await PushSnapshotAsync();
+    }
+
+    private void PostWebViewZoomFactor()
+    {
+        var zoomFactor = webView?.ZoomFactor ?? 1.0;
+        var percent = (int)Math.Round(zoomFactor * 100, MidpointRounding.AwayFromZero);
+        PostEvent("zoomChanged", new { percent });
     }
 
     private void QueueWindowSettingsStabilization(long generation)
@@ -501,10 +830,10 @@ public sealed class MainForm : Form
 
     private async Task HandleWebViewInitializationFailureAsync(Exception exception)
     {
-        await RecoverWebViewAsync("Zemi Mecchamouflage could not start its WebView2 interface.", exception);
+        await RecoverWebViewAsync("dialog.webview.failed.initialize", exception);
     }
 
-    private async Task RecoverWebViewAsync(string userMessage, Exception exception)
+    private async Task RecoverWebViewAsync(string userMessageKey, Exception exception)
     {
         if (webViewRecoveryInProgress || IsDisposed || Disposing)
             return;
@@ -520,7 +849,9 @@ public sealed class MainForm : Form
             var retryAvailable = !webViewRetryUsed;
             var action = WebViewFailureDialog.Show(
                 this,
-                userMessage,
+                session.Localization,
+                session.Settings.Language,
+                UiText(userMessageKey),
                 DiagnosticsState.Summary(session.Paths),
                 ManualWebView2RuntimeUrl,
                 retryAvailable);
@@ -541,7 +872,9 @@ public sealed class MainForm : Form
                 session.Log.Error("WebView2 retry: " + retryException.Message);
                 WebViewFailureDialog.Show(
                     this,
-                    "The WebView2 retry did not succeed.",
+                    session.Localization,
+                    session.Settings.Language,
+                    UiText("dialog.webview.failed.retry"),
                     DiagnosticsState.Summary(session.Paths),
                     ManualWebView2RuntimeUrl,
                     retryAvailable: false);
@@ -614,7 +947,7 @@ public sealed class MainForm : Form
             return;
         }
         _ = RecoverWebViewAsync(
-            "The WebView2 browser process stopped unexpectedly.",
+            "dialog.webview.failed.browser.process",
             new InvalidOperationException("MC-WV-301 " + detail));
     }
 
@@ -754,7 +1087,7 @@ public sealed class MainForm : Form
         if (webReady)
             return;
         await RecoverWebViewAsync(
-            "The Zemi Mecchamouflage interface failed while starting.",
+            "dialog.webview.failed.starting",
             new InvalidOperationException("MC-WV-205 " + detail));
     }
 
@@ -768,6 +1101,10 @@ public sealed class MainForm : Form
                 return HandleUpdateSetting(command.Payload);
             case "updateSettings":
                 return HandleUpdateSettings(command.Payload);
+            case "previewEspSettings":
+                return HandlePreviewEspSettings(command.Payload);
+            case "clearEspPreview":
+                return HandleClearEspPreview(command.Payload);
             case "resetSetting":
                 return HandleResetSetting(command.Payload);
             case "resetSection":
@@ -791,32 +1128,350 @@ public sealed class MainForm : Form
             case "setHotkeyRecording":
                 hotkeyRecording = command.Payload.GetProperty("recording").GetBoolean();
                 return new { success = true };
+            case "setImageDesignDraftState":
+                if (!command.Payload.TryGetProperty("dirty", out var dirtyPayload) ||
+                    dirtyPayload.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                {
+                    return new { success = false, message = "Image design draft state is invalid." };
+                }
+                session.SetImageDesignDraftDirty(dirtyPayload.GetBoolean());
+                return new { success = true };
             case "previewWindow":
                 HandlePreviewWindow(command.Payload);
                 return new { success = true };
             case "setWindowState":
                 PersistWindowSnapshot();
                 return new { success = true };
+            case "getActiveImage":
+                return new { success = true, design = session.GetImageDesignMetadata() };
+            case "getImageGuide":
+                return await HandleGetImageGuideAsync(command.Payload);
+            case "getImageAssetChunk":
+                return HandleGetImageAssetChunk(command.Payload);
+            case "getLoadedImagePresetChunk":
+                return HandleGetLoadedImagePresetChunk(command.Payload);
+            case "stageImageDesignChunk":
+                return HandleStageImageDesignChunk(command.Payload);
+            case "commitSettingsWithImage":
+                return HandleCommitSettingsWithImage(command.Payload);
+            case "loadImagePreset":
+                return HandleLoadImagePreset();
+            case "saveImagePreset":
+                return HandleSaveImagePreset(command.Payload);
             case "paint":
-                return ApplyResult(await RunPaintCommandAsync(previewOnly: false, unpreviewOnly: false));
+            case "stop":
             case "preview":
-                return ApplyResult(await RunPaintCommandAsync(previewOnly: true, unpreviewOnly: false));
             case "unpreview":
-                return ApplyResult(await RunPaintCommandAsync(previewOnly: false, unpreviewOnly: true));
+            case "imagePaint":
+            case "imageStop":
+            case "imagePreview":
+            case "imageUnpreview":
+                return ApplyPaintResult(await RunPaintActionAsync(PaintActionFromCommand(command.Command)));
             case "secondPass":
                 return ApplyResult(await RunPaintCommandAsync(previewOnly: false, unpreviewOnly: false, secondPass: true));
             case "naturalFirstPass":
                 return ApplyResult(await RunNaturalPaintCommandAsync(secondPass: false));
             case "naturalSecondPass":
                 return ApplyResult(await RunNaturalPaintCommandAsync(secondPass: true));
-            case "stop":
-                return ApplyResult(await session.StopPaintAsync());
             default:
                 return new { success = false, message = "Unknown command: " + command.Command };
         }
     }
 
-    private async Task<HostCommandResult> RunPaintCommandAsync(bool previewOnly, bool unpreviewOnly, bool secondPass = false)
+    private async Task<object> HandleGetImageGuideAsync(JsonElement payload)
+    {
+        var bodyType = payload.TryGetProperty("bodyType", out var bodyTypePayload) &&
+                       bodyTypePayload.ValueKind == JsonValueKind.String
+            ? ImagePaintSettings.NormalizeBodyType(bodyTypePayload.GetString())
+            : "round";
+        return await session.GetImageGuideAsync(bodyType);
+    }
+
+    private object HandleCommitSettingsWithImage(JsonElement payload)
+    {
+        if (!settingsEditing)
+            return new { success = false, message = "Open Edit before changing Image Paint." };
+        if (!TryReadSettingChanges(payload, out var changes, out var settingsMessage))
+            return new { success = false, message = settingsMessage };
+        if (!TryReadImageDesign(payload, out var design, out var imageMessage))
+            return new { success = false, message = imageMessage };
+        var result = session.CommitSettingsWithImage(changes, design);
+        return new
+        {
+            success = result.Success,
+            message = result.Message,
+            revision = result.Success ? session.Settings.Image.Revision : 0
+        };
+    }
+
+    private object HandleLoadImagePreset()
+    {
+        if (!settingsEditing)
+            return new { success = false, message = "Open Edit before loading a preset." };
+
+        Directory.CreateDirectory(session.Paths.ImagePresetsDirectory);
+        using var dialog = new OpenFileDialog
+        {
+            Title = UiText("dialog.preset.load.title"),
+            InitialDirectory = session.Paths.ImagePresetsDirectory,
+            Filter = UiText("dialog.preset.filter"),
+            DefaultExt = ImagePresetStore.PresetExtension.TrimStart('.'),
+            Multiselect = false,
+            CheckFileExists = true,
+            CheckPathExists = true
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return new { success = true, cancelled = true };
+        if (!session.TryLoadImagePreset(dialog.FileName, out var design, out var message))
+            return new { success = false, message };
+
+        PruneExpiredImageTransfers();
+        var transferId = Guid.NewGuid().ToString("D");
+        loadedImagePresets[transferId] = new LoadedImagePresetTransfer { Design = design };
+        return new { success = true, transferId, design = WithoutImageAssets(design) };
+    }
+
+    private object HandleSaveImagePreset(JsonElement payload)
+    {
+        if (!settingsEditing)
+            return new { success = false, message = "Open Edit before saving a preset." };
+        if (!TryReadImageDesign(payload, out var design, out var message))
+            return new { success = false, message };
+
+        Directory.CreateDirectory(session.Paths.ImagePresetsDirectory);
+        using var dialog = new SaveFileDialog
+        {
+            Title = UiText("dialog.preset.save.title"),
+            InitialDirectory = session.Paths.ImagePresetsDirectory,
+            Filter = UiText("dialog.preset.filter"),
+            DefaultExt = ImagePresetStore.PresetExtension.TrimStart('.'),
+            AddExtension = true,
+            OverwritePrompt = true,
+            CheckPathExists = true
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return new { success = true, cancelled = true };
+        var result = session.SaveImagePreset(dialog.FileName, design);
+        return new { success = result.Success, message = result.Message, path = result.Success ? result.Message : "" };
+    }
+
+    private bool TryReadImageDesign(JsonElement payload, out ImagePaintSettings design, out string message)
+    {
+        design = new ImagePaintSettings();
+        message = "";
+        if (!payload.TryGetProperty("design", out var designPayload))
+        {
+            message = "The image design is missing.";
+            return false;
+        }
+        try
+        {
+            design = designPayload.Deserialize<ImagePaintSettings>(JsonOptions) ?? new ImagePaintSettings();
+        }
+        catch (JsonException)
+        {
+            message = "The image design is invalid.";
+            return false;
+        }
+        if (design.Enabled && !TryTakeStagedImageDesign(payload, design, out message))
+            return false;
+        return true;
+    }
+
+    private object HandleGetImageAssetChunk(JsonElement payload)
+    {
+        if (!TryReadImageAssetRequest(payload, out var asset, out var index, out var message))
+            return new { success = false, message };
+        var data = "";
+        var available = session.TryGetImageDesignAsset(asset, out data);
+        if (!available)
+            return new { success = false, message = "The requested active image asset is unavailable." };
+        return ImageAssetChunk(data, index);
+    }
+
+    private object HandleGetLoadedImagePresetChunk(JsonElement payload)
+    {
+        if (!TryReadImageAssetRequest(payload, out var asset, out var index, out var message) ||
+            !TryReadTransferId(payload, out var transferId, out message))
+        {
+            return new { success = false, message = message ?? "The preset asset request is invalid." };
+        }
+        PruneExpiredImageTransfers();
+        if (!loadedImagePresets.TryGetValue(transferId, out var transfer) ||
+            !TryGetImageAssetBase64(transfer.Design, asset, out var data))
+        {
+            return new { success = false, message = "The loaded preset is no longer available." };
+        }
+        transfer.LastUpdated = DateTimeOffset.UtcNow;
+        return ImageAssetChunk(data, index);
+    }
+
+    private static object ImageAssetChunk(string data, int index)
+    {
+        if (index > data.Length / ImageTransferChunkCharacters + 1)
+            return new { success = false, message = "The requested image chunk is unavailable." };
+        var offset = index * ImageTransferChunkCharacters;
+        if (offset >= data.Length)
+            return new { success = false, message = "The requested image chunk is unavailable." };
+        var length = Math.Min(ImageTransferChunkCharacters, data.Length - offset);
+        return new { success = true, index, data = data.Substring(offset, length), complete = offset + length >= data.Length };
+    }
+
+    private object HandleStageImageDesignChunk(JsonElement payload)
+    {
+        if (!settingsEditing)
+            return new { success = false, message = "Open Edit before uploading an image design." };
+        if (!TryReadImageAssetRequest(payload, out var asset, out var index, out var message) ||
+            !TryReadTransferId(payload, out var transferId, out message) ||
+            !payload.TryGetProperty("data", out var dataPayload) ||
+            dataPayload.ValueKind != JsonValueKind.String)
+        {
+            return new { success = false, message = message ?? "The image chunk is invalid." };
+        }
+        var data = dataPayload.GetString() ?? "";
+        if (data.Length == 0 || data.Length > ImageTransferChunkCharacters)
+            return new { success = false, message = "The image chunk has an invalid size." };
+
+        PruneExpiredImageTransfers();
+        if (!stagedImageDesigns.TryGetValue(transferId, out var transfer))
+        {
+            if (stagedImageDesigns.Count >= 16)
+                return new { success = false, message = "Too many pending image uploads. Try saving again." };
+            transfer = new StagedImageDesignTransfer();
+            stagedImageDesigns.Add(transferId, transfer);
+        }
+        if (!transfer.Assets.TryGetValue(asset, out var staged))
+        {
+            staged = new StagedImageAsset();
+            transfer.Assets.Add(asset, staged);
+        }
+        if (index != staged.NextChunkIndex)
+            return new { success = false, message = "The image chunks arrived out of order." };
+        if (staged.Data.Length > MaximumImageTransferCharacters - data.Length)
+            return new { success = false, message = "The staged image is too large." };
+        staged.Data.Append(data);
+        staged.NextChunkIndex++;
+        transfer.LastUpdated = DateTimeOffset.UtcNow;
+        return new { success = true, index };
+    }
+
+    private bool TryTakeStagedImageDesign(JsonElement payload, ImagePaintSettings design, out string message)
+    {
+        message = "";
+        if (!TryReadTransferId(payload, out var transferId, out message) ||
+            !stagedImageDesigns.Remove(transferId, out var transfer))
+        {
+            message = string.IsNullOrWhiteSpace(message) ? "The image upload was not found. Save the design again." : message;
+            return false;
+        }
+        if (!transfer.Assets.TryGetValue("canvas", out var canvas))
+        {
+            message = "The canonical image canvas is missing.";
+            return false;
+        }
+        design.CanvasRgbaBase64 = canvas.Data.ToString();
+        for (var index = 0; index < design.Layers.Count; index++)
+        {
+            if (!transfer.Assets.TryGetValue($"layer{index}", out var layer))
+            {
+                message = $"Image layer {index + 1} is missing.";
+                return false;
+            }
+            design.Layers[index].DataBase64 = layer.Data.ToString();
+        }
+        return true;
+    }
+
+    private static bool TryReadImageAssetRequest(JsonElement payload, out string asset, out int index, out string? message)
+    {
+        asset = "";
+        index = -1;
+        message = null;
+        if (!payload.TryGetProperty("asset", out var assetPayload) || assetPayload.ValueKind != JsonValueKind.String)
+        {
+            message = "The image asset is missing.";
+            return false;
+        }
+        asset = assetPayload.GetString() ?? "";
+        if (asset != "canvas" &&
+            (!asset.StartsWith("layer", StringComparison.Ordinal) ||
+             !int.TryParse(asset["layer".Length..], out var layerIndex) ||
+             layerIndex < 0 || layerIndex > 4095))
+        {
+            message = "The requested image asset is invalid.";
+            return false;
+        }
+        if (!payload.TryGetProperty("index", out var indexPayload) || !indexPayload.TryGetInt32(out index) || index < 0)
+        {
+            message = "The image chunk index is invalid.";
+            return false;
+        }
+        return true;
+    }
+
+    private static bool TryReadTransferId(JsonElement payload, out string transferId, out string message)
+    {
+        transferId = "";
+        message = "";
+        if (!payload.TryGetProperty("transferId", out var transferPayload) ||
+            transferPayload.ValueKind != JsonValueKind.String ||
+            !Guid.TryParse(transferPayload.GetString(), out var transfer))
+        {
+            message = "The image upload id is invalid.";
+            return false;
+        }
+        transferId = transfer.ToString("D");
+        return true;
+    }
+
+    private void PruneExpiredImageTransfers()
+    {
+        var cutoff = DateTimeOffset.UtcNow - ImageTransferLifetime;
+        foreach (var transferId in stagedImageDesigns
+                     .Where(entry => entry.Value.LastUpdated < cutoff)
+                     .Select(entry => entry.Key)
+                     .ToArray())
+        {
+            stagedImageDesigns.Remove(transferId);
+        }
+        foreach (var transferId in loadedImagePresets
+                     .Where(entry => entry.Value.LastUpdated < cutoff)
+                     .Select(entry => entry.Key)
+                     .ToArray())
+        {
+            loadedImagePresets.Remove(transferId);
+        }
+    }
+
+    private static ImagePaintSettings WithoutImageAssets(ImagePaintSettings source)
+    {
+        var clone = JsonSerializer.Deserialize<ImagePaintSettings>(JsonSerializer.Serialize(source, JsonOptions), JsonOptions)
+                    ?? new ImagePaintSettings();
+        clone.CanvasRgbaBase64 = "";
+        foreach (var layer in clone.Layers)
+            layer.DataBase64 = "";
+        return clone;
+    }
+
+    private static bool TryGetImageAssetBase64(ImagePaintSettings design, string asset, out string data)
+    {
+        data = "";
+        if (asset == "canvas")
+        {
+            data = design.CanvasRgbaBase64;
+            return data.Length > 0;
+        }
+        if (!asset.StartsWith("layer", StringComparison.Ordinal) ||
+            !int.TryParse(asset["layer".Length..], out var index) ||
+            index < 0 || index >= design.Layers.Count)
+        {
+            return false;
+        }
+        data = design.Layers[index].DataBase64;
+        return data.Length > 0;
+    }
+
+    private async Task<HostCommandResult> RunPaintCommandAsync(PaintKind kind = PaintKind.Standard, bool previewOnly = false, bool unpreviewOnly = false, bool secondPass = false)
     {
         var previousInterval = statusTimer.Interval;
         statusTimer.Interval = 250;
@@ -824,7 +1479,7 @@ public sealed class MainForm : Form
         var refreshTask = RefreshSnapshotsUntilCancelledAsync(refresh.Token);
         try
         {
-            return await session.RunPaintAsync(previewOnly, unpreviewOnly, secondPass);
+            return await session.RunPaintAsync(kind: kind, previewOnly: previewOnly, unpreviewOnly: unpreviewOnly, secondPass: secondPass);
         }
         finally
         {
@@ -866,6 +1521,32 @@ public sealed class MainForm : Form
         }
     }
 
+    private Task<HostCommandResult> RunPaintActionAsync(PaintAction action) => action switch
+    {
+        PaintAction.Start => RunPaintCommandAsync(previewOnly: false, unpreviewOnly: false),
+        PaintAction.Stop => session.StopPaintAsync(),
+        PaintAction.Preview => RunPaintCommandAsync(previewOnly: true, unpreviewOnly: false),
+        PaintAction.Unpreview => RunPaintCommandAsync(previewOnly: false, unpreviewOnly: true),
+        PaintAction.ImageStart => RunPaintCommandAsync(PaintKind.Image, previewOnly: false, unpreviewOnly: false),
+        PaintAction.ImageStop => session.StopPaintAsync(),
+        PaintAction.ImagePreview => RunPaintCommandAsync(PaintKind.Image, previewOnly: true, unpreviewOnly: false),
+        PaintAction.ImageUnpreview => RunPaintCommandAsync(PaintKind.Image, previewOnly: false, unpreviewOnly: true),
+        _ => throw new ArgumentOutOfRangeException(nameof(action), action, null)
+    };
+
+    private static PaintAction PaintActionFromCommand(string command) => command switch
+    {
+        "paint" => PaintAction.Start,
+        "stop" => PaintAction.Stop,
+        "preview" => PaintAction.Preview,
+        "unpreview" => PaintAction.Unpreview,
+        "imagePaint" => PaintAction.ImageStart,
+        "imageStop" => PaintAction.ImageStop,
+        "imagePreview" => PaintAction.ImagePreview,
+        "imageUnpreview" => PaintAction.ImageUnpreview,
+        _ => throw new ArgumentOutOfRangeException(nameof(command), command, null)
+    };
+
     private async Task RefreshSnapshotsUntilCancelledAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -877,6 +1558,8 @@ public sealed class MainForm : Form
 
     private object HandleUpdateSetting(JsonElement payload)
     {
+        if (!settingsEditing)
+            return new { success = false, message = "Open Edit before changing settings." };
         var key = payload.GetProperty("key").GetString() ?? "";
         var result = session.UpdateSetting(key, payload.GetProperty("value"));
         ApplyWindowSettings();
@@ -885,20 +1568,44 @@ public sealed class MainForm : Form
 
     private object HandleUpdateSettings(JsonElement payload)
     {
-        var changes = new List<SettingChange>();
-        foreach (var item in payload.GetProperty("changes").EnumerateArray())
-        {
-            var key = item.GetProperty("key").GetString() ?? "";
-            changes.Add(new SettingChange(key, item.GetProperty("value")));
-        }
-
+        if (!settingsEditing)
+            return new { success = false, message = "Open Edit before changing settings." };
+        if (!TryReadSettingChanges(payload, out var changes, out var message))
+            return new { success = false, message };
         var result = session.UpdateSettings(changes);
         ApplyWindowSettings();
         return ApplyResult(result);
     }
 
+    private static bool TryReadSettingChanges(JsonElement payload, out List<SettingChange> changes, out string message)
+    {
+        changes = [];
+        message = "";
+        if (!payload.TryGetProperty("changes", out var entries) || entries.ValueKind != JsonValueKind.Array)
+        {
+            message = "The setting changes are missing.";
+            return false;
+        }
+        try
+        {
+            foreach (var item in entries.EnumerateArray())
+            {
+                var key = item.GetProperty("key").GetString() ?? "";
+                changes.Add(new SettingChange(key, item.GetProperty("value")));
+            }
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            message = "A setting change is invalid.";
+            return false;
+        }
+    }
+
     private object HandleResetSetting(JsonElement payload)
     {
+        if (!settingsEditing)
+            return new { success = false, message = "Open Edit before changing settings." };
         var key = payload.GetProperty("key").GetString() ?? "";
         var result = session.ResetSetting(key);
         ApplyWindowSettings();
@@ -907,6 +1614,8 @@ public sealed class MainForm : Form
 
     private object HandleResetSection(JsonElement payload)
     {
+        if (!settingsEditing)
+            return new { success = false, message = "Open Edit before changing settings." };
         var section = payload.GetProperty("section").GetString() ?? "";
         var result = session.ResetSection(section);
         ApplyWindowSettings();
@@ -915,6 +1624,8 @@ public sealed class MainForm : Form
 
     private object HandleResetAllSettings()
     {
+        if (!settingsEditing)
+            return new { success = false, message = "Open Edit before changing settings." };
         var result = session.ResetAllSettings();
         ApplyWindowSettings();
         return ApplyResult(result);
@@ -923,8 +1634,27 @@ public sealed class MainForm : Form
     private object ApplyResult(HostCommandResult result)
     {
         ApplyWindowSettings();
+        if (result.Success)
+        {
+            nativeEspPreview = null;
+            QueueNativePresentEspConfiguration(session.Settings.Esp);
+        }
         _ = PushSnapshotAsync();
         return new { success = result.Success, message = result.Message };
+    }
+
+    private object ApplyPaintResult(HostCommandResult result)
+    {
+        var response = ApplyResult(result);
+        NotifyPaintResult(result);
+        return response;
+    }
+
+    private void NotifyPaintResult(HostCommandResult result)
+    {
+        if (string.IsNullOrWhiteSpace(result.Message) || result.Level == CommandResultLevel.Success)
+            return;
+        SendToast(result.Message, result.Level == CommandResultLevel.Warn ? "warn" : "error");
     }
 
     private void HandlePreviewWindow(JsonElement payload)
@@ -933,32 +1663,124 @@ public sealed class MainForm : Form
             Opacity = Math.Clamp(opacity, 0.35, 1.0);
     }
 
+    private object HandlePreviewEspSettings(JsonElement payload)
+    {
+        if (payload.ValueKind != JsonValueKind.Object ||
+            !TryReadBoolean(payload, "enabled", out var enabled) ||
+            !TryReadString(payload, "scope", out var scope) ||
+            !TryReadBoolean(payload, "boxes", out var boxes) ||
+            !TryReadBoolean(payload, "skeletons", out var skeletons) ||
+            !TryReadBoolean(payload, "names", out var names) ||
+            !TryReadBoolean(payload, "distance", out var distance) ||
+            !TryReadBoolean(payload, "snaplines", out var snaplines) ||
+            !TryReadColor(payload, "hiderColor", out var hiderColor) ||
+            !TryReadColor(payload, "hunterColor", out var hunterColor) ||
+            !TryReadNonnegativeInt64(payload, "generation", out var generation) ||
+            scope is not ("all" or "hider" or "hunter"))
+        {
+            return new { success = false, message = "ESP draft preview is invalid." };
+        }
+
+        if (generation < nativeEspPreviewGeneration)
+            return new { success = true };
+        nativeEspPreviewGeneration = generation;
+        nativeEspPreview = new EspSettings
+        {
+            Enabled = enabled,
+            TargetScope = scope,
+            Boxes = boxes,
+            Skeletons = skeletons,
+            Names = names,
+            Distance = distance,
+            Snaplines = snaplines,
+            HiderColor = hiderColor,
+            HunterColor = hunterColor
+        };
+        QueueNativePresentEspConfiguration(nativeEspPreview);
+        return new { success = true };
+    }
+
+    private object HandleClearEspPreview(JsonElement payload)
+    {
+        if (payload.ValueKind != JsonValueKind.Object ||
+            !TryReadNonnegativeInt64(payload, "generation", out var generation))
+        {
+            return new { success = false, message = "ESP draft preview reset is invalid." };
+        }
+        if (generation < nativeEspPreviewGeneration)
+            return new { success = true };
+        nativeEspPreviewGeneration = generation;
+        nativeEspPreview = null;
+        QueueNativePresentEspConfiguration(session.Settings.Esp);
+        return new { success = true };
+    }
+
+    private static bool TryReadBoolean(JsonElement payload, string name, out bool value)
+    {
+        value = false;
+        if (!payload.TryGetProperty(name, out var property) ||
+            property.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            return false;
+        value = property.GetBoolean();
+        return true;
+    }
+
+    private static bool TryReadString(JsonElement payload, string name, out string value)
+    {
+        value = "";
+        return payload.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String &&
+               !string.IsNullOrWhiteSpace(value = property.GetString() ?? "");
+    }
+
+    private static bool TryReadColor(JsonElement payload, string name, out RgbColor value)
+    {
+        value = RgbColor.White;
+        return payload.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String &&
+               RgbColor.TryParse(property.GetString(), out value);
+    }
+
+    private static bool TryReadNonnegativeInt64(JsonElement payload, string name, out long value)
+    {
+        value = 0;
+        return payload.TryGetProperty(name, out var property) && property.TryGetInt64(out value) && value >= 0;
+    }
+
     private async Task HandleHotkeyAsync(int id)
     {
-        switch (id)
+        if (id == HotkeySecondPass)
         {
-            case HotkeyStart:
-                _ = await RunPaintCommandAsync(previewOnly: false, unpreviewOnly: false);
-                break;
-            case HotkeyPreview:
-                _ = await RunPaintCommandAsync(previewOnly: true, unpreviewOnly: false);
-                break;
-            case HotkeyUnPreview:
-                _ = await RunPaintCommandAsync(previewOnly: false, unpreviewOnly: true);
-                break;
-            case HotkeyStop:
-                _ = await session.StopPaintAsync();
-                break;
-            case HotkeySecondPass:
-                _ = await RunPaintCommandAsync(previewOnly: false, unpreviewOnly: false, secondPass: true);
-                break;
-            case HotkeyNaturalFirstPass:
-                _ = await RunNaturalPaintCommandAsync(secondPass: false);
-                break;
-            case HotkeyNaturalSecondPass:
-                _ = await RunNaturalPaintCommandAsync(secondPass: true);
-                break;
+            NotifyPaintResult(await RunPaintCommandAsync(previewOnly: false, unpreviewOnly: false, secondPass: true));
+            await PushSnapshotAsync();
+            return;
         }
+        if (id == HotkeyNaturalFirstPass)
+        {
+            NotifyPaintResult(await RunNaturalPaintCommandAsync(secondPass: false));
+            await PushSnapshotAsync();
+            return;
+        }
+        if (id == HotkeyNaturalSecondPass)
+        {
+            NotifyPaintResult(await RunNaturalPaintCommandAsync(secondPass: true));
+            await PushSnapshotAsync();
+            return;
+        }
+        PaintAction? action = id switch
+        {
+            HotkeyStart => PaintAction.Start,
+            HotkeyStop => PaintAction.Stop,
+            HotkeyPreview => PaintAction.Preview,
+            HotkeyUnPreview => PaintAction.Unpreview,
+            HotkeyImageStart => PaintAction.ImageStart,
+            HotkeyImageStop => PaintAction.ImageStop,
+            HotkeyImagePreview => PaintAction.ImagePreview,
+            HotkeyImageUnPreview => PaintAction.ImageUnpreview,
+            _ => null
+        };
+        if (action is null)
+            return;
+        var result = await RunPaintActionAsync(action.Value);
+        NotifyPaintResult(result);
         await PushSnapshotAsync();
     }
 
@@ -1024,7 +1846,7 @@ public sealed class MainForm : Form
             _ = DwmSetWindowAttribute(Handle, DwmwaUseImmersiveDarkMode, ref dark, sizeof(int));
             if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
             {
-                var caption = ColorRef(Color.FromArgb(32, 32, 32));
+                var caption = ColorRef(Color.Black);
                 var text = ColorRef(Color.White);
                 _ = DwmSetWindowAttribute(Handle, DwmwaCaptionColor, ref caption, sizeof(int));
                 _ = DwmSetWindowAttribute(Handle, DwmwaTextColor, ref text, sizeof(int));
@@ -1134,7 +1956,7 @@ public sealed class MainForm : Form
         var hotkeyId = ResolveHotkeyId(virtualKey);
         if (hotkeyId == 0)
             return;
-        if (settingsEditing)
+        if (settingsEditing && !IsStopHotkey(hotkeyId))
         {
             if (!hotkeyRecording)
                 SendToast(session.Localization.Text(session.Settings.Language, "toast.editing.hotkey.blocked"), "warn");
@@ -1142,6 +1964,9 @@ public sealed class MainForm : Form
         }
         _ = HandleHotkeyAsync(hotkeyId);
     }
+
+    private static bool IsStopHotkey(int hotkeyId) =>
+        hotkeyId is HotkeyStop or HotkeyImageStop;
 
     private int ResolveHotkeyId(uint virtualKey)
     {
@@ -1151,6 +1976,10 @@ public sealed class MainForm : Form
             (HotkeyPreview, session.Settings.PreviewHotkey),
             (HotkeyUnPreview, session.Settings.UnPreviewHotkey),
             (HotkeyStop, session.Settings.StopHotkey),
+            (HotkeyImageStart, session.Settings.ImageStartHotkey),
+            (HotkeyImagePreview, session.Settings.ImagePreviewHotkey),
+            (HotkeyImageUnPreview, session.Settings.ImageUnPreviewHotkey),
+            (HotkeyImageStop, session.Settings.ImageStopHotkey),
             (HotkeySecondPass, session.Settings.SecondPassHotkey),
             (HotkeyNaturalFirstPass, session.Settings.NaturalFirstPassHotkey),
             (HotkeyNaturalSecondPass, session.Settings.NaturalSecondPassHotkey)

@@ -10,7 +10,7 @@ param(
     [string]$OodlePath = "",
     [string]$ZlibPath = "",
     [int]$TextureSize = 1024,
-    [int]$ExpectedVertices = 1660,
+    [int]$ExpectedVertices = 1668,
     [int]$ExpectedIndices = 8352,
     [int]$ExpectedBones = 28
 )
@@ -51,7 +51,7 @@ if ([string]::IsNullOrWhiteSpace($MappingsPath)) {
     $MappingsPath = $env:MECCHA_MAPPINGS_PATH
 }
 if ([string]::IsNullOrWhiteSpace($MappingsPath)) {
-    throw "MappingsPath is required. Run the mapping dumper after a game update, then pass make mesh MAPPINGS=<path-to-usmap> or set MECCHA_MAPPINGS_PATH."
+    throw "MappingsPath is required: this repository intentionally has no generated .usmap. Create Mappings.usmap from the current game build with third_party/UnrealMappingsDumper, then run make mesh MAPPINGS=<path-to-Mappings.usmap> or set MECCHA_MAPPINGS_PATH."
 }
 
 if ([string]::IsNullOrWhiteSpace($Cue4ParsePath)) {

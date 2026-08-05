@@ -12,6 +12,12 @@ rem --- Configure this if your fork lives somewhere else ---
 set "REMOTE_URL=https://github.com/Mozmina/MecchaCamouflage.git"
 set "BRANCH=main"
 
+rem --- Clear any stale git lock files left over from an interrupted run ---
+rem     (can happen if OneDrive, an antivirus, or another program briefly
+rem     locks a file inside .git while a previous run was working)
+if exist ".git\index.lock" del /f /q ".git\index.lock" >nul 2>nul
+if exist ".git\HEAD.lock" del /f /q ".git\HEAD.lock" >nul 2>nul
+
 where git >nul 2>nul
 if errorlevel 1 (
     echo [ERROR] Git was not found on this computer.
@@ -41,12 +47,23 @@ git fetch origin %BRANCH%
 if errorlevel 1 goto :fail
 
 echo [4/6] Lining up local history with origin/%BRANCH% (your edited files are kept as-is)...
+set "RESET_TRIES=0"
+:reset_retry
+if exist ".git\index.lock" del /f /q ".git\index.lock" >nul 2>nul
 git reset origin/%BRANCH%
-if errorlevel 1 goto :fail
+if not errorlevel 1 goto :reset_done
+set /a RESET_TRIES+=1
+if !RESET_TRIES! lss 3 (
+    echo [INFO] Retrying (another program may have briefly locked a git file)...
+    timeout /t 2 /nobreak >nul
+    goto :reset_retry
+)
+goto :fail
+:reset_done
 
 echo [5/6] Staging and committing your changes...
 git add -A
-git commit -m "Natural paint: 3-stage pipeline (base coat, color blocks, detail); fix color-batch test fill_end assumption"
+git commit -m "Merge upstream v1.7.2 (ESP overlay, Image Paint, WebP, Fukuyoka, rewritten per-region replay/color pipeline, GPLv3, new submodules); re-adapt natural paint 3-stage (F10/F11) and second pass (F9) onto new pipeline; move Second/Natural hotkeys to F9-F11 to free F5-F8 for Image Paint; rebrand new LiveDiagnostics project and merged files to ZemiMecchamouflage"
 if errorlevel 1 (
     echo.
     echo [INFO] Nothing to commit, or git needs your identity configured.

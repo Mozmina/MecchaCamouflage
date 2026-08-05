@@ -1,13 +1,14 @@
 # Research Tools
 
-This project pins OSS game-research tools as git submodules under
-`third_party/`. They are used only when a game update requires asset, mapping,
-or SDK investigation.
+This project pins third-party source dependencies as git submodules under
+`third_party/`. MinHook is required by the normal runtime build. CUE4Parse and
+UnrealMappingsDumper are used when a game update requires asset, mapping, or SDK
+investigation.
 
 The normal runtime build requires the WebView2 controller host, the native bridge and
-injector, and the reviewed mesh profile artifacts under `resources/mesh-profiles/`.
-The tools below are for update recovery and profile regeneration, not normal
-app builds.
+injector, MinHook, and the reviewed mesh profile artifacts under
+`resources/mesh-profiles/`. The research tools below are for update recovery
+and profile regeneration.
 
 Runtime bridge probes for multiplayer paint replication are documented in
 [`runtime-paint-replication-research.md`](runtime-paint-replication-research.md)
@@ -22,11 +23,18 @@ the local build output for package/debug runs. After game updates, initialize th
 submodules and run `make mesh MAPPINGS=<path-to-usmap>` to regenerate the
 reviewed shipping profile.
 
-Initialize the research tools with:
+Initialize all pinned dependencies with:
 
 ```bash
 git submodule update --init --recursive
 ```
+
+## MinHook
+
+- Upstream: https://github.com/TsudaKageyu/minhook
+- License: BSD 2-Clause; see `third_party/minhook/LICENSE.txt`
+- Purpose: provide the native function hooks used by the in-game renderer.
+- Pinned path used by `make build`: `third_party/minhook`
 
 ## CUE4Parse
 
@@ -78,6 +86,24 @@ The command writes `resources/mesh-profiles/paintman.mesh-profile-v2.json` after
 validating the expected Paintman LOD0 shape. It fails closed if CUE4Parse,
 game archives, mappings, or the expected mesh shape are unavailable.
 
+For an update that affects Image Paint, use the combined refresh command instead.
+With the requested body already selected in game and standing naturally, it
+regenerates the readonly asset profile, builds the development capture host, and
+bakes the exact one-shot RuntimePaintable vertices and skeleton into
+`ImageReferencePose`:
+
+~~~bash
+make refresh-image-reference \
+  REFERENCE_BODY=round \
+  MAPPINGS=/path/to/current-game.usmap \
+  CONFIRM_NEUTRAL_POSE=1
+~~~
+
+Use `REFERENCE_BODY=cube` for the cube mesh. The confirmation is intentional:
+the script must never silently bake an arbitrary live animation or run during
+normal painting. It restores the previous profile if generation, build, capture,
+or profile-identity validation fails.
+
 ## Update Workflow
 
 When a game update breaks painting, use this order:
@@ -93,7 +119,7 @@ When a game update breaks painting, use this order:
 4. Use UnrealMappingsDumper only when runtime reflection cannot resolve a
    trustworthy layout or the engine-side mapping changed.
 5. Generate a current `.usmap` locally if the previous mapping no longer works.
-6. Run `make mesh MAPPINGS=<path-to-current.usmap>` to regenerate the profile.
+6. With the body selected and neutral, run `make refresh-image-reference MAPPINGS=<path-to-current.usmap> CONFIRM_NEUTRAL_POSE=1` to regenerate its profile and fixed pose together.
 7. Review and commit regenerated shipping profiles in `resources/mesh-profiles/`.
    `scripts/build.ps1` copies profiles into `.build/bin/mesh-profiles/` for
    package/debug runs.

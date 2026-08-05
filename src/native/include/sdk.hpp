@@ -8,11 +8,22 @@ namespace sdk
 {
     namespace FieldOffsets
     {
+        // Verified against the current shipping build by enumerating the live
+        // level and joining role-character AActors to PlayerArray PlayerStates.
+        constexpr std::uintptr_t UWorld_PersistentLevel = 0x0030;
+        constexpr std::uintptr_t ULevel_Actors = 0x00A0;
         constexpr std::uintptr_t UWorld_OwningGameInstance = 0x0228;
         constexpr std::uintptr_t UGameInstance_LocalPlayers = 0x0038;
         constexpr std::uintptr_t UPlayer_PlayerController = 0x0030;
         constexpr std::uintptr_t Controller_ControlRotation = 0x0320;
         constexpr std::uintptr_t PlayerController_PlayerCameraManager = 0x0360;
+        // The live game-thread response and the external reference agree that
+        // this is the usable component-space FTransform array header on the
+        // current shipping build. The reflected array at 0x9B8 is present but
+        // does not expose a usable live header.
+        constexpr std::uintptr_t
+            SkeletalMeshComponent_CachedComponentSpaceTransforms =
+                0x05F0;
         constexpr std::uintptr_t BP_FirstPersonCharacter_RuntimePaintable = 0x0B68;
         constexpr std::uintptr_t RuntimePaintable_CurrentBrushSettings = 0x0170;
         constexpr std::uintptr_t SceneCapture2D_CaptureComponent2D = 0x02B8;

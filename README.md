@@ -7,7 +7,13 @@
   Zemi Mecchamouflage
 </h1>
 
-A standalone Windows desktop tool for MECCHA CHAMELEON camouflage experiments.
+A Windows desktop app for MECCHA CHAMELEON.
+
+## Features
+
+- **Paint**: Paint a player character with custom colors and materials.
+- **Image Paint**: Paint imported images onto a player character.
+- **ESP**: Show player locations and information in game.
 
 ## Download
 
@@ -28,36 +34,24 @@ Logs are written under:
 %LOCALAPPDATA%\ZemiMecchamouflage\versions\<version>\logs\
 ```
 
-## Windows Security
-
-If the log reports an error like the following, Windows Security has blocked a
-runtime file:
-
-```text
-Bridge warmup failed: One or more errors occurred. (Operation did not complete successfully because the file contains a virus or potentially unwanted software.)
-```
-
-1. Open **Windows Security**.
-2. Go to **Virus & threat protection** → **Manage settings**.
-3. Scroll down to **Exclusions** and click **Add or remove exclusions**.
-4. Click **Add an exclusion** → **Folder**.
-5. Select the following folder:
+If Windows asks, approve the UAC prompt at startup to add this Microsoft
+Defender exclusion:
 
 ```text
 %LOCALAPPDATA%\ZemiMecchamouflage\
 ```
 
-After adding the exclusion, restart ZemiMecchamouflage.
+After adding the exclusion, restart Zemi Mecchamouflage.
 
 ## Development
 
 ```bash
-git clone https://github.com/Mozmina/MecchaCamouflage.git
+git clone --recurse-submodules https://github.com/Mozmina/MecchaCamouflage.git
 cd MecchaCamouflage
 make run
 ```
 
-Core development references:
+## Docs
 
 - [Repository layout](docs/repository-layout.md)
 - [Direct bridge injection](docs/runtime-direct-bridge.md)
@@ -65,8 +59,15 @@ Core development references:
 - [Paint replication validation](docs/runtime-paint-replication-validation.md)
 - [Research tools](docs/research-tools.md)
 - [Release checklist](docs/release-checklist.md)
-- [Feature roadmap](docs/roadmap.md)
+
+## Contributing
+
+Pull requests welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, code style, and the PR process. This fork is based on [acentrist/MecchaCamouflage](https://github.com/acentrist/MecchaCamouflage) — consider contributing improvements upstream too.
+
+## Security
+
+Follow the disclosure process in [SECURITY.md](SECURITY.md).
 
 ## License
 
-This project is licensed under [GPL-3.0-or-later](LICENSE.txt).
+[GPL-3.0-or-later](LICENSE.txt) © Acentrist

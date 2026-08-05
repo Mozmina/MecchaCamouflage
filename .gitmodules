@@ -4,3 +4,6 @@
 [submodule "third_party/UnrealMappingsDumper"]
 	path = third_party/UnrealMappingsDumper
 	url = https://github.com/TheNaeem/UnrealMappingsDumper
+[submodule "third_party/minhook"]
+	path = third_party/minhook
+	url = https://github.com/TsudaKageyu/minhook.git

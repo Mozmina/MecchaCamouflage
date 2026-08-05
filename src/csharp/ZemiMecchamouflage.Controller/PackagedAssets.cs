@@ -33,6 +33,21 @@ public static class PackagedAssets
     private static string[]? cachedManifestResources;
     private static int WorkerCount => Math.Max(1, Environment.ProcessorCount);
 
+    public static string CurrentAssetSetId
+    {
+        get
+        {
+            var assembly = Assembly.GetEntryAssembly() ?? typeof(PackagedAssets).Assembly;
+            var resources = assembly.GetManifestResourceNames()
+                .Where(name => name.StartsWith(ResourcePrefix, StringComparison.Ordinal))
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+            return resources.Length == 0
+                ? "loose"
+                : GetManifest(assembly, resources).AssetSetId;
+        }
+    }
+
     public static string ResolveAssetRoot(AppPaths paths, string directoryName, RuntimeLog? log = null)
     {
         var extracted = EnsureExtracted(paths, directoryName, log);

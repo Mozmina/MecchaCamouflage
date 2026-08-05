@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: windows-2022
@@ -16,6 +20,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve build identity
+        shell: powershell
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $version = $env:GITHUB_REF_NAME
+          } else {
+            $version = "manual-$env:GITHUB_RUN_NUMBER-$env:GITHUB_RUN_ATTEMPT"
+          }
+          "RELEASE_VERSION=$version" | Add-Content -LiteralPath $env:GITHUB_ENV
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -29,11 +45,21 @@ jobs:
 
       - name: Build runtime
         shell: powershell
-        run: .\scripts\build.ps1
+        run: .\scripts\build.ps1 -Version $env:RELEASE_VERSION
 
       - name: Package runtime
         shell: powershell
-        run: .\scripts\release.ps1
+        run: .\scripts\release.ps1 -Version $env:RELEASE_VERSION
+
+      - name: Verify embedded runtime bundle
+        shell: powershell
+        run: |
+          $safeVersion = $env:RELEASE_VERSION -replace '[^A-Za-z0-9._-]', '_'
+          .\scripts\verify-runtime-bundle.ps1 `
+            -ExePath ".build/package/zemi-mecchamouflage-$env:RELEASE_VERSION.exe" `
+            -ExpectedVersion $env:RELEASE_VERSION `
+            -BridgePath ".build/obj/$safeVersion/package-native/runtime-bridge.dll" `
+            -ProfileDirectory "resources/mesh-profiles"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -46,4 +72,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: .build/package/zemi-mecchamouflage-*.exe

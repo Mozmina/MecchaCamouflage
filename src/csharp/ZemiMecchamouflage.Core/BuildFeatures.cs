@@ -12,4 +12,10 @@ public static class BuildFeatures
     public static bool ResearchArtifactsEnabled =>
         IsResearchBuild &&
         string.Equals(Environment.GetEnvironmentVariable("MECCHA_RESEARCH_ARTIFACTS"), "1", StringComparison.Ordinal);
+
+    public static bool NativeEspVerboseStatusEnabled =>
+        string.Equals(
+            Environment.GetEnvironmentVariable("MECCHA_ESP_VERBOSE_STATUS"),
+            "1",
+            StringComparison.Ordinal);
 }

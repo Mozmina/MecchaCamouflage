@@ -4,17 +4,11 @@
 #include <cstdint>
 #include <type_traits>
 
-#include <windows.h>
-
 // This ABI is deliberately pointer-free. The injector copies the whole block into
-// the target process, BridgeStartV1 copies it into bridge-owned state, and then the
+// the target process, BridgeStartV2 copies it into bridge-owned state, and then the
 // injector may safely reclaim the remote block after the remote start thread exits.
 // Keep the fixed offsets in sync with the controller serializer.
-constexpr std::uint32_t BridgeStartMagicV1 = 0x3153434D; // bytes: "MCS1"
-constexpr std::uint32_t BridgeStartAbiV1 = 1;
-constexpr std::uint32_t BridgeBootstrapProtocolV1 = 1;
-
-enum BridgeStartResultV1 : std::uint32_t
+enum BridgeStartResult : std::uint32_t
 {
     BRIDGE_START_UNINITIALIZED = 0,
     BRIDGE_START_STARTING = 1,
@@ -29,8 +23,14 @@ enum BridgeStartResultV1 : std::uint32_t
     BRIDGE_START_WORKER_FAILED = 10,
 };
 
+// V2 keeps the controller-provided DLL integrity hash and additionally binds
+// the bridge to the complete runtime bundle (DLL, profiles, and protocol ABIs).
+constexpr std::uint32_t BridgeStartMagicV2 = 0x3253434D; // bytes: "MCS2"
+constexpr std::uint32_t BridgeStartAbiV2 = 2;
+constexpr std::uint32_t BridgeBootstrapProtocolV2 = 2;
+
 #pragma pack(push, 1)
-struct BridgeStartBlockV1
+struct BridgeStartBlockV2
 {
     std::uint32_t magic;
     std::uint32_t size;
@@ -39,6 +39,7 @@ struct BridgeStartBlockV1
     std::uint8_t instance_guid[16];
     std::uint8_t token[32];
     std::uint8_t sha256[32];
+    std::uint8_t runtime_bundle_sha256[32];
     std::uint32_t requested_port;
     std::uint32_t result_state;
     std::uint32_t bound_port;
@@ -50,22 +51,21 @@ struct BridgeStartBlockV1
 };
 #pragma pack(pop)
 
-using BridgeStartV1Fn = DWORD(WINAPI*)(void*);
-
-static_assert(std::is_standard_layout_v<BridgeStartBlockV1>);
-static_assert(sizeof(BridgeStartBlockV1) == 128);
-static_assert(offsetof(BridgeStartBlockV1, magic) == 0);
-static_assert(offsetof(BridgeStartBlockV1, size) == 4);
-static_assert(offsetof(BridgeStartBlockV1, abi) == 8);
-static_assert(offsetof(BridgeStartBlockV1, pid) == 12);
-static_assert(offsetof(BridgeStartBlockV1, instance_guid) == 16);
-static_assert(offsetof(BridgeStartBlockV1, token) == 32);
-static_assert(offsetof(BridgeStartBlockV1, sha256) == 64);
-static_assert(offsetof(BridgeStartBlockV1, requested_port) == 96);
-static_assert(offsetof(BridgeStartBlockV1, result_state) == 100);
-static_assert(offsetof(BridgeStartBlockV1, bound_port) == 104);
-static_assert(offsetof(BridgeStartBlockV1, protocol) == 108);
-static_assert(offsetof(BridgeStartBlockV1, win32_error) == 112);
-static_assert(offsetof(BridgeStartBlockV1, winsock_error) == 116);
-static_assert(offsetof(BridgeStartBlockV1, reserved0) == 120);
-static_assert(offsetof(BridgeStartBlockV1, reserved1) == 124);
+static_assert(std::is_standard_layout_v<BridgeStartBlockV2>);
+static_assert(sizeof(BridgeStartBlockV2) == 160);
+static_assert(offsetof(BridgeStartBlockV2, magic) == 0);
+static_assert(offsetof(BridgeStartBlockV2, size) == 4);
+static_assert(offsetof(BridgeStartBlockV2, abi) == 8);
+static_assert(offsetof(BridgeStartBlockV2, pid) == 12);
+static_assert(offsetof(BridgeStartBlockV2, instance_guid) == 16);
+static_assert(offsetof(BridgeStartBlockV2, token) == 32);
+static_assert(offsetof(BridgeStartBlockV2, sha256) == 64);
+static_assert(offsetof(BridgeStartBlockV2, runtime_bundle_sha256) == 96);
+static_assert(offsetof(BridgeStartBlockV2, requested_port) == 128);
+static_assert(offsetof(BridgeStartBlockV2, result_state) == 132);
+static_assert(offsetof(BridgeStartBlockV2, bound_port) == 136);
+static_assert(offsetof(BridgeStartBlockV2, protocol) == 140);
+static_assert(offsetof(BridgeStartBlockV2, win32_error) == 144);
+static_assert(offsetof(BridgeStartBlockV2, winsock_error) == 148);
+static_assert(offsetof(BridgeStartBlockV2, reserved0) == 152);
+static_assert(offsetof(BridgeStartBlockV2, reserved1) == 156);

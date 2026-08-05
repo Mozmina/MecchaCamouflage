@@ -10,10 +10,14 @@ on:
 jobs:
   build:
     runs-on: windows-2022
+    env:
+      BUILD_VERSION: ci-${{ github.run_number }}-${{ github.run_attempt }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -27,23 +31,28 @@ jobs:
 
       - name: Build runtime
         shell: powershell
-        run: .\scripts\build.ps1
+        run: .\scripts\build.ps1 -Version $env:BUILD_VERSION
 
       - name: Build artifact checks
         shell: powershell
         run: |
           if (-not (Test-Path ".build/bin/zemi-mecchamouflage.exe")) { throw "runtime exe missing" }
-          if (-not (Test-Path ".build/obj/package-native/runtime-bridge.dll")) { throw "runtime bridge dll missing" }
-          if (-not (Test-Path ".build/obj/package-native/runtime-injector.exe")) { throw "runtime injector exe missing" }
-          if (Test-Path ".build/obj/package-native/bridge-loader.dll") { throw "bridge loader must not be packaged" }
+          $nativeDir = ".build/obj/$env:BUILD_VERSION/package-native"
+          if (-not (Test-Path "$nativeDir/runtime-bridge.dll")) { throw "runtime bridge dll missing" }
+          if (-not (Test-Path "$nativeDir/runtime-injector.exe")) { throw "runtime injector exe missing" }
+          if (Test-Path "$nativeDir/bridge-loader.dll") { throw "bridge loader must not be packaged" }
           if (Test-Path "src/native/loader/loader.cpp") { throw "obsolete loader source must not return" }
           if (Test-Path "src/native/include/bridge_loader_abi.hpp") { throw "obsolete loader ABI must not return" }
 
       - name: Package dry run
         shell: powershell
         run: |
-          $version = "ci-$env:GITHUB_RUN_NUMBER"
-          .\scripts\release.ps1 -Version $version
-          $exePath = ".build/package/zemi-mecchamouflage-$version.exe"
+          .\scripts\release.ps1 -Version $env:BUILD_VERSION
+          $exePath = ".build/package/zemi-mecchamouflage-$($env:BUILD_VERSION).exe"
           if (-not (Test-Path $exePath)) { throw "package exe missing" }
           if ((Get-Item $exePath).Length -le 10000000) { throw "package exe is unexpectedly small" }
+          .\scripts\verify-runtime-bundle.ps1 `
+            -ExePath $exePath `
+            -ExpectedVersion $env:BUILD_VERSION `
+            -BridgePath ".build/obj/$env:BUILD_VERSION/package-native/runtime-bridge.dll" `
+            -ProfileDirectory "resources/mesh-profiles"

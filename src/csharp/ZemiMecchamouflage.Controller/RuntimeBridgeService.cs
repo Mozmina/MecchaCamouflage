@@ -1,7 +1,10 @@
 using System.ComponentModel;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.MemoryMappedFiles;
 using System.Security.Cryptography;
+using System.Text.Json;
 using ZemiMecchamouflage.Core;
 
 namespace ZemiMecchamouflage.Controller;
@@ -30,7 +33,12 @@ public enum ResearchTextureTarget
 public sealed record ResearchBridgeOptions(string EventWatchOutputPath);
 
 /// <summary>Non-secret identity exported to research artifacts for correlation with event-watch output.</summary>
-public sealed record ResearchBridgeIdentity(int ProcessId, Guid InstanceId, string BridgeHash, string BridgePath);
+public sealed record ResearchBridgeIdentity(
+    int ProcessId,
+    Guid InstanceId,
+    string BridgeHash,
+    string RuntimeBundleId,
+    string BridgePath);
 
 /// <summary>Creates the pre-injection, local-only sidecar used by the native event watcher.</summary>
 public static class ResearchBridgeArtifacts
@@ -58,21 +66,55 @@ public static class ResearchBridgeArtifacts
     }
 }
 
+public static class GameProcessSelectionPolicy
+{
+    public static int? SelectProcessId(
+        IEnumerable<int> candidateProcessIds,
+        int? pinnedProcessId)
+    {
+        ArgumentNullException.ThrowIfNull(candidateProcessIds);
+        var candidates = candidateProcessIds
+            .Where(processId => processId > 0)
+            .Distinct()
+            .ToArray();
+        if (pinnedProcessId is > 0 &&
+            candidates.Contains(pinnedProcessId.Value))
+        {
+            return pinnedProcessId.Value;
+        }
+        return candidates.Length == 1 ? candidates[0] : null;
+    }
+
+    public static bool MayReplacePinnedTarget(
+        bool hasPinnedTarget,
+        bool pinnedTargetIsAlive) =>
+        !hasPinnedTarget || !pinnedTargetIsAlive;
+
+}
+
 /// <summary>
-/// Stages and starts one uniquely named direct bridge per attempt. Existing bridge modules are
-/// intentionally outside this service's control: they are neither enumerated, switched,
-/// unloaded, nor used as a reason to require a game restart.
+/// Reconnects to a matching native generation or safely replaces an obsolete resident bridge.
+/// Every injection uses an immutable, content-addressed instance directory; loaded modules are
+/// left resident but must be unhooked and quiescent before the next generation starts.
 /// </summary>
 public sealed class RuntimeBridgeService
 {
     public static readonly TimeSpan BridgeProbeTimeout = TimeSpan.FromMilliseconds(300);
+    private const int ProductionGenerationLimit = 3;
+    private const int DevelopmentGenerationLimit = 8;
 
     private readonly AppPaths paths;
     private readonly RuntimeLog log;
     private readonly object bridgeStateGate = new();
     private BridgeInstance? activeInstance;
     private string waitingForProcessName = "";
+    private string lastAmbiguousProcessKey = "";
+    private string lastBlockedTargetSwitchKey = "";
+    private string lastUnresponsiveBridgeKey = "";
     private string lastBridgeReadyLogKey = "";
+    private string lastGenerationLogKey = "";
+    private readonly HashSet<string> replacementAttempts = new(StringComparer.OrdinalIgnoreCase);
+    private NativeRuntimeBundleDescriptor? packagedRuntimeBundle;
     private bool bridgeReadyTimeoutLogged;
     private bool bridgeConnected;
 
@@ -118,6 +160,16 @@ public sealed class RuntimeBridgeService
         }
     }
 
+    /// <summary>Identifies the currently connected, uniquely staged bridge instance.</summary>
+    public Guid? ActiveBridgeInstanceId
+    {
+        get
+        {
+            lock (bridgeStateGate)
+                return activeInstance?.InstanceId;
+        }
+    }
+
     public ResearchBridgeIdentity? ActiveResearchBridgeIdentity
     {
         get
@@ -131,6 +183,7 @@ public sealed class RuntimeBridgeService
                         instance.Target.ProcessId,
                         instance.InstanceId,
                         instance.ExpectedBridgeHash,
+                        instance.ExpectedRuntimeBundleId ?? "",
                         instance.BridgePath);
             }
         }
@@ -144,7 +197,48 @@ public sealed class RuntimeBridgeService
     public Process? FindGameProcess(string processName)
     {
         var name = Path.GetFileNameWithoutExtension(processName);
-        return Process.GetProcessesByName(name).OrderBy(process => process.Id).FirstOrDefault();
+        TargetProcessIdentity? pinnedTarget;
+        lock (bridgeStateGate)
+            pinnedTarget = activeInstance?.Target;
+        var pinnedProcess = TryOpenPinnedProcess(pinnedTarget);
+        if (pinnedProcess is not null)
+            return pinnedProcess;
+
+        var candidates = Process.GetProcessesByName(name);
+        var candidateProcessIds =
+            candidates.Select(process => process.Id).ToArray();
+        var selectedProcessId = GameProcessSelectionPolicy.SelectProcessId(
+            candidateProcessIds,
+            pinnedProcessId: null);
+        Process? selected = null;
+        foreach (var candidate in candidates)
+        {
+            if (selected is null && candidate.Id == selectedProcessId)
+                selected = candidate;
+            else
+                candidate.Dispose();
+        }
+        if (selected is null && candidates.Length > 1)
+        {
+            var candidateKey = string.Join(
+                ",",
+                candidateProcessIds.Order());
+            if (!string.Equals(
+                    lastAmbiguousProcessKey,
+                    candidateKey,
+                    StringComparison.Ordinal))
+            {
+                lastAmbiguousProcessKey = candidateKey;
+                waitingForProcessName = processName;
+                log.Warn(
+                    $"Game process: multiple candidates ({candidateKey}); waiting for one unambiguous target.");
+            }
+        }
+        else
+        {
+            lastAmbiguousProcessKey = "";
+        }
+        return selected;
     }
 
     public Task<BridgeReply> PingAsync(CancellationToken cancellationToken = default, TimeSpan? timeoutOverride = null) =>
@@ -155,6 +249,69 @@ public sealed class RuntimeBridgeService
 
     public Task<BridgeReply> SendPaintAsync(string payload, CancellationToken cancellationToken = default) =>
         RequestActiveAsync(client => client.RequestAsync(payload, cancellationToken));
+
+    /// <summary>
+    /// Configures the in-process D3D12 Present compositor. The host supplies
+    /// settings only; it never reads game memory or owns an overlay window.
+    /// </summary>
+    public Task<BridgeReply> ConfigureNativePresentEspAsync(
+        EspSettings settings,
+        CancellationToken cancellationToken = default) =>
+        ConfigureNativePresentEspAsync(
+            settings, forceRebind: false, cancellationToken: cancellationToken);
+
+    public Task<BridgeReply> ConfigureNativePresentEspAsync(
+        EspSettings settings,
+        bool forceRebind,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        var payload = JsonSerializer.Serialize(new
+        {
+            type = "esp_native_present",
+            enabled = settings.Enabled,
+            scope = settings.TargetScope,
+            boxes = settings.Boxes,
+            skeletons = settings.Skeletons,
+            names = settings.Names,
+            distance = settings.Distance,
+            snaplines = settings.Snaplines,
+            hider_r = settings.HiderColor.R,
+            hider_g = settings.HiderColor.G,
+            hider_b = settings.HiderColor.B,
+            hunter_r = settings.HunterColor.R,
+            hunter_g = settings.HunterColor.G,
+            hunter_b = settings.HunterColor.B,
+            force_rebind = forceRebind
+        });
+        return RequestActiveAsync(client => client.RequestAsync(
+            payload,
+            cancellationToken,
+            TimeSpan.FromSeconds(2)));
+    }
+
+    public Task<BridgeReply> ArmNativePresentEspProbeAsync(
+        int frames = 120,
+        CancellationToken cancellationToken = default)
+    {
+        if (frames is < 1 or > 120)
+            throw new ArgumentOutOfRangeException(nameof(frames));
+        var payload = JsonSerializer.Serialize(new
+        {
+            type = "esp_native_present_probe",
+            frames
+        });
+        return RequestActiveAsync(client => client.RequestAsync(
+            payload,
+            cancellationToken,
+            TimeSpan.FromSeconds(2)));
+    }
+
+    public Task<BridgeReply> GetNativePresentEspStatusAsync(CancellationToken cancellationToken = default) =>
+        RequestActiveAsync(client => client.RequestAsync(
+            "{\"type\":\"esp_native_present_status\"}",
+            cancellationToken,
+            TimeSpan.FromMilliseconds(500)));
 
     /// <summary>
     /// Sends one whitelisted, authenticated research request through the controller-owned bridge.
@@ -200,6 +357,28 @@ public sealed class RuntimeBridgeService
     public async Task<BridgeReply> ShutdownAsync(CancellationToken cancellationToken = default)
     {
         var result = await RequestActiveWithInstanceAsync(client => client.ShutdownAsync(cancellationToken));
+        if (result.Reply.Ok && result.Reply.Success)
+        {
+            lock (bridgeStateGate)
+            {
+                if (ReferenceEquals(activeInstance, result.Instance))
+                {
+                    bridgeConnected = false;
+                    activeInstance = null;
+                }
+            }
+        }
+        return result.Reply;
+    }
+
+    /// <summary>
+    /// Releases this host's connection but intentionally leaves the process-resident native
+    /// graphics core alive. A later GUI discovers and authenticates to that same core rather
+    /// than stacking another Present hook over a live game.
+    /// </summary>
+    public async Task<BridgeReply> DetachAsync(CancellationToken cancellationToken = default)
+    {
+        var result = await RequestActiveWithInstanceAsync(client => client.DetachAsync(cancellationToken));
         if (result.Reply.Ok && result.Reply.Success)
         {
             lock (bridgeStateGate)
@@ -271,7 +450,11 @@ public sealed class RuntimeBridgeService
             using var process = Process.GetProcessById(selectedProcessId);
             var target = CaptureTargetIdentity(process);
             waitingForProcessName = "";
-            return await InjectDirectInstanceAsync(target, options, cancellationToken);
+            return await InjectDirectInstanceAsync(
+                target,
+                options,
+                ResolvePackagedRuntimeBundle(),
+                cancellationToken);
         }
         catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception or UnauthorizedAccessException)
         {
@@ -311,33 +494,153 @@ public sealed class RuntimeBridgeService
     {
         ArgumentNullException.ThrowIfNull(target);
         waitingForProcessName = "";
-        var matchingInstance = MatchingActiveInstance(target);
-        if (matchingInstance is not null)
+        BridgeInstance? previousInstance;
+        lock (bridgeStateGate)
+            previousInstance = activeInstance;
+        if (previousInstance is not null &&
+            !SameTargetIdentity(previousInstance.Target, target))
         {
-            var ping = await PingAsync(cancellationToken, BridgeProbeTimeout);
-            if (IsBridgeReadyForInstance(ping, matchingInstance))
+            var previousTargetIsAlive =
+                TargetIdentityIsAlive(previousInstance.Target);
+            if (!GameProcessSelectionPolicy.MayReplacePinnedTarget(
+                    hasPinnedTarget: true,
+                    pinnedTargetIsAlive: previousTargetIsAlive))
             {
-                bridgeReadyTimeoutLogged = false;
-                if (RestoreConnectedState(matchingInstance))
-                    return true;
+                var blockedKey =
+                    $"{previousInstance.Target.ProcessId}:{target.ProcessId}";
+                if (!string.Equals(
+                        lastBlockedTargetSwitchKey,
+                        blockedKey,
+                        StringComparison.Ordinal))
+                {
+                    lastBlockedTargetSwitchKey = blockedKey;
+                    log.Warn(
+                        $"Game process: keeping connected pid={previousInstance.Target.ProcessId}; ignored competing pid={target.ProcessId}.");
+                }
+                return false;
             }
-            MarkDisconnectedIfCurrent(matchingInstance);
+
+            lock (bridgeStateGate)
+            {
+                if (ReferenceEquals(activeInstance, previousInstance))
+                {
+                    activeInstance = null;
+                    bridgeConnected = false;
+                }
+            }
+            lastBlockedTargetSwitchKey = "";
+            log.Info(
+                $"Game process: previous pid={previousInstance.Target.ProcessId} exited; selecting pid={target.ProcessId}.");
+        }
+        NativeRuntimeBundleDescriptor desiredBundle;
+        try
+        {
+            desiredBundle = ResolvePackagedRuntimeBundle();
+        }
+        catch (Exception ex) when (ex is ArgumentException or UnauthorizedAccessException or IOException or DirectoryNotFoundException)
+        {
+            MarkDisconnected();
+            DiagnosticsState.SetLastCode("MC-RT-001", ex.Message);
+            DiagnosticsState.SetBridgeInjection("runtime bundle validation failed");
+            log.Error("Bridge: packaged runtime bundle validation failed: " + FriendlyAccessFailure(ex.Message));
+            return false;
         }
 
-        return await InjectDirectInstanceAsync(target, null, cancellationToken);
+        var resident = MatchingActiveInstance(target) ?? TryAttachResidentCore(target);
+        if (resident is not null && RuntimeBundleMatches(resident, desiredBundle))
+        {
+            lock (bridgeStateGate)
+            {
+                activeInstance = resident;
+                bridgeConnected = false;
+            }
+            var ping = await PingAsync(cancellationToken, BridgeProbeTimeout);
+            if (IsBridgeReadyForInstance(ping, resident))
+            {
+                bridgeReadyTimeoutLogged = false;
+                lastUnresponsiveBridgeKey = "";
+                LogGenerationState(resident, desiredBundle, "reconnect", CountLoadedBridgeGenerations(target));
+                return RestoreConnectedState(resident);
+            }
+            MarkDisconnectedIfCurrent(resident);
+        }
+
+        return await InjectDirectInstanceAsync(target, null, desiredBundle, cancellationToken);
+    }
+
+    private static BridgeInstance? TryAttachResidentCore(TargetProcessIdentity target)
+    {
+        if (!OperatingSystem.IsWindows())
+            return null;
+        try
+        {
+            using var mapping = MemoryMappedFile.OpenExisting(
+                $@"Local\ZemiMecchamouflage.ResidentCore.{target.ProcessId}",
+                MemoryMappedFileRights.Read);
+            var header = ReadMappedBytes(mapping, 12);
+            var size = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(4, 4));
+            if (size is not (BridgeResidentCore.SizeV1 or BridgeResidentCore.SizeV2))
+                return null;
+            var bytes = ReadMappedBytes(mapping, checked((int)size));
+            if (!BridgeResidentCore.TryParse(bytes, target.ProcessId, out var resident))
+                return null;
+            var instance = new BridgeInstance(
+                target,
+                resident.InstanceId,
+                resident.ConnectionToken,
+                resident.BridgeHash,
+                bridgePath: "",
+                injectorPath: "",
+                progressPath: "",
+                resident.RuntimeBundleId,
+                resident.ProtocolVersion);
+            instance.SetPort(resident.Port);
+            return instance;
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+    }
+
+    private static byte[] ReadMappedBytes(MemoryMappedFile mapping, int size)
+    {
+        using var view = mapping.CreateViewStream(0, size, MemoryMappedFileAccess.Read);
+        var bytes = new byte[size];
+        var read = 0;
+        while (read < bytes.Length)
+        {
+            var count = view.Read(bytes, read, bytes.Length - read);
+            if (count == 0)
+                throw new EndOfStreamException("Resident bridge mapping ended early.");
+            read += count;
+        }
+        return bytes;
     }
 
     private Task<bool> InjectDirectInstanceAsync(
         TargetProcessIdentity target,
         ResearchBridgeOptions? researchOptions,
+        NativeRuntimeBundleDescriptor desiredBundle,
         CancellationToken cancellationToken) =>
         // Mutex ownership is thread-affine. Keep the complete critical section on one worker
         // thread so asynchronous injector/network continuations cannot release it elsewhere.
-        Task.Run(() => InjectDirectInstanceOnMutexThread(target, researchOptions, cancellationToken), CancellationToken.None);
+        Task.Run(
+            () => InjectDirectInstanceOnMutexThread(target, researchOptions, desiredBundle, cancellationToken),
+            CancellationToken.None);
 
     private bool InjectDirectInstanceOnMutexThread(
         TargetProcessIdentity target,
         ResearchBridgeOptions? researchOptions,
+        NativeRuntimeBundleDescriptor desiredBundle,
         CancellationToken cancellationToken)
     {
         var mutexName = $@"Local\ZemiMecchamouflage.Inject.{target.ProcessId}";
@@ -347,7 +650,7 @@ public sealed class RuntimeBridgeService
         {
             try
             {
-                ownsMutex = mutex.WaitOne(TimeSpan.FromSeconds(1));
+                ownsMutex = mutex.WaitOne(TimeSpan.FromSeconds(30));
             }
             catch (AbandonedMutexException)
             {
@@ -359,10 +662,89 @@ public sealed class RuntimeBridgeService
                 return false;
             }
 
+            // Re-evaluate after taking the cross-process mutex. Another GUI may
+            // have completed an upgrade while this caller was waiting.
+            var mappedResident = TryAttachResidentCore(target);
+            if (mappedResident is null && ResidentCoreMappingExists(target.ProcessId))
+                return FailGenerationUpgrade(target, "resident identity could not be validated");
+            var existingInstance = mappedResident ?? MatchingActiveInstance(target);
+            var generationCount = CountLoadedBridgeGenerations(target);
+            var generationLimit = GenerationLimit();
+            var replacementKey = $"{target.ProcessId}:{desiredBundle.Id}";
+            bool replacementAlreadyAttempted;
+            lock (bridgeStateGate)
+                replacementAlreadyAttempted = replacementAttempts.Contains(replacementKey);
+            var action = BridgeGenerationPolicy.Decide(
+                existingInstance is not null,
+                existingInstance?.ExpectedRuntimeBundleId,
+                desiredBundle.Id,
+                replacementAlreadyAttempted,
+                generationCount,
+                generationLimit);
+            if (researchOptions is not null && existingInstance is not null)
+                action = generationCount >= generationLimit
+                    ? BridgeGenerationAction.RestartRequired
+                    : BridgeGenerationAction.Replace;
+
+            if (action == BridgeGenerationAction.RestartRequired)
+                return FailGenerationUpgrade(target, $"native generation limit or retry guard reached ({generationCount}/{generationLimit})");
+
+            if (action == BridgeGenerationAction.Reconnect)
+            {
+                lock (bridgeStateGate)
+                {
+                    activeInstance = existingInstance;
+                    bridgeConnected = false;
+                }
+                var existingPing = PingAsync(cancellationToken, BridgeProbeTimeout).GetAwaiter().GetResult();
+                if (IsBridgeReadyForInstance(existingPing, existingInstance!))
+                {
+                    bridgeReadyTimeoutLogged = false;
+                    lastUnresponsiveBridgeKey = "";
+                    LogGenerationState(existingInstance!, desiredBundle, "reconnect-after-mutex", generationCount);
+                    return RestoreConnectedState(existingInstance!);
+                }
+                MarkDisconnectedIfCurrent(existingInstance!);
+                return FailGenerationUpgrade(target, "matching resident bridge is unresponsive");
+            }
+
+            var replacementStarted = false;
+            if (action == BridgeGenerationAction.Replace)
+            {
+                if (existingInstance is null)
+                    return FailGenerationUpgrade(target, "replacement source disappeared");
+                lock (bridgeStateGate)
+                {
+                    if (!replacementAttempts.Add(replacementKey))
+                        return FailGenerationUpgrade(target, "automatic replacement was already attempted");
+                    activeInstance = existingInstance;
+                    bridgeConnected = false;
+                }
+                replacementStarted = true;
+                DiagnosticsState.SetBridgeInjection($"replacement shutdown pid={target.ProcessId}");
+                var shutdown = new BridgeClient(
+                        existingInstance.Endpoint,
+                        target.ProcessId,
+                        TimeSpan.FromSeconds(10))
+                    .ShutdownAsync(cancellationToken)
+                    .GetAwaiter()
+                    .GetResult();
+                if (!ShutdownProvedQuiescence(shutdown))
+                    return FailGenerationUpgrade(target, $"resident shutdown was not quiescent ({shutdown.Stage})");
+                lock (bridgeStateGate)
+                {
+                    if (ReferenceEquals(activeInstance, existingInstance))
+                        activeInstance = null;
+                    bridgeConnected = false;
+                }
+                if (!WaitForResidentCoreAbsent(target.ProcessId, TimeSpan.FromSeconds(5), cancellationToken))
+                    return FailGenerationUpgrade(target, "resident mapping remained published after shutdown");
+            }
+
             BridgeInstance instance;
             try
             {
-                instance = PrepareDirectBridgeInstance(target, researchOptions);
+                instance = PrepareDirectBridgeInstance(target, researchOptions, desiredBundle);
             }
             catch (Exception ex) when (ex is ArgumentException or UnauthorizedAccessException or IOException or DirectoryNotFoundException or FileNotFoundException)
             {
@@ -370,7 +752,9 @@ public sealed class RuntimeBridgeService
                 DiagnosticsState.SetLastCode("MC-RT-001", ex.Message);
                 DiagnosticsState.SetBridgeInjection("direct bridge staging failed");
                 log.Error("Bridge: runtime files could not be staged: " + FriendlyAccessFailure(ex.Message));
-                return false;
+                return replacementStarted
+                    ? FailGenerationUpgrade(target, "replacement bundle staging failed")
+                    : false;
             }
 
             LogTargetProcess(target);
@@ -382,9 +766,17 @@ public sealed class RuntimeBridgeService
                 DiagnosticsState.SetLastCode("MC-INJ-131", "injector wait was canceled; target memory ownership is indeterminate");
                 DiagnosticsState.SetBridgeInjection($"direct injector canceled pid={target.ProcessId}");
                 log.Warn("Bridge: injection was canceled while the target operation may still be running. Retry explicitly when ready.");
-                return false;
+                return replacementStarted
+                    ? FailGenerationUpgrade(target, "replacement injector wait was canceled")
+                    : false;
             }
-            if (!invocation.Parsed || invocation.Result is null || !invocation.Result.Matches(target.ProcessId, instance.InstanceId, instance.ExpectedBridgeHash))
+            if (!invocation.Parsed ||
+                invocation.Result is null ||
+                !invocation.Result.Matches(
+                    target.ProcessId,
+                    instance.InstanceId,
+                    instance.ExpectedBridgeHash,
+                    instance.ExpectedRuntimeBundleId))
             {
                 MarkDisconnected();
                 var result = invocation.Result;
@@ -395,7 +787,9 @@ public sealed class RuntimeBridgeService
                 DiagnosticsState.SetLastCode(code, detail ?? "injector did not return a matching direct bridge result");
                 DiagnosticsState.SetBridgeInjection($"direct injection failed pid={target.ProcessId} state={result?.State ?? "protocol_error"}");
                 log.Error("Bridge: direct injection failed: " + FriendlyInjectorFailure(invocation));
-                return false;
+                return replacementStarted
+                    ? FailGenerationUpgrade(target, "replacement injection identity validation failed")
+                    : false;
             }
 
             instance.SetPort(invocation.Result.BoundPort!.Value);
@@ -407,7 +801,18 @@ public sealed class RuntimeBridgeService
             var ping = PingAsync(cancellationToken, TimeSpan.FromSeconds(3)).GetAwaiter().GetResult();
             if (IsBridgeReadyForInstance(ping, instance))
             {
+                var published = TryAttachResidentCore(target);
+                if (published is null ||
+                    published.InstanceId != instance.InstanceId ||
+                    !RuntimeBundleMatches(published, desiredBundle))
+                {
+                    MarkDisconnectedIfCurrent(instance);
+                    return FailGenerationUpgrade(target, "new resident mapping did not publish the staged bundle identity");
+                }
                 bridgeReadyTimeoutLogged = false;
+                var updatedGenerationCount = CountLoadedBridgeGenerations(target);
+                LogGenerationState(instance, desiredBundle, action == BridgeGenerationAction.Replace ? "replaced" : "injected", updatedGenerationCount);
+                CleanupUnusedBridgeInstances(target);
                 return RestoreConnectedState(instance);
             }
 
@@ -419,7 +824,9 @@ public sealed class RuntimeBridgeService
                 bridgeReadyTimeoutLogged = true;
                 log.Error("Bridge: direct bridge started but its authenticated hello did not complete.");
             }
-            return false;
+            return replacementStarted
+                ? FailGenerationUpgrade(target, "replacement bridge hello did not validate")
+                : false;
         }
         finally
         {
@@ -428,32 +835,60 @@ public sealed class RuntimeBridgeService
         }
     }
 
-    private BridgeInstance PrepareDirectBridgeInstance(TargetProcessIdentity target, ResearchBridgeOptions? researchOptions)
+    private BridgeInstance PrepareDirectBridgeInstance(
+        TargetProcessIdentity target,
+        ResearchBridgeOptions? researchOptions,
+        NativeRuntimeBundleDescriptor desiredBundle)
     {
         paths.EnsureBaseDirectories();
         var nativeRoot = PackagedAssets.ResolveRequiredAssetRoot(paths, "native", log);
-        var profilesRoot = PackagedAssets.ResolveRequiredAssetRoot(paths, "mesh-profiles", log);
+        // Mesh profiles live beneath the packaged Web root so the Image editor
+        // and the native bridge read one identical, versioned copy.
+        var profilesRoot = PackagedAssets.ResolveRequiredAssetRoot(paths, "web", log);
         var bridgeSource = ResolvePackagedNativeAsset(nativeRoot, "runtime-bridge.dll");
         var injectorSource = ResolvePackagedNativeAsset(nativeRoot, "runtime-injector.exe");
         if (!File.Exists(bridgeSource) || !File.Exists(injectorSource))
             throw new FileNotFoundException("Packaged direct bridge or injector is missing.");
 
         var instanceId = Guid.NewGuid();
-        var token = RandomNumberGenerator.GetBytes(BridgeStartBlockV1.TokenLength);
-        var hash = PackagedAssets.Sha256File(bridgeSource).ToLowerInvariant();
-        var instanceDirectory = Path.Combine(paths.BridgeInstancesDirectory, BridgeInstanceNaming.CreateDirectoryName(instanceId));
+        var sourceProfiles = Path.Combine(profilesRoot, "web", "mesh-profiles");
+        var currentSourceBundle = NativeRuntimeBundle.Create(bridgeSource, sourceProfiles);
+        if (!string.Equals(currentSourceBundle.Id, desiredBundle.Id, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("The packaged runtime bundle changed while staging.");
+
+        var token = RandomNumberGenerator.GetBytes(BridgeStartBlockV2.TokenLength);
+        var hash = desiredBundle.BridgeSha256;
+        var instanceDirectory = Path.Combine(
+            paths.BridgeInstancesDirectory,
+            BridgeInstanceNaming.CreateDirectoryName(desiredBundle.Id, instanceId, target.ProcessId));
         Directory.CreateDirectory(instanceDirectory);
 
-        var bridgePath = Path.Combine(instanceDirectory, BridgeInstanceNaming.CreateBridgeFileName(hash, instanceId));
+        var bridgePath = Path.Combine(
+            instanceDirectory,
+            BridgeInstanceNaming.CreateBridgeFileName(desiredBundle.Id, instanceId));
         var injectorPath = Path.Combine(instanceDirectory, "runtime-injector.exe");
         PackagedAssets.CopyIfInvalid(bridgeSource, bridgePath);
         PackagedAssets.CopyIfInvalid(injectorSource, injectorPath);
         CopyMeshProfiles(profilesRoot, instanceDirectory);
+        var stagedBundle = NativeRuntimeBundle.Create(
+            bridgePath,
+            Path.Combine(instanceDirectory, "mesh-profiles"));
+        if (!string.Equals(stagedBundle.Id, desiredBundle.Id, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("The staged runtime bundle did not match the packaged runtime bundle.");
         if (researchOptions is not null)
             ResearchBridgeArtifacts.StageEventWatchSidecar(bridgePath, researchOptions.EventWatchOutputPath);
 
         var progressPath = bridgePath + ".progress.json";
-        var instance = new BridgeInstance(target, instanceId, token, hash, bridgePath, injectorPath, progressPath);
+        var instance = new BridgeInstance(
+            target,
+            instanceId,
+            token,
+            hash,
+            bridgePath,
+            injectorPath,
+            progressPath,
+            desiredBundle.Id,
+            BridgeProtocolV2.Version);
         LogRuntimeFilesPrepared(instance);
         return instance;
     }
@@ -474,11 +909,13 @@ public sealed class RuntimeBridgeService
         start.ArgumentList.Add(instance.Target.ExecutablePath);
         start.ArgumentList.Add(instance.BridgePath);
 
-        var startBlock = BridgeStartBlockV1.Create(
+        var startBlock = BridgeStartBlockV2.Create(
             instance.Target.ProcessId,
             instance.InstanceId,
             instance.ConnectionToken,
-            Convert.FromHexString(instance.ExpectedBridgeHash));
+            Convert.FromHexString(instance.ExpectedBridgeHash),
+            Convert.FromHexString(instance.ExpectedRuntimeBundleId
+                ?? throw new InvalidOperationException("A V2 bridge instance has no runtime bundle identity.")));
         Process? injector;
         try
         {
@@ -518,7 +955,7 @@ public sealed class RuntimeBridgeService
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
             LogInjectorOutput(stdout, stderr);
-            if (!InjectorResultV1.TryParseFinal(stdout, out var result, out var parseError))
+            if (!InjectorResult.TryParseFinal(stdout, out var result, out var parseError))
                 return new InjectorInvocation(false, false, null, parseError, stderr);
             return new InjectorInvocation(false, true, result, "", stderr);
         }
@@ -538,7 +975,19 @@ public sealed class RuntimeBridgeService
         lock (bridgeStateGate)
         {
             if (ReferenceEquals(activeInstance, instance))
+            {
+                if (reply.Ok &&
+                    reply.ProcessId == instance.Target.ProcessId &&
+                    reply.InstanceId == instance.InstanceId &&
+                    string.Equals(
+                        reply.BridgeHash,
+                        instance.ExpectedBridgeHash,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    instance.TrySetProgressPath(reply.ProgressPath);
+                }
                 bridgeConnected = IsBridgeReadyForInstance(reply, instance) || (reply.Ok && reply.InstanceId == instance.InstanceId);
+            }
         }
         return new ActiveBridgeRequest(instance, reply);
     }
@@ -603,7 +1052,8 @@ public sealed class RuntimeBridgeService
         reply.ProcessId == instance.Target.ProcessId &&
         reply.InstanceId == instance.InstanceId &&
         string.Equals(reply.BridgeHash, instance.ExpectedBridgeHash, StringComparison.OrdinalIgnoreCase) &&
-        reply.ProtocolVersion == BridgeProtocolV1.Version;
+        reply.ProtocolVersion == instance.ProtocolVersion &&
+        string.Equals(reply.RuntimeBundleId, instance.ExpectedRuntimeBundleId, StringComparison.OrdinalIgnoreCase);
 
     private BridgeInstance? MatchingActiveInstance(TargetProcessIdentity target)
     {
@@ -630,17 +1080,320 @@ public sealed class RuntimeBridgeService
         return TargetProcessIdentity.Create(process.Id, process.StartTime.ToUniversalTime().ToFileTimeUtc(), executablePath);
     }
 
+    private static bool SameTargetIdentity(
+        TargetProcessIdentity left,
+        TargetProcessIdentity right) =>
+        left.ProcessId == right.ProcessId &&
+        left.CreationTimeUtcFileTime == right.CreationTimeUtcFileTime &&
+        string.Equals(
+            left.ExecutablePath,
+            right.ExecutablePath,
+            StringComparison.OrdinalIgnoreCase);
+
+    private static Process? TryOpenPinnedProcess(
+        TargetProcessIdentity? target)
+    {
+        if (target is null)
+            return null;
+        try
+        {
+            var process = Process.GetProcessById(target.ProcessId);
+            if (process.HasExited)
+            {
+                process.Dispose();
+                return null;
+            }
+            try
+            {
+                var creationTime = process.StartTime
+                    .ToUniversalTime()
+                    .ToFileTimeUtc();
+                if (creationTime != target.CreationTimeUtcFileTime)
+                {
+                    process.Dispose();
+                    return null;
+                }
+            }
+            catch (Exception ex) when (
+                ex is Win32Exception or
+                InvalidOperationException or
+                UnauthorizedAccessException)
+            {
+                // Retain the pinned PID when Windows temporarily denies
+                // identity inspection. Switching targets is less safe.
+            }
+            return process;
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException or
+            InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    private static bool TargetIdentityIsAlive(
+        TargetProcessIdentity target)
+    {
+        using var process = TryOpenPinnedProcess(target);
+        return process is not null;
+    }
+
     private static string ResolvePackagedNativeAsset(string root, string fileName)
     {
         var inNativeDirectory = Path.Combine(root, "native", fileName);
         return File.Exists(inNativeDirectory) ? inNativeDirectory : Path.Combine(root, fileName);
     }
 
+    private NativeRuntimeBundleDescriptor ResolvePackagedRuntimeBundle()
+    {
+        lock (bridgeStateGate)
+        {
+            if (packagedRuntimeBundle is not null)
+                return packagedRuntimeBundle;
+        }
+        var descriptor = NativeRuntimeBundle.CreatePackaged(paths, log);
+        lock (bridgeStateGate)
+        {
+            packagedRuntimeBundle ??= descriptor;
+            descriptor = packagedRuntimeBundle;
+        }
+        log.Info(
+            $"Runtime bundle: app_version={VersionInfo.Current} | package_asset_set_id={PackagedAssets.CurrentAssetSetId} | runtime_bundle_id={descriptor.Id[..16]}.");
+        return descriptor;
+    }
+
+    private static bool RuntimeBundleMatches(
+        BridgeInstance instance,
+        NativeRuntimeBundleDescriptor desiredBundle) =>
+        instance.ProtocolVersion == BridgeProtocolV2.Version &&
+        string.Equals(
+            instance.ExpectedRuntimeBundleId,
+            desiredBundle.Id,
+            StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(
+            instance.ExpectedBridgeHash,
+            desiredBundle.BridgeSha256,
+            StringComparison.OrdinalIgnoreCase);
+
+    private static bool ResidentCoreMappingExists(int processId)
+    {
+        if (!OperatingSystem.IsWindows())
+            return false;
+        try
+        {
+            using var mapping = MemoryMappedFile.OpenExisting(
+                $@"Local\ZemiMecchamouflage.ResidentCore.{processId}",
+                MemoryMappedFileRights.Read);
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return true;
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+    }
+
+    private static bool ShutdownProvedQuiescence(BridgeReply reply)
+    {
+        if (!reply.Ok || !reply.Success || !string.Equals(reply.Stage, "shutdown", StringComparison.Ordinal))
+            return false;
+        try
+        {
+            using var document = JsonDocument.Parse(reply.Raw);
+            var root = document.RootElement;
+            return root.TryGetProperty("metadata", out var metadata) &&
+                   metadata.ValueKind == JsonValueKind.Object &&
+                   metadata.TryGetProperty("active_paint_quiescent", out var paint) &&
+                   paint.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                   paint.GetBoolean() &&
+                   metadata.TryGetProperty("hook_callbacks_quiescent", out var callbacks) &&
+                   callbacks.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                   callbacks.GetBoolean();
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool WaitForResidentCoreAbsent(
+        int processId,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (!ResidentCoreMappingExists(processId))
+                return true;
+            if (cancellationToken.IsCancellationRequested)
+                return false;
+            Thread.Sleep(25);
+        }
+        return !ResidentCoreMappingExists(processId);
+    }
+
+    private static int CountLoadedBridgeGenerations(TargetProcessIdentity target)
+    {
+        if (!OperatingSystem.IsWindows())
+            return 0;
+        try
+        {
+            using var process = Process.GetProcessById(target.ProcessId);
+            if (process.HasExited ||
+                process.StartTime.ToUniversalTime().ToFileTimeUtc() != target.CreationTimeUtcFileTime)
+            {
+                return int.MaxValue;
+            }
+            var count = 0;
+            foreach (ProcessModule module in process.Modules)
+            {
+                var name = module.ModuleName;
+                if (name.StartsWith("meccha-direct-bridge-", StringComparison.OrdinalIgnoreCase) ||
+                    name.StartsWith("runtime-bridge-hot-", StringComparison.OrdinalIgnoreCase))
+                {
+                    ++count;
+                }
+            }
+            return count;
+        }
+        catch (Exception ex) when (
+            ex is Win32Exception or InvalidOperationException or UnauthorizedAccessException)
+        {
+            return int.MaxValue;
+        }
+    }
+
+    private static int GenerationLimit() =>
+        BuildFeatures.IsResearchBuild ||
+        VersionInfo.Current.Contains("-build-", StringComparison.OrdinalIgnoreCase)
+            ? DevelopmentGenerationLimit
+            : ProductionGenerationLimit;
+
+    private bool FailGenerationUpgrade(TargetProcessIdentity target, string reason)
+    {
+        MarkDisconnected();
+        DiagnosticsState.SetLastCode("MC-INJ-146", reason);
+        DiagnosticsState.SetBridgeInjection($"restart required pid={target.ProcessId}");
+        var key = $"{target.ProcessId}:{reason}";
+        if (!string.Equals(lastUnresponsiveBridgeKey, key, StringComparison.Ordinal))
+        {
+            lastUnresponsiveBridgeKey = key;
+            log.Error($"Bridge: safe native generation switch failed ({reason}). Restart the game before using Paint or ESP.");
+        }
+        return false;
+    }
+
+    private void LogGenerationState(
+        BridgeInstance resident,
+        NativeRuntimeBundleDescriptor desiredBundle,
+        string stage,
+        int generationCount)
+    {
+        var residentBundle = resident.ExpectedRuntimeBundleId ?? "legacy";
+        var key = $"{resident.Target.ProcessId}:{residentBundle}:{desiredBundle.Id}:{stage}:{generationCount}";
+        if (string.Equals(lastGenerationLogKey, key, StringComparison.Ordinal))
+            return;
+        lastGenerationLogKey = key;
+        log.Info(
+            $"Bridge generation: resident_bundle_id={ShortHash(residentBundle)} | runtime_bundle_id={desiredBundle.Id[..16]} | generation_match={RuntimeBundleMatches(resident, desiredBundle)} | replacement_stage={stage} | generation_count={generationCount}.");
+    }
+
+    private static string ShortHash(string value) =>
+        value.Length > 16 ? value[..16] : value;
+
+    private void CleanupUnusedBridgeInstances(TargetProcessIdentity target)
+    {
+        if (!OperatingSystem.IsWindows() || !Directory.Exists(paths.BridgeInstancesDirectory))
+            return;
+        HashSet<string> loadedPaths;
+        try
+        {
+            using var process = Process.GetProcessById(target.ProcessId);
+            loadedPaths = process.Modules
+                .Cast<ProcessModule>()
+                .Select(module => module.FileName)
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Select(Path.GetFullPath)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (
+            ex is Win32Exception or InvalidOperationException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        foreach (var directory in Directory.EnumerateDirectories(
+                     paths.BridgeInstancesDirectory,
+                     "bridge-instance-v2-*",
+                     SearchOption.TopDirectoryOnly))
+        {
+            var name = Path.GetFileName(directory);
+            var parts = name.Split('-', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 6 || !int.TryParse(parts[3], out var ownerPid))
+                continue;
+            var ownerIsCurrentTarget = ownerPid == target.ProcessId;
+            var ownerProcessIsAlive = ownerIsCurrentTarget;
+            if (ownerPid != target.ProcessId)
+            {
+                try
+                {
+                    using var owner = Process.GetProcessById(ownerPid);
+                    ownerProcessIsAlive = !owner.HasExited;
+                }
+                catch (ArgumentException)
+                {
+                    // No live process owns this immutable instance directory.
+                }
+                catch (InvalidOperationException)
+                {
+                    // No live process owns this immutable instance directory.
+                }
+                catch (Exception ex) when (ex is Win32Exception or UnauthorizedAccessException)
+                {
+                    ownerProcessIsAlive = true;
+                }
+            }
+            bool moduleIsLoaded;
+            try
+            {
+                moduleIsLoaded = Directory.EnumerateFiles(directory, "*.dll", SearchOption.TopDirectoryOnly)
+                    .Select(Path.GetFullPath)
+                    .Any(loadedPaths.Contains);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                continue;
+            }
+            if (!BridgeGenerationPolicy.MayDeleteInstanceDirectory(
+                    ownerIsCurrentTarget,
+                    ownerProcessIsAlive,
+                    moduleIsLoaded))
+                continue;
+            try
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Loaded or externally inspected generations remain immutable.
+            }
+        }
+    }
+
     private static void CopyMeshProfiles(string profilesRoot, string instanceDirectory)
     {
-        var source = Path.Combine(profilesRoot, "mesh-profiles");
+        var source = Path.Combine(profilesRoot, "web", "mesh-profiles");
         if (!Directory.Exists(source))
-            return;
+            throw new DirectoryNotFoundException("Packaged mesh profiles are missing from the Web assets.");
         var target = Path.Combine(instanceDirectory, "mesh-profiles");
         Directory.CreateDirectory(target);
         foreach (var file in Directory.EnumerateFiles(source, "*.json", SearchOption.TopDirectoryOnly))
@@ -743,15 +1496,19 @@ public sealed class RuntimeBridgeService
     {
         if (invocation.Result?.State.Equals("indeterminate_timeout", StringComparison.OrdinalIgnoreCase) == true)
             return "the remote operation did not finish. Its target memory was intentionally retained; retry explicitly after confirming the game is responsive.";
+        var win32Error = invocation.Result?.Win32Error ?? 0;
+        var win32Detail = win32Error > 0
+            ? $" (win32={win32Error}: {new Win32Exception(win32Error).Message})"
+            : "";
         var detail = invocation.Result?.Detail;
         if (string.IsNullOrWhiteSpace(detail))
             detail = invocation.ParseError;
         if (string.IsNullOrWhiteSpace(detail))
             detail = invocation.StandardError;
         var lower = detail.ToLowerInvariant();
-        if (lower.Contains("access denied") || lower.Contains("win32=5"))
-            return "access denied while opening the selected game process. Run Zemi Mecchamouflage with the same privileges as the game, or try Run as administrator.";
-        return detail;
+        if (lower.Contains("access denied") || win32Error == 5)
+            return "access denied while opening the selected game process. Run Zemi Mecchamouflage with the same privileges as the game, or try Run as administrator." + win32Detail;
+        return detail + win32Detail;
     }
 
     private static string FriendlyAccessFailure(string message)
@@ -765,5 +1522,5 @@ public sealed class RuntimeBridgeService
     private static bool ResearchArtifactsEnabled() => BuildFeatures.ResearchArtifactsEnabled;
 
     private sealed record ActiveBridgeRequest(BridgeInstance? Instance, BridgeReply Reply);
-    private sealed record InjectorInvocation(bool Canceled, bool Parsed, InjectorResultV1? Result, string ParseError, string StandardError);
+    private sealed record InjectorInvocation(bool Canceled, bool Parsed, InjectorResult? Result, string ParseError, string StandardError);
 }

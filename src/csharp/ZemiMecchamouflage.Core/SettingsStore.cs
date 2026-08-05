@@ -51,10 +51,44 @@ public sealed class SettingsStore
         settings.StopHotkey = ReadString(root, "stop_hotkey", settings.StopHotkey);
         settings.PreviewHotkey = ReadString(root, "preview_hotkey", settings.PreviewHotkey);
         settings.UnPreviewHotkey = ReadString(root, "unpreview_hotkey", settings.UnPreviewHotkey);
+        settings.ImageStartHotkey = ReadString(root, "image_start_hotkey", settings.ImageStartHotkey);
+        settings.ImagePreviewHotkey = ReadString(root, "image_preview_hotkey", settings.ImagePreviewHotkey);
+        settings.ImageUnPreviewHotkey = ReadString(root, "image_unpreview_hotkey", settings.ImageUnPreviewHotkey);
+        settings.ImageStopHotkey = ReadString(root, "image_stop_hotkey", settings.ImageStopHotkey);
+        settings.ActiveImageDesignId = ReadString(root, "active_image_design_id", settings.ActiveImageDesignId);
         settings.SecondPassHotkey = ReadString(root, "second_pass_hotkey", settings.SecondPassHotkey);
         settings.NaturalFirstPassHotkey = ReadString(root, "natural_first_pass_hotkey", settings.NaturalFirstPassHotkey);
         settings.NaturalSecondPassHotkey = ReadString(root, "natural_second_pass_hotkey", settings.NaturalSecondPassHotkey);
         settings.LogRetentionDays = ReadInt(root, "log_retention_days", settings.LogRetentionDays);
+        settings.Esp.Enabled = ReadBool(root, "esp_enabled", settings.Esp.Enabled);
+        settings.Esp.TargetScope = NormalizeEspTargetScope(ReadString(root, "esp_target_scope", settings.Esp.TargetScope));
+        settings.Esp.Boxes = ReadBool(root, "esp_boxes", settings.Esp.Boxes);
+        settings.Esp.Skeletons = ReadBool(root, "esp_skeletons", settings.Esp.Skeletons);
+        settings.Esp.Names = ReadBool(root, "esp_names", settings.Esp.Names);
+        settings.Esp.Distance = ReadBool(root, "esp_distance", settings.Esp.Distance);
+        settings.Esp.Snaplines = ReadBool(root, "esp_snaplines", settings.Esp.Snaplines);
+        var hiderColorText = root.ContainsKey("esp_hider_color")
+            ? ReadString(root, "esp_hider_color", settings.Esp.HiderColor.ToHex())
+            : ReadString(root, "esp_color", settings.Esp.HiderColor.ToHex());
+        if (RgbColor.TryParse(hiderColorText, out var hiderColor))
+            settings.Esp.HiderColor = hiderColor;
+        var hunterColorText = root.ContainsKey("esp_hunter_color")
+            ? ReadString(root, "esp_hunter_color", settings.Esp.HunterColor.ToHex())
+            : ReadString(root, "esp_enemy_color", settings.Esp.HunterColor.ToHex());
+        if (RgbColor.TryParse(hunterColorText, out var hunterColor))
+            settings.Esp.HunterColor = hunterColor;
+
+        if (root.TryGetPropertyValue("image", out var imageNode) && imageNode is JsonObject)
+        {
+            try
+            {
+                settings.Image = imageNode.Deserialize<ImagePaintSettings>(Options) ?? new ImagePaintSettings();
+            }
+            catch (JsonException)
+            {
+                settings.Image = new ImagePaintSettings();
+            }
+        }
 
         var paint = settings.Paint;
         // v1.6.3 retires the two-pass brush pipeline. Existing configs retain
@@ -68,12 +102,9 @@ public sealed class SettingsStore
         paint.BrushSizeTexels = hasSingleBrush
             ? ReadDouble(root, "brush_size_texels", paint.BrushSizeTexels)
             : legacyBrush2Enabled || !legacyBrush1Enabled ? legacyBrush2Size : legacyBrush1Size;
-        paint.SideSourceMaxUv = ReadDouble(root, "side_source_max_uv", paint.SideSourceMaxUv);
-        paint.FrontBackSourceMaxUv = ReadDouble(root, "front_back_source_max_uv", paint.FrontBackSourceMaxUv);
         paint.FrontRegionMode = ReadRegionMode(root, "front_region_mode", paint.FrontRegionMode);
         paint.SideRegionMode = ReadRegionMode(root, "side_region_mode", paint.SideRegionMode);
         paint.BackRegionMode = ReadRegionMode(root, "back_region_mode", paint.BackRegionMode);
-        paint.AutoMaterial = ReadBool(root, "auto_material", paint.AutoMaterial);
         paint.Metallic = ReadDouble(root, "metallic", paint.Metallic);
         paint.Roughness = ReadDouble(root, "roughness", paint.Roughness);
         paint.Emissive = ReadDouble(root, "emissive", paint.Emissive);
@@ -138,16 +169,22 @@ public sealed class SettingsStore
             settings.UnPreviewHotkey = "F3";
         if (string.IsNullOrWhiteSpace(settings.StopHotkey))
             settings.StopHotkey = "F4";
+        if (string.IsNullOrWhiteSpace(settings.ImageStartHotkey))
+            settings.ImageStartHotkey = "F5";
+        if (string.IsNullOrWhiteSpace(settings.ImagePreviewHotkey))
+            settings.ImagePreviewHotkey = "F6";
+        if (string.IsNullOrWhiteSpace(settings.ImageUnPreviewHotkey))
+            settings.ImageUnPreviewHotkey = "F7";
+        if (string.IsNullOrWhiteSpace(settings.ImageStopHotkey))
+            settings.ImageStopHotkey = "F8";
         if (string.IsNullOrWhiteSpace(settings.SecondPassHotkey))
-            settings.SecondPassHotkey = "F5";
+            settings.SecondPassHotkey = "F9";
         if (string.IsNullOrWhiteSpace(settings.NaturalFirstPassHotkey))
-            settings.NaturalFirstPassHotkey = "F6";
+            settings.NaturalFirstPassHotkey = "F10";
         if (string.IsNullOrWhiteSpace(settings.NaturalSecondPassHotkey))
-            settings.NaturalSecondPassHotkey = "F7";
+            settings.NaturalSecondPassHotkey = "F11";
 
         settings.Paint.BrushSizeTexels = Math.Clamp(settings.Paint.BrushSizeTexels, 1.0, 10.0);
-        settings.Paint.SideSourceMaxUv = Math.Clamp(settings.Paint.SideSourceMaxUv, 0.001, 0.50);
-        settings.Paint.FrontBackSourceMaxUv = Math.Clamp(settings.Paint.FrontBackSourceMaxUv, 0.001, 2.00);
         settings.Paint.Metallic = Math.Clamp(settings.Paint.Metallic, 0.0, 1.0);
         settings.Paint.Roughness = Math.Clamp(settings.Paint.Roughness, 0.0, 1.0);
         settings.Paint.Emissive = Math.Clamp(settings.Paint.Emissive, 0.0, 1.0);
@@ -159,6 +196,12 @@ public sealed class SettingsStore
         settings.Paint.SecondPassColorCompressionTolerance = Math.Clamp(settings.Paint.SecondPassColorCompressionTolerance, 0.0, 10.0);
         settings.Paint.NaturalPaintJitterPercent = Math.Clamp(settings.Paint.NaturalPaintJitterPercent, 0.0, 100.0);
         settings.Paint.NaturalPaintLayerCount = Math.Clamp(settings.Paint.NaturalPaintLayerCount, 1, 8);
+        settings.Image ??= new ImagePaintSettings();
+        settings.Esp ??= new EspSettings();
+        settings.Esp.TargetScope = NormalizeEspTargetScope(settings.Esp.TargetScope);
+        settings.Image.ClampDraft();
+        if (settings.Image.Enabled && !settings.Image.TryValidate(out _))
+            settings.Image = new ImagePaintSettings();
         return settings;
     }
 
@@ -179,16 +222,27 @@ public sealed class SettingsStore
         preview_hotkey = settings.PreviewHotkey,
         unpreview_hotkey = settings.UnPreviewHotkey,
         stop_hotkey = settings.StopHotkey,
+        image_start_hotkey = settings.ImageStartHotkey,
+        image_preview_hotkey = settings.ImagePreviewHotkey,
+        image_unpreview_hotkey = settings.ImageUnPreviewHotkey,
+        image_stop_hotkey = settings.ImageStopHotkey,
+        active_image_design_id = settings.ActiveImageDesignId,
+        esp_enabled = settings.Esp.Enabled,
+        esp_target_scope = settings.Esp.TargetScope,
+        esp_boxes = settings.Esp.Boxes,
+        esp_skeletons = settings.Esp.Skeletons,
+        esp_names = settings.Esp.Names,
+        esp_distance = settings.Esp.Distance,
+        esp_snaplines = settings.Esp.Snaplines,
+        esp_hider_color = settings.Esp.HiderColor.ToHex(),
+        esp_hunter_color = settings.Esp.HunterColor.ToHex(),
         second_pass_hotkey = settings.SecondPassHotkey,
         natural_first_pass_hotkey = settings.NaturalFirstPassHotkey,
         natural_second_pass_hotkey = settings.NaturalSecondPassHotkey,
         brush_size_texels = settings.Paint.BrushSizeTexels,
-        side_source_max_uv = settings.Paint.SideSourceMaxUv,
-        front_back_source_max_uv = settings.Paint.FrontBackSourceMaxUv,
         front_region_mode = RegionModeText(settings.Paint.FrontRegionMode),
         side_region_mode = RegionModeText(settings.Paint.SideRegionMode),
         back_region_mode = RegionModeText(settings.Paint.BackRegionMode),
-        auto_material = settings.Paint.AutoMaterial,
         metallic = settings.Paint.Metallic,
         roughness = settings.Paint.Roughness,
         emissive = settings.Paint.Emissive,
@@ -202,6 +256,14 @@ public sealed class SettingsStore
         natural_paint_jitter_percent = settings.Paint.NaturalPaintJitterPercent,
         natural_paint_layer_count = settings.Paint.NaturalPaintLayerCount
     };
+
+    private static string NormalizeEspTargetScope(string? value) =>
+        value?.Trim().ToLowerInvariant() switch
+        {
+            "hider" => "hider",
+            "hunter" => "hunter",
+            _ => "all"
+        };
 
     public static string RegionModeText(RegionMode mode) => mode switch
     {

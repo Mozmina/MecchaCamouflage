@@ -1,161 +1,155 @@
-# Direct Bridge Injection (v1.6)
+# Direct Bridge Generations (v1.7)
 
-This is the authoritative description of the v1.6 injection and bootstrap
-path. The production system has one supported native path: the controller
-directly injects one uniquely named bridge DLL into the exact game process it
-selected, starts that bridge, and authenticates the resulting loopback
-endpoint.
+This is the authoritative description of the production native bootstrap and
+hot-reload path. The controller accepts a process-resident bridge only when its
+DLL, runtime profiles, and compatibility ABIs match the package currently
+running.
 
-## Scope and invariants
-
-- The shipped native components are the bridge and the injector only.
-- There is no loader, bridge switching, conditional unload, named-pipe loader
-  lifecycle, loader cache, or restart-required state caused by an existing
-  module.
-- Existing bridge DLLs in a game process are ignored. The new instance is
-  identified by its GUID, token, build hash, and endpoint. It is not selected
-  by DLL age or by a module-name scan.
-- A bridge is never unloaded by the production path. An injection timeout is
-  indeterminate: remote memory remains owned until the remote operation has
-  finished, and the user must explicitly retry.
-- The paint command protocol after bootstrap is unchanged.
+## Runtime bundle identity
 
 The relevant implementation is:
 
-- `src/native/bridge/bridge.cpp`: injected bridge and `BridgeStartV1`.
+- `src/native/bridge/bridge.cpp`: injected bridge and `BridgeStartV2`.
 - `src/native/injector/injector.cpp`: one direct injection attempt.
 - `src/native/include/direct_bridge_abi.hpp`: fixed startup ABI.
 - `src/csharp/ZemiMecchamouflage.Controller/RuntimeBridgeService.cs`: staging,
   identity, synchronization, and connection ownership.
-- `src/csharp/ZemiMecchamouflage.Controller/BridgeBootstrap.cs`: startup-block
-  and endpoint identity models.
+- `src/csharp/ZemiMecchamouflage.Controller/BridgeBootstrap.cs` /
+  `BridgeBootstrapV2.cs`: startup-block and endpoint identity models.
 - `src/csharp/ZemiMecchamouflage.Controller/BridgeClient.cs`: HELLO and command
   sequencing.
+- `src/csharp/ZemiMecchamouflage.Controller/BridgeGenerationPolicy.cs`,
+  `BridgeResidentCore.cs`, `NativeRuntimeBundle.cs`: generation identity,
+  reconnect/replace decisions, and immutable staging.
 
-## Per-instance staging
-
-For every attempt the controller creates a new directory under:
-
-```text
-%LOCALAPPDATA%\ZemiMecchamouflage\bridge-instances\<instance-guid>\
-```
-
-It copies the packaged bridge, injector, and mesh profiles into that directory.
-The bridge file name is generated from the build hash and instance GUID:
+`NativeRuntimeBundleId` is the SHA-256 of a canonical UTF-8/LF manifest:
 
 ```text
-meccha-direct-bridge-v1-<sha256>-<guid>.dll
+schema=1
+start_block_abi=2
+resident_core_abi=2
+protocol=2
+bridge=<runtime-bridge.dll sha256>
+profile=mesh-profiles/<ordinal relative name>=<sha256>
 ```
 
-The staged name is intentionally outside old `runtime-bridge-*` naming
-patterns. The controller stores the endpoint, instance GUID, token, and
-expected hash in one `BridgeInstance` record. The token is never logged.
-Live instance directories are not deleted while a game may still have the DLL
-loaded or may still read its profiles.
+All mesh and Image Paint profiles participate in this identity. Application
+version and injector hash are verified separately and do not affect resident
+behavior identity. Profile entries are sorted with ordinal comparison.
 
-## Exact target identity
+The controller calculates the identity from the validated package cache, copies
+the runtime into a new immutable instance directory, and calculates it again
+from the staged files. A mismatch prevents injection.
 
-The caller selects a concrete `Process`. The controller captures:
+## Bootstrap and resident ABIs
 
-1. PID;
-2. process creation `FILETIME`; and
-3. normalized executable path.
-
-The injector receives those exact values and the exact staged bridge path. It
-owns one target-process handle for the attempt and verifies the identity again
-before writing remote memory. It never searches for a process by executable
-name and never chooses between same-name processes.
-
-## Injection sequence
-
-1. Acquire the per-PID direct-injection mutex.
-2. Stage the unique bridge, injector, and mesh profiles.
-3. Start the injector with `--direct <pid> <creation-filetime> <exe-path>
-   <bridge-path>`.
-4. The injector verifies target identity and architecture, allocates remote
-   memory for the bridge path and startup block, and calls `LoadLibraryW`.
-5. After `LoadLibraryW` completes, it locates the newly loaded module by the
-   exact normalized full path. This is the only bridge-module enumeration.
-6. It resolves the exported `BridgeStartV1` RVA from the local inspection map,
-   calls it in the target, and waits for both remote operations to finish.
-7. It reports the fixed startup result as JSON to the controller.
-
-Remote path and startup-block memory is not released until its corresponding
-remote thread has exited. The production path contains no `TerminateThread`,
-target `FreeLibrary`, bridge switch, or loader fallback. A canceled or timed
-out wait is reported as indeterminate and does not attempt unsafe cleanup.
-
-## `BridgeStartBlockV1` ABI
-
-The startup block is exactly 128 bytes, pointer-free, little-endian, and shared
-between C# and native code. Native `static_assert`s and C# serialization tests
-must fail if the layout changes.
+New injections use `BridgeStartV2` and the 160-byte, pointer-free
+`BridgeStartBlockV2`.
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
-| 0 | 4 | magic (`MCS1`) |
-| 4 | 4 | structure size (`128`) |
-| 8 | 4 | ABI version (`1`) |
+| 0 | 4 | magic (`MCS2`) |
+| 4 | 4 | structure size (`160`) |
+| 8 | 4 | ABI version (`2`) |
 | 12 | 4 | expected PID |
 | 16 | 16 | instance GUID |
 | 32 | 32 | random connection token |
-| 64 | 32 | expected bridge SHA-256 |
-| 96 | 4 | requested port (`0`; OS chooses) |
-| 100 | 4 | result state |
-| 104 | 4 | bound port |
-| 108 | 4 | bootstrap protocol version |
-| 112 | 4 | Win32 error |
-| 116 | 4 | Winsock error |
-| 120 | 8 | reserved; must be zero |
+| 64 | 32 | bridge DLL SHA-256 |
+| 96 | 32 | runtime bundle SHA-256 |
+| 128 | 4 | requested port (`0`) |
+| 132 | 4 | result state |
+| 136 | 4 | bound port |
+| 140 | 4 | bootstrap protocol (`2`) |
+| 144 | 4 | Win32 error |
+| 148 | 4 | Winsock error |
+| 152 | 8 | reserved; must be zero |
 
-`BridgeStartV1(void*)` validates the block, copies it into bridge-owned state,
-binds `127.0.0.1:0`, obtains the assigned port, starts the listener, writes
-the result state and errors, and returns only after the listener is accepting
-connections. `DllMain` only records module state and calls
-`DisableThreadLibraryCalls`; runtime startup is not performed from `DllMain`.
+The native bridge publishes a 136-byte `MCR2` resident mapping containing its
+PID, port, protocol, GUID, token, DLL hash, and runtime bundle ID. HELLO returns
+the same identity. The controller requires the start block, injector result,
+resident mapping, and authenticated HELLO to agree.
 
-## TCP bootstrap and commands
+The controller retains a read-only parser for the 104-byte `MCR1` mapping. A
+v1.6.x resident may authenticate only as an upgrade source; it is never accepted
+as the active v1.7 runtime generation.
 
-Each command uses one short-lived TCP connection. The first line is always a
-`hello` containing:
+## Immutable staging
 
-- bootstrap protocol version;
-- instance GUID; and
-- the random token.
+Each V2 instance is staged under:
 
-The bridge validates all three and replies with its PID, instance GUID, build
-hash, and protocol version. Only after a successful reply does the client send
-the existing command line on that same connection. `ping`, paint, preview,
-cancel, and shutdown payloads are unchanged after HELLO.
+```text
+%LOCALAPPDATA%\ZemiMecchamouflage\bridge-instances\
+  bridge-instance-v2-<pid>-<bundle-prefix>-<guid>\
+```
 
-The client accepts a reply only when PID, GUID, token-associated endpoint, and
-expected build hash match its `BridgeInstance`. It does not read `.port`
-sidecars or probe another bridge for compatibility. The `.progress.path` and
-`.progress.json` sidecars remain solely for paint progress; research event
-watch artifacts remain research-only.
+The DLL name contains the runtime bundle generation, full DLL hash, and instance
+GUID. Loaded directories are never overwritten or deleted. Cleanup removes only
+unloaded V2 directories owned by the current target or by a process that no
+longer exists. Legacy directories without provable ownership are retained.
 
-Shutdown closes command admission and the listener before cancellation. An
-already accepted handler must recheck admission before dispatch, and paint is
-tracked from queue removal through planning, async execution, and terminal
-completion. The bridge restores its hooks only after that pipeline is
-quiescent; the DLL remains resident and may start a later authenticated
-instance after listener/callback rundown. A timed-out shutdown does not report
-success or authorize an automatic retry while cancellation is still pending.
+The content-addressed package cache remains responsible for validating embedded
+resources. WebView2 data and user settings do not participate in bridge
+generation cleanup.
 
-## Failure handling
+## Connection and replacement lifecycle
 
-Startup failures identify the stage (staging, target identity, remote load,
-module path match, bridge start, listener, HELLO, or command). A bridge that
-has not completed a valid HELLO accepts no application command and performs no
-paint action. Existing modules do not change this state and do not require a
-game restart.
+The controller captures the exact target PID, creation `FILETIME`, and
+normalized executable path. The injector independently verifies all three.
 
-## Verification gates
+For every connection:
 
-Before a release, run the direct-injection tests and Windows 10/11 smoke
-matrix from [`release-checklist.md`](release-checklist.md), including 25
-sequential injections into one game process, same-name processes, target exit
-during each stage, concurrent hosts, old direct bridges, and resident modules.
-Every successful connection must match the selected PID, generated GUID,
-token, and build hash. Run the existing paint, preview, cancellation, and
-multiplayer checks unchanged.
+1. Calculate the packaged runtime bundle ID.
+2. Read the resident mapping.
+3. Reconnect only when the V2 bundle and DLL hashes match.
+4. Otherwise acquire `Local\ZemiMecchamouflage.Inject.<pid>` and re-read the
+   mapping to avoid a cross-GUI race.
+5. Authenticate to the old resident and request shutdown.
+6. Require `active_paint_quiescent=true` and
+   `hook_callbacks_quiescent=true`.
+7. Wait up to five seconds for the resident mapping to disappear.
+8. Stage and hash a new immutable instance.
+9. Inject its V2 start block.
+10. Verify the injector result, HELLO, and newly published resident mapping.
+
+Shutdown closes command admission before canceling queued and executing paint.
+It removes ProcessEvent and Present ownership only after paint, UE calls, and
+hook callbacks are quiescent. The old DLL remains loaded but inert.
+
+A production process may hold at most three native generations. Development and
+research builds allow eight. One automatic replacement attempt is allowed for a
+PID and desired bundle during one GUI session. Any timeout, invalid identity,
+failed quiescence proof, retry, or generation-cap condition fails closed and
+requires a game restart; Paint, Preview, and ESP do not use the stale bridge.
+
+## Command protocol and diagnostics
+
+Every TCP command begins with HELLO containing the protocol, GUID, and random
+token. Application commands are sent only after PID, GUID, DLL hash, bundle ID,
+and protocol validation.
+
+Normal logs expose only short non-secret identity fields:
+
+- application version and package asset-set ID;
+- desired and resident runtime bundle IDs;
+- generation match, replacement stage, and generation count.
+
+Tokens, credentials, fixed personal paths, and full target paths are not logged
+outside explicit research diagnostics.
+
+## Release verification
+
+GitHub Actions is the release publisher. Before upload, the packaged executable
+runs `--verify-runtime-bundle`, re-extracts its embedded assets through the
+normal validated cache, and reports its version, asset-set ID, DLL hash, profile
+hashes, and runtime bundle ID. The workflow compares these values with the
+version-scoped native build and source profiles, then records the release
+artifact SHA-256.
+
+Windows verification must cover:
+
+- v1.6.x resident to v1.7 automatic replacement;
+- reconnect with an identical bundle;
+- profile-only and DLL changes;
+- replacement while Paint/Preview/ESP are active;
+- shutdown, mapping, HELLO, and generation-cap failure paths;
+- unchanged manual Paint, Image Paint, cancellation, and multiplayer behavior.

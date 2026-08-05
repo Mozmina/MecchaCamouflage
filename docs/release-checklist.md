@@ -72,6 +72,18 @@ runtime cache files automatically.
 
 These require MECCHA CHAMELEON.
 
+- On a machine without the Defender exclusion:
+  - startup requests UAC once
+  - approving it adds only `%LOCALAPPDATA%\MecchaCamouflage`
+  - `defender-exclusion-added.txt` contains `1` in that directory
+  - the bridge warms up without the previous antivirus block
+  - the next startup does not request UAC again
+- On a machine where the exclusion list is visible, remove the exclusion while
+  leaving the marker file.
+  - the next startup requests UAC and restores the exclusion
+- Cancel the UAC prompt once.
+  - the app continues to start
+  - diagnostics record the failed exclusion setup
 - Start the app with no game running.
   - GUI initializes.
   - error state is clear and diagnostic.
@@ -105,8 +117,11 @@ These require MECCHA CHAMELEON.
   - cache rebuilds automatically.
   - WebView2 starts from the installed Evergreen Runtime, or prompts to install it with the embedded bootstrapper.
 - Restart the controller against the same game process.
-  - the new controller instance starts and authenticates its own direct bridge.
-  - older direct bridges or any other resident module do not produce a restart-required state.
+  - an identical runtime bundle reconnects to the current V2 resident.
+  - a different DLL or profile bundle performs one authenticated, quiescent
+    generation replacement without restarting the game.
+  - a failed replacement never reconnects to the obsolete resident and clearly
+    requires a game restart.
   - an indeterminate injector timeout is diagnosed and requires an explicit retry; it does not trigger unload or thread termination.
 - Cancel and then shut down separate paints while each is still in the planning
   phase. Each command must report one active job, the paint must reach a
@@ -114,19 +129,21 @@ These require MECCHA CHAMELEON.
   `active_paint_quiescent=true`, and an immediate fresh injection must complete
   without restarting the game.
 
-## v1.6 Direct Bridge and WebView2 Gates
+## v1.7 Runtime Bundle and WebView2 Gates
 
 - Test direct injection on Windows 10 and Windows 11 with a clean game,
   multiple same-name game processes, target exit during injection, concurrent
   host launches, and old direct bridges/modules already resident in the game.
-- Run 25 sequential direct injections into one game process. Every successful
-  connection must match the selected PID, generated instance GUID, token, and
-  bridge hash; no attempt may become restart-required because an old module is
-  present.
+- Verify an identical bundle reconnects without injection. Verify profile-only
+  and DLL changes each create one replacement generation whose selected PID,
+  generated instance GUID, token, DLL hash, and bundle ID all agree across the
+  start block, injector result, resident mapping, and HELLO.
+- Verify the release generation cap is three and the development/research cap
+  is eight. Reaching either cap must fail closed and require a game restart.
 - Verify a timeout never frees remote path/start-block memory before the
   corresponding remote thread exits. The production path must contain no
-  `TerminateThread`, unload, switch, or loader fallback. The source tree and
-  packaged output contain no loader component.
+  `TerminateThread`, DLL unload, or stale-generation fallback. The source tree
+  and packaged output contain no loader component.
 - Verify Evergreen WebView2 with a runtime already present, absent with a
   successful bootstrapper install, bootstrapper failure/offline behavior, a
   clean user-data folder, two rapid app launches, and a forced WebView process

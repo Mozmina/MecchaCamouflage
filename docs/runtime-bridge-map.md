@@ -4,7 +4,8 @@ This document maps the responsibilities inside `src/native/bridge/bridge.cpp`.
 Use it before deleting code, moving code, or changing bridge command behavior.
 
 Bridge startup is owned by the direct injector and the bridge's exported
-`BridgeStartV1` entry point. The fixed ABI, target identity rules, and TCP
+`BridgeStartV2` entry point. The fixed ABI, runtime-bundle identity rules,
+generation replacement, target identity rules, and TCP
 bootstrap are specified in [`runtime-direct-bridge.md`](runtime-direct-bridge.md).
 
 Current policy: do not delete or split bridge code before the code path is

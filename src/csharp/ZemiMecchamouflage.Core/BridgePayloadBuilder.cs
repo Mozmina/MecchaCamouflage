@@ -1,7 +1,34 @@
 using System.Globalization;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 
 namespace ZemiMecchamouflage.Core;
+
+public sealed record ImagePaintOptions(
+    int Width,
+    int Height,
+    string RgbaBase64,
+    string AlphaMode,
+    RgbColor BackgroundColor,
+    string Placement,
+    string BodyType,
+    string FrontRegionMode,
+    string RightRegionMode,
+    string BackRegionMode,
+    string LeftRegionMode,
+    RgbColor FillColor,
+    double FillMetallic,
+    double FillRoughness,
+    double FillEmissive,
+    double BrushSizeTexels,
+    double ColorCompressionTolerance,
+    double Metallic,
+    double Roughness,
+    double Emissive,
+    double BackgroundMetallic,
+    double BackgroundRoughness,
+    double BackgroundEmissive,
+    int Revision);
 
 public sealed record PaintRequestOptions(
     bool PreviewOnly = false,
@@ -14,13 +41,52 @@ public sealed record PaintRequestOptions(
     bool NaturalColorBatchEnabled = false,
     double NaturalColorBatchSplitThreshold = 0.12,
     int NaturalColorBatchMaxClusters = 8,
-    int NaturalColorBatchSeed = 0);
+    int NaturalColorBatchSeed = 0,
+    ImagePaintOptions? Image = null);
 
 public static class BridgePayloadBuilder
 {
+    private static readonly JsonSerializerOptions PayloadJsonOptions = new()
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+    };
+
     public static string BuildPaintPayload(AppSettings settings, int processId, string processName, PaintRequestOptions options)
     {
         var paint = SettingsStore.Clamp(settings).Paint;
+        var image = options.Image;
+        var paintSource = new Dictionary<string, object?>
+        {
+            ["kind"] = image is null ? "environment_capture" : "imported_image"
+        };
+        if (image is not null)
+        {
+            paintSource["image_paint_width"] = image.Width;
+            paintSource["image_paint_height"] = image.Height;
+            paintSource["image_paint_rgba_base64"] = image.RgbaBase64;
+            paintSource["image_paint_alpha_mode"] = image.AlphaMode;
+            paintSource["image_paint_background_r"] = ToUnit(image.BackgroundColor.R);
+            paintSource["image_paint_background_g"] = ToUnit(image.BackgroundColor.G);
+            paintSource["image_paint_background_b"] = ToUnit(image.BackgroundColor.B);
+            paintSource["image_paint_placement"] = image.Placement;
+            paintSource["image_paint_body_type"] = image.BodyType;
+            paintSource["image_paint_front_region_mode"] = image.FrontRegionMode;
+            paintSource["image_paint_right_region_mode"] = image.RightRegionMode;
+            paintSource["image_paint_back_region_mode"] = image.BackRegionMode;
+            paintSource["image_paint_left_region_mode"] = image.LeftRegionMode;
+            paintSource["image_paint_fill_color_r"] = ToUnit(image.FillColor.R);
+            paintSource["image_paint_fill_color_g"] = ToUnit(image.FillColor.G);
+            paintSource["image_paint_fill_color_b"] = ToUnit(image.FillColor.B);
+            paintSource["image_paint_fill_metallic"] = image.FillMetallic;
+            paintSource["image_paint_fill_roughness"] = image.FillRoughness;
+            paintSource["image_paint_fill_emissive"] = image.FillEmissive;
+            paintSource["image_paint_brush_size_texels"] = image.BrushSizeTexels;
+            paintSource["image_paint_color_compression_tolerance"] = image.ColorCompressionTolerance;
+            paintSource["image_paint_metallic"] = image.Metallic;
+            paintSource["image_paint_roughness"] = image.Roughness;
+            paintSource["image_paint_emissive"] = image.Emissive;
+            paintSource["image_paint_revision"] = image.Revision;
+        }
         var payload = new Dictionary<string, object?>
         {
             ["type"] = "paint_full_route",
@@ -34,12 +100,10 @@ public static class BridgePayloadBuilder
                 ["pid"] = processId,
                 ["name"] = processName
             },
+            ["paint_source"] = paintSource,
             ["tuning"] = new Dictionary<string, object?>
             {
                 ["brush_size_texels"] = paint.BrushSizeTexels,
-                ["side_source_max_uv"] = paint.SideSourceMaxUv,
-                ["front_back_source_max_uv"] = paint.FrontBackSourceMaxUv,
-                ["auto_material"] = paint.AutoMaterial,
                 ["metallic"] = paint.Metallic,
                 ["roughness"] = paint.Roughness,
                 ["emissive"] = paint.Emissive,
@@ -65,7 +129,7 @@ public static class BridgePayloadBuilder
         };
         if (options.DiagnosticStrokeLimit > 0)
             payload["diagnostic_stroke_limit"] = Math.Clamp(options.DiagnosticStrokeLimit, 1, 10_000);
-        return JsonSerializer.Serialize(payload) + "\n";
+        return JsonSerializer.Serialize(payload, PayloadJsonOptions) + "\n";
     }
 
     private static double ToUnit(byte value) =>

@@ -4,9 +4,8 @@ using System.Text.Json;
 namespace ZemiMecchamouflage.Controller;
 
 /// <summary>
-/// The binary contract passed by the injector to BridgeStartV1.  It intentionally contains no
-/// pointers or host-owned strings: the bridge copies it before starting any worker thread.
-/// Keep this layout in lock-step with native/include/direct_bridge_abi.hpp.
+/// Legacy v1 bootstrap layout retained for authenticated v1.6.x migration and
+/// compatibility tests. New injections always use <see cref="BridgeStartBlockV2"/>.
 /// </summary>
 public sealed class BridgeStartBlockV1
 {
@@ -198,7 +197,9 @@ public sealed class BridgeInstance
         string expectedBridgeHash,
         string bridgePath,
         string injectorPath,
-        string progressPath)
+        string progressPath,
+        string? expectedRuntimeBundleId = null,
+        uint protocolVersion = BridgeProtocolV1.Version)
     {
         if (connectionToken.Length != BridgeStartBlockV1.TokenLength)
             throw new ArgumentException("A bridge token must be 32 bytes.", nameof(connectionToken));
@@ -208,6 +209,17 @@ public sealed class BridgeInstance
         InstanceId = instanceId;
         ConnectionToken = connectionToken.ToArray();
         ExpectedBridgeHash = NormalizeHash(expectedBridgeHash);
+        if (protocolVersion == BridgeProtocolV2.Version)
+        {
+            if (string.IsNullOrWhiteSpace(expectedRuntimeBundleId))
+                throw new ArgumentException("A V2 bridge instance requires a runtime bundle identity.", nameof(expectedRuntimeBundleId));
+            ExpectedRuntimeBundleId = NormalizeHash(expectedRuntimeBundleId);
+        }
+        else if (protocolVersion != BridgeProtocolV1.Version)
+        {
+            throw new ArgumentOutOfRangeException(nameof(protocolVersion), "The bridge protocol version is unsupported.");
+        }
+        ProtocolVersion = protocolVersion;
         BridgePath = bridgePath;
         InjectorPath = injectorPath;
         ProgressPath = progressPath;
@@ -217,9 +229,11 @@ public sealed class BridgeInstance
     public Guid InstanceId { get; }
     public byte[] ConnectionToken { get; }
     public string ExpectedBridgeHash { get; }
+    public string? ExpectedRuntimeBundleId { get; }
+    public uint ProtocolVersion { get; }
     public string BridgePath { get; }
     public string InjectorPath { get; }
-    public string ProgressPath { get; }
+    public string ProgressPath { get; private set; }
     public int? Port { get; private set; }
 
     public void SetPort(int port)
@@ -229,8 +243,27 @@ public sealed class BridgeInstance
         Port = port;
     }
 
+    public bool TrySetProgressPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) ||
+            path.IndexOf('\0', StringComparison.Ordinal) >= 0 ||
+            !Path.IsPathFullyQualified(path))
+        {
+            return false;
+        }
+        ProgressPath = Path.GetFullPath(path);
+        return true;
+    }
+
     public BridgeEndpoint Endpoint => Port is int port
-        ? new BridgeEndpoint("127.0.0.1", port, InstanceId, ConnectionToken, ExpectedBridgeHash, BridgeProtocolV1.Version)
+        ? new BridgeEndpoint(
+            "127.0.0.1",
+            port,
+            InstanceId,
+            ConnectionToken,
+            ExpectedBridgeHash,
+            ProtocolVersion,
+            ExpectedRuntimeBundleId)
         : throw new InvalidOperationException("The direct bridge has not reported a port.");
 
     public override string ToString() => $"BridgeInstance {{ TargetPid = {Target.ProcessId}, InstanceId = {InstanceId:N}, Port = {Port?.ToString() ?? "(not started)"}, BridgePath = {BridgePath} }}";
@@ -246,7 +279,14 @@ public sealed class BridgeInstance
 
 public sealed class BridgeEndpoint
 {
-    public BridgeEndpoint(string host, int port, Guid instanceId, ReadOnlySpan<byte> connectionToken, string expectedBridgeHash, uint protocolVersion)
+    public BridgeEndpoint(
+        string host,
+        int port,
+        Guid instanceId,
+        ReadOnlySpan<byte> connectionToken,
+        string expectedBridgeHash,
+        uint protocolVersion,
+        string? expectedRuntimeBundleId = null)
     {
         if (string.IsNullOrWhiteSpace(host))
             throw new ArgumentException("A bridge host is required.", nameof(host));
@@ -262,6 +302,16 @@ public sealed class BridgeEndpoint
         ConnectionToken = connectionToken.ToArray();
         ExpectedBridgeHash = BridgeInstance.NormalizeHash(expectedBridgeHash);
         ProtocolVersion = protocolVersion;
+        if (protocolVersion == BridgeProtocolV2.Version)
+        {
+            if (string.IsNullOrWhiteSpace(expectedRuntimeBundleId))
+                throw new ArgumentException("A V2 bridge endpoint requires a runtime bundle identity.", nameof(expectedRuntimeBundleId));
+            ExpectedRuntimeBundleId = BridgeInstance.NormalizeHash(expectedRuntimeBundleId);
+        }
+        else if (protocolVersion != BridgeProtocolV1.Version)
+        {
+            throw new ArgumentOutOfRangeException(nameof(protocolVersion), "The bridge protocol version is unsupported.");
+        }
     }
 
     public string Host { get; }
@@ -269,12 +319,19 @@ public sealed class BridgeEndpoint
     public Guid InstanceId { get; }
     public byte[] ConnectionToken { get; }
     public string ExpectedBridgeHash { get; }
+    public string? ExpectedRuntimeBundleId { get; }
     public uint ProtocolVersion { get; }
 
     public override string ToString() => $"BridgeEndpoint {{ Host = {Host}, Port = {Port}, InstanceId = {InstanceId:N} }}";
 }
 
-public sealed record BridgeHelloIdentity(int ProcessId, Guid InstanceId, string BridgeHash, uint ProtocolVersion);
+public sealed record BridgeHelloIdentity(
+    int ProcessId,
+    Guid InstanceId,
+    string BridgeHash,
+    uint ProtocolVersion,
+    string? ProgressPath,
+    string? RuntimeBundleId);
 
 public static class BridgeProtocolV1
 {
@@ -311,7 +368,37 @@ public static class BridgeProtocolV1
                 error = "Bridge hello identity did not match the requested instance.";
                 return false;
             }
-            identity = new BridgeHelloIdentity(pid, instanceId, endpoint.ExpectedBridgeHash, version);
+            string? runtimeBundleId = null;
+            if (endpoint.ProtocolVersion == BridgeProtocolV2.Version)
+            {
+                if (!metadata.TryGetProperty("runtime_bundle_id", out var bundleElement) ||
+                    bundleElement.ValueKind != JsonValueKind.String ||
+                    !string.Equals(bundleElement.GetString(), endpoint.ExpectedRuntimeBundleId, StringComparison.OrdinalIgnoreCase))
+                {
+                    error = "Bridge hello runtime bundle identity did not match the requested generation.";
+                    return false;
+                }
+                runtimeBundleId = endpoint.ExpectedRuntimeBundleId;
+            }
+            string? progressPath = null;
+            if (metadata.TryGetProperty("progress_path", out var progressPathElement) &&
+                progressPathElement.ValueKind == JsonValueKind.String)
+            {
+                var reportedPath = progressPathElement.GetString();
+                if (!string.IsNullOrWhiteSpace(reportedPath) &&
+                    reportedPath.IndexOf('\0', StringComparison.Ordinal) < 0 &&
+                    Path.IsPathFullyQualified(reportedPath))
+                {
+                    progressPath = Path.GetFullPath(reportedPath);
+                }
+            }
+            identity = new BridgeHelloIdentity(
+                pid,
+                instanceId,
+                endpoint.ExpectedBridgeHash,
+                version,
+                progressPath,
+                runtimeBundleId);
             return true;
         }
         catch (JsonException ex)
@@ -322,13 +409,14 @@ public static class BridgeProtocolV1
     }
 }
 
-public sealed record InjectorResultV1(
+public sealed record InjectorResult(
     bool Success,
     string State,
     uint ProtocolVersion,
     int? ProcessId,
     Guid? InstanceId,
     string? BridgeHash,
+    string? RuntimeBundleId,
     int? BoundPort,
     int Win32Error,
     int WinsockError,
@@ -336,15 +424,20 @@ public sealed record InjectorResultV1(
 {
     public bool IsListening => Success && string.Equals(State, "listening", StringComparison.OrdinalIgnoreCase);
 
-    public bool Matches(int expectedPid, Guid expectedInstanceId, string expectedBridgeHash) =>
+    public bool Matches(
+        int expectedPid,
+        Guid expectedInstanceId,
+        string expectedBridgeHash,
+        string? expectedRuntimeBundleId = null) =>
         IsListening &&
-        ProtocolVersion == BridgeProtocolV1.Version &&
+        ProtocolVersion == (expectedRuntimeBundleId is null ? BridgeProtocolV1.Version : BridgeProtocolV2.Version) &&
         ProcessId == expectedPid &&
         InstanceId == expectedInstanceId &&
         string.Equals(BridgeHash, expectedBridgeHash, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(RuntimeBundleId, expectedRuntimeBundleId, StringComparison.OrdinalIgnoreCase) &&
         BoundPort is >= 1 and <= 65535;
 
-    public static bool TryParseFinal(string stdout, out InjectorResultV1 result, out string error)
+    public static bool TryParseFinal(string stdout, out InjectorResult result, out string error)
     {
         result = null!;
         error = "";
@@ -367,13 +460,14 @@ public sealed record InjectorResultV1(
                 var instanceText = TryGetString(root, "instance_id");
                 var instanceId = Guid.TryParseExact(instanceText, "N", out var parsedInstance) ? parsedInstance : (Guid?)null;
                 var hash = TryGetString(root, "bridge_hash");
-                result = new InjectorResultV1(
+                result = new InjectorResult(
                     successElement.GetBoolean(),
                     stateElement.GetString() ?? "",
                     protocol,
                     processId,
                     instanceId,
                     hash,
+                    TryGetString(root, "runtime_bundle_id"),
                     TryGetInt32(root, "port"),
                     TryGetInt32(root, "win32") ?? 0,
                     TryGetInt32(root, "winsock") ?? 0,
@@ -398,11 +492,17 @@ public sealed record InjectorResultV1(
 
 public static class BridgeInstanceNaming
 {
-    public static string CreateDirectoryName(Guid instanceId) => "bridge-instance-" + instanceId.ToString("N");
-
-    public static string CreateBridgeFileName(string bridgeHash, Guid instanceId)
+    public static string CreateDirectoryName(string runtimeBundleId, Guid instanceId, int processId)
     {
-        var normalized = BridgeInstance.NormalizeHash(bridgeHash);
-        return $"meccha-direct-bridge-v1-{normalized}-{instanceId:N}.dll";
+        if (processId <= 0)
+            throw new ArgumentOutOfRangeException(nameof(processId));
+        var normalized = BridgeInstance.NormalizeHash(runtimeBundleId);
+        return $"bridge-instance-v2-{processId}-{normalized[..16]}-{instanceId:N}";
+    }
+
+    public static string CreateBridgeFileName(string runtimeBundleId, Guid instanceId)
+    {
+        var normalizedBundle = BridgeInstance.NormalizeHash(runtimeBundleId);
+        return $"meccha-direct-bridge-v2-{normalizedBundle[..16]}-{instanceId:N}.dll";
     }
 }
