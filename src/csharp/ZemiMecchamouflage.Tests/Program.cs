@@ -3406,7 +3406,7 @@ static void WebUiReportsWebViewZoomFactorInFooter()
 
     Assert(markup.Contains("id=\"footer-zoom\">100%</span>", StringComparison.Ordinal) &&
            !markup.Contains("blob/main/LICENSE.txt", StringComparison.Ordinal) &&
-           markup.Contains("https://github.com/acentrist/MecchaCamouflage", StringComparison.Ordinal),
+           markup.Contains("https://github.com/Mozmina/MecchaCamouflage", StringComparison.Ordinal),
         "the footer must replace the redundant License link with the current WebView zoom percentage");
     Assert(app.Contains("message.name === \"zoomChanged\"", StringComparison.Ordinal) &&
            app.Contains("renderFooterZoom(message.data?.percent);", StringComparison.Ordinal),

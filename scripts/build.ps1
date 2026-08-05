@@ -397,8 +397,8 @@ try {
         # changed mesh profile or native binary cannot be bundled from a stale
         # assembly while retaining restored dependencies and other projects.
         $webHostArtifactPaths = @(
-            (Join-Path $DotNetArtifactRoot "bin\MecchaCamouflage.WebHost"),
-            (Join-Path $DotNetArtifactRoot "obj\MecchaCamouflage.WebHost")
+            (Join-Path $DotNetArtifactRoot "bin\ZemiMecchamouflage.WebHost"),
+            (Join-Path $DotNetArtifactRoot "obj\ZemiMecchamouflage.WebHost")
         )
         foreach ($artifactPath in $webHostArtifactPaths) {
             if (Test-Path -LiteralPath $artifactPath) {

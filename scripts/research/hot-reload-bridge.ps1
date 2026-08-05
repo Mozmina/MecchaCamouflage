@@ -97,7 +97,7 @@ function Read-ResidentCore([int]$ProcessId) {
     $view = $null
     try {
         $mapping = [System.IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting(
-            "Local\MecchaCamouflage.ResidentCore.$ProcessId",
+            "Local\ZemiMecchamouflage.ResidentCore.$ProcessId",
             [System.IO.MemoryMappedFiles.MemoryMappedFileRights]::Read)
         $headerView = $mapping.CreateViewStream(
             0,
@@ -436,7 +436,7 @@ if ($stagedBundle.Id -ne $bundle.Id) {
     throw "Staged native runtime bundle identity mismatch."
 }
 
-$mutexName = "Local\MecchaCamouflage.Inject.$TargetPid"
+$mutexName = "Local\ZemiMecchamouflage.Inject.$TargetPid"
 $mutex = [System.Threading.Mutex]::new($false, $mutexName)
 $ownsMutex = $false
 $oldHash = ""
